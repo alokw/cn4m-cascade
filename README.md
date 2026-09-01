@@ -10,14 +10,50 @@ working rules; [PROGRESS.md](PROGRESS.md) tracks what is built and what is next.
 
 ## Status
 
-Built in phases (SPEC.md §11). **Phase 1 of 6 is complete.**
+Built in phases (SPEC.md §11). **Phases 1 and 2 of 6 are complete.**
 
 | | |
 |---|---|
-| ✅ Works today | Target CRUD over HTTP, on-demand kernel CIFS mounts with refcounting and an idle grace period, SMB dialect fallback, multichannel fallback, stale-mount detection, encrypted credentials, startup mount cleanup, legible failure messages |
-| ⛔ Not built yet | The sync engine itself (scan/diff/copy), filters, multi-destination fan-out, the web UI, scheduling, webhooks, two-way sync |
+| ✅ Works today | Target CRUD over HTTP; on-demand kernel CIFS mounts with refcounting and an idle grace period; SMB dialect and multichannel fallback; stale-mount detection; encrypted credentials; **the sync engine — mirror and update modes to a single destination, with a concurrent scanner, parallel copies, resumable temp-file writes, retries, cancellation, a task log and live progress/ETA** |
+| ⛔ Not built yet | Filters, multi-destination fan-out, the web UI, scheduling, webhooks, two-way sync, rename/move detection |
 
-There is no UI yet, and nothing syncs files yet. Phase 1 is the skeleton and the mount manager.
+There is no UI yet — everything is driven over HTTP. Syncing works: a job mirrors or updates one
+source to one destination, and has been tested at 100,000 files.
+
+## Sync modes
+
+| Mode | What it does |
+|---|---|
+| **Mirror** | Makes the destination match the source. Copies new and changed files, **and deletes destination files the source no longer has.** |
+| **Update** | Copies new and newer files only. **Never deletes anything at the destination**, whatever is there. |
+
+Mirror is the one that removes data, so it has several guards:
+
+- **Every deletion is announced before it happens** — a warning naming the count and total bytes,
+  then one log line per file and per directory removed. Deletion logging is never summarised away
+  and cannot be turned off.
+- **Deletions are withheld when the source listing might be wrong.** If any source directory could
+  not be read, or the source scans as completely empty while the destination is not (a dropped
+  mount, or a stale cached listing), nothing is deleted and the run finishes `partial` with the
+  reason recorded.
+- **Deletions are withheld when copies failed**, unless the job sets `delete_policy: proceed`.
+  Extra files at the destination are corrected by the next clean run; a wrong deletion is not.
+- **An incomplete source scan blocks deletions unconditionally** — that one is not a policy and
+  cannot be overridden.
+
+Update never deletes under any circumstance, including when the source has a directory where the
+destination has a file. Such conflicts are reported and skipped rather than resolved.
+
+### Filters and deletion
+
+A path excluded by a filter is **out of scope on both sides**: it is never copied, never deleted,
+and never considered by the comparison.
+
+This matters more than it looks. Excluding `cache/` means the source's `cache/` is not copied — it
+does **not** mean the destination's existing `cache/` is now "missing from the source" and due for
+deletion. Adding an exclude rule to save bandwidth must never destroy what is already backed up. If
+you want a directory removed from the destination, delete it at the source and let mirror propagate
+that, or remove it by hand.
 
 ## Requirements
 
@@ -109,8 +145,23 @@ curl -sS -X POST localhost:8384/api/targets -H 'Content-Type: application/json' 
 curl -sS -X POST localhost:8384/api/targets/<id>/test | jq .
 ```
 
-Phase 1 endpoints: `POST|GET /api/targets`, `GET|PATCH|DELETE /api/targets/{id}`,
-`POST /api/targets/{id}/test`, `GET /healthz`. Leave `username` empty to mount as a guest.
+Endpoints so far:
+
+```
+POST|GET       /api/targets                 GET|PATCH|DELETE /api/targets/{id}
+POST           /api/targets/{id}/test
+
+POST|GET       /api/jobs                    GET|DELETE       /api/jobs/{id}
+POST           /api/jobs/{id}/run           → 202, runs in the background
+
+GET            /api/runs                    GET              /api/runs/{id}
+GET            /api/runs/{id}/events        POST             /api/runs/{id}/cancel
+
+GET            /healthz
+```
+
+Leave `username` empty to mount as a guest. `GET /api/runs/{id}` includes live progress and ETA
+while a run is in flight.
 
 ## Configuration
 

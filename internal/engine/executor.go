@@ -132,6 +132,20 @@ func (e *Executor) Execute(ctx context.Context, srcRoot, dstRoot string, plan *P
 		return result, ctx.Err()
 	}
 
+	// Announce removals before making any of them. Deletions are the only
+	// irreversible thing a run does, so the log says what is about to
+	// happen and not merely what happened.
+	if len(deletes) > 0 || len(rmdirs) > 0 {
+		var bytes int64
+		for _, a := range deletes {
+			bytes += a.Size
+		}
+		e.emit(Event{Level: store.LevelWarn, Message: fmt.Sprintf(
+			"about to delete %d file(s) totalling %d bytes and remove %d director(y/ies) from the destination; "+
+				"each one is logged individually below",
+			len(deletes), bytes, len(rmdirs))})
+	}
+
 	if err := e.runDeletes(execCtx, dstRoot, deletes, opts, result, abort); err != nil {
 		return result, err
 	}
