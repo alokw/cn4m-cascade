@@ -1,0 +1,52 @@
+# Integration harness: two Samba servers plus a dev container that owns the
+# CIFS mounts. Bridge network with static IPs — targets are addressed by IP
+# (SPEC.md §1). Production compose uses network_mode: host (SPEC.md §3.3);
+# that does not work on Docker Desktop for macOS, hence a bridge here
+# (PROGRESS.md B-3).
+services:
+  samba-a:
+    build: ./test/samba
+    container_name: smbsync-samba-a
+    networks:
+      smbnet:
+        ipv4_address: 172.28.0.10
+
+  samba-b:
+    build: ./test/samba
+    container_name: smbsync-samba-b
+    networks:
+      smbnet:
+        ipv4_address: 172.28.0.11
+
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: smbsync-dev
+    cap_add: [SYS_ADMIN, DAC_READ_SEARCH, NET_ADMIN]
+    security_opt: [apparmor:unconfined]
+    environment:
+      # 172.28.0.99 is deliberately unassigned: the offline-host test target.
+      SMBSYNC_TEST_SAMBA_A: 172.28.0.10
+      SMBSYNC_TEST_SAMBA_B: 172.28.0.11
+      SMBSYNC_TEST_OFFLINE: 172.28.0.99
+      ENCRYPTION_KEY: test-encryption-key-not-for-production
+    volumes:
+      - .:/src
+      - gomodcache:/go/pkg/mod
+      - gobuildcache:/root/.cache/go-build
+    working_dir: /src
+    networks: [smbnet]
+    depends_on: [samba-a, samba-b]
+    command: sleep infinity
+
+networks:
+  smbnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  gomodcache:
+  gobuildcache:

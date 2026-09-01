@@ -1,0 +1,17 @@
+# Development / test container. The host may be macOS, where mount.cifs does
+# not exist, so every build, lint and test runs in here (PROGRESS.md B-1/B-2).
+FROM golang:1.25-bookworm
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends cifs-utils procps iproute2 iptables ca-certificates curl jq \
+ && rm -rf /var/lib/apt/lists/*
+
+# Prebuilt binary rather than `go install`: building the linter from source
+# ties its version to the container's Go toolchain.
+RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+      | sh -s -- -b /usr/local/bin latest \
+ && golangci-lint --version
+
+ENV CGO_ENABLED=0
+WORKDIR /src
+CMD ["bash"]
