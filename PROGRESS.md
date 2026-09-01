@@ -2,16 +2,89 @@
 
 Living handoff doc. Update at the end of every session (CLAUDE.md → Workflow).
 
-**Current phase:** Phase 3 — Filtering + multi-destination (SPEC.md §11). Plan proposed, awaiting
-approval on one blocking question (§0b).
-**Phase 2:** ✅ Complete.
-**Status of Phase 2:** ✅ All exit criteria met, the fresh-context review is done (it found seven
-data-loss bugs, all fixed with regression tests — §5b), and the bounded-I/O hard rule is now
-satisfied. Lint clean; unit and integration suites green under `-race`.
+**Current phase:** Phase 4 — API + UI (SPEC.md §11). **Start in plan mode.**
+**Phase 3:** ✅ Complete — Filtering + multi-destination. All three exit criteria pass, the
+fresh-context review is done (it found five more paths to data loss, all filter-related, all fixed
+— §5c), and vet, lint, unit and integration are all green under `-race` in a single clean run.
+**Phase 2:** ✅ Complete — all exit criteria met, the fresh-context review is done (it found seven
+data-loss bugs, all fixed with regression tests — §5b), and the bounded-I/O hard rule is satisfied.
 **Phase 1:** ✅ Complete (record retained below).
-**Last updated:** 2026-09-01
+**Last updated:** 2026-09-01 (Phase 3 complete)
 
 ---
+
+## 0a. Phase 3 status
+
+### Built
+| Package | Contents |
+|---|---|
+| `internal/filter` (new) | gitignore-semantics pattern compiler over `doublestar/v4`, rule chain (includes define the universe, excludes win, per-target layered on job-level), dot-path JSON key extraction, per-rule counters, degraded-chain tracking |
+| `internal/runner/filters.go` (new) | resolves every rule source once per run — inline, list file, JSON file, including `target://` files read off a share through `engine.ReadFileBounded` — and partitions one compiled set into the per-destination chains and the job-scope prune chain |
+| `internal/runner/filtertest.go` (new) | `filter-test` dry run: scans the source, replays the chain, returns per-rule counts and a sample of admitted paths |
+| `internal/runner/progress.go` (new) | `RunSnapshot` aggregating per-destination trackers into a run-level view, with `busiestPhase()` and byte estimates for destinations that have not been planned yet |
+| `internal/store` (migration `0003`) | `filter_rules` table + CRUD, `job_destinations` lifted to many rows |
+| `internal/engine` | `Matcher` seam on the differ (`Admits`/`PrunesDir`/`Degraded`), filter-aware scan pruning, deletion guard extended to degraded chains, `requiredDirs` deriving mkdirs from planned copies |
+| `internal/runner/runner.go` | fan-out: resolve source once, scan once, loop destinations sequentially or in parallel; per-destination outcome and status; availability gate (`skip`/`abort`) |
+| `internal/api` | filter rule CRUD on jobs, `POST /api/jobs/{id}/filter-test`, per-destination progress in run detail |
+
+### Exit criteria (SPEC.md §11)
+| Criterion | Status |
+|---|---|
+| Two destinations, one offline, completes `partial` under `skip` | ✅ `TestOneDestinationOfflineCompletesPartial` (36.4s) |
+| A JSON-file exclude rule with a dot-path key prunes a subtree | ✅ `TestJSONFilterRulePrunesASubtree` |
+| A malformed key fails the run with a clear error | ✅ `TestMalformedJSONKeyFailsTheRunClearly` |
+
+### Verification (CLAUDE.md → Definition of done)
+| Gate | Result |
+|---|---|
+| `go build` / `go vet -tags=integration` | ✅ clean |
+| `golangci-lint run` | ✅ `0 issues.` |
+| Unit tests under `-race` | ✅ config, engine, filter, mountmgr, secrets, store all `ok` |
+| Integration under `-race` | ✅ **29/29, `ok ... 134.616s`** |
+| Fresh-context subagent review | ✅ Done; all code findings fixed (§5c) |
+
+```
+--- PASS: TestOneDestinationOfflineCompletesPartial (36.33s)   ← exit criterion
+--- PASS: TestOneDestinationOfflineUnderAbort (35.91s)
+--- PASS: TestFanOutToTwoDestinations (0.32s)
+--- PASS: TestJSONFilterRulePrunesASubtree (0.31s)             ← exit criterion
+--- PASS: TestFilteredSubtreeAtTheDestinationIsNotDeleted (0.30s)
+--- PASS: TestMalformedJSONKeyFailsTheRunClearly (0.10s)       ← exit criterion
+--- PASS: TestMalformedKeyWithIgnoreRulePolicy (0.31s)
+--- PASS: TestPerTargetFilterScoping (0.29s)
+--- PASS: TestFilterTestEndpoint (0.08s)
+--- PASS: TestDroppedFilterRuleDisablesDeletions (0.31s)
+--- PASS: TestIncludeRuleCopiesIntoNewDirectories (0.30s)
+--- PASS: TestParallelDestinations (0.30s)
+... 17 further Phase 1 and Phase 2 cases, all PASS
+--- PASS: TestDestinationDisappearsMidRun (42.44s)
+ok  	github.com/alokw/cn4m-cascade/test	134.616s
+```
+
+The harness was verified clean *after* the run — 0 leftover CIFS mounts, no leftover iptables rules
+— which is the end-to-end proof that the cleanup fix in §6 Phase 3 item 7 actually works.
+
+Getting to this single clean run took three attempts; the two failed ones are written up in §6
+Phase 3 item 7 because both failure modes look like broken product code and are not.
+
+---
+
+## 0b. Phase 3 — the blocking question, resolved
+
+**SPEC.md §6.1 step 4 says "Filter the source listing." Taken literally that destroys data in
+mirror mode.** Excluding `cache/` from the *source* removes those paths from the source tree; mirror
+then sees them present at the destination and absent from the source — the definition of extraneous
+— and deletes them. A user adding an exclude rule to skip copying a directory would silently delete
+it from their backup on the next run.
+
+**Resolved 2026-09-01 (D-37):** the chain is applied to **both** listings, so an excluded path is
+invisible to the diff entirely — never copied, never deleted, never considered. This is a deliberate
+deviation from §6.1's literal wording, raised rather than assumed, and documented in the README's
+*Sync modes* section: *"Adding an exclude rule to save bandwidth must never destroy what is already
+backed up."* The other Phase 3 questions were settled with the recommendations as proposed:
+`doublestar/v4` plus our own gitignore rule layer, job-scoped rules only for pruning the shared
+source walk, `target://` rule files honouring the rule's `on_error`, `unavailable_policy` defaulting
+to `skip` with `prompt` rejected until Phase 4, and `parallel_destinations` defaulting to sequential.
 
 ## 0. Phase 2 status
 
@@ -101,10 +174,20 @@ hygiene, bounded shutdown), `internal/storage` (SPEC §4 verbatim), `internal/ap
 
 ## 3. What's next
 
-Phase 2 — Sync engine, mirror + update modes, single destination (SPEC.md §11). **Start in plan
-mode**: re-read SPEC.md §6, propose against Phase 2's exit criteria, wait for approval.
+Phase 4 — API + UI (SPEC.md §11). **Start in plan mode**: re-read SPEC.md §8 and §9, propose
+against Phase 4's exit criteria, wait for approval.
 
-Phase 2 gets three things from Phase 1 worth knowing about:
+Phase 4 inherits three things worth knowing about:
+- `Server.Handler()` is still the auth seam (D-4). Session auth lands here.
+- `unavailable_policy: prompt` and `delete_policy: prompt` are both **rejected at validation today**
+  with a "not until Phase 4" message. They are the interactive modal, and they are the reason the
+  gate was built with a policy enum rather than a boolean.
+- `runner.RunSnapshot` already aggregates per-destination progress; the UI consumes it rather than
+  computing anything.
+
+*(Phase 1 → 2 handoff notes, retained:)*
+
+Phase 2 got three things from Phase 1 worth knowing about:
 - `mountmgr.Manager.Acquire` returns `(root, release, err)` — jobs hold a reference for their whole
   run, which is what the idle grace and the in-use delete refusal were built for.
 - The Samba containers are killable mid-transfer, which is how "pull the network cable mid-run"
@@ -153,6 +236,17 @@ D-1…D-13 were approved 2026-08-31 before implementation; D-14…D-17 came out 
 | D-34 | Every share-touching syscall goes through `engine.bounded`; transfers get a **stall** timeout (inactivity), not a deadline | A syscall wedged in the kernel cannot be interrupted from userspace, so what is bounded is how long the *caller* waits. A deadline on the whole transfer would break legitimate multi-gigabyte copies. Documented in CLAUDE.md |
 | D-35 | Deletions, directory removals and overwrites are **always** logged individually; only brand-new files are gated behind `log_every_file` | A deletion cannot be undone by re-running, so it must never be summarised away. A 100k-file first run would otherwise write 100k rows |
 | D-36 | **Rename/move detection is deferred to Phase 5**, not implemented here | Built and reverted: size + mtime is not identity. A probe showed two unrelated 9-byte files written in the same second being planned as a move, and after a false rename the metadata *matches*, so the differ treats the wrong path as correct forever — silent and permanent. Real identity needs `sync_state` (SPEC.md §6.4). Recorded as a rule in CLAUDE.md |
+| D-37 | **The filter chain applies to both listings, not just the source** (§6.1 step 4 taken literally) | An excluded path is out of scope on *both* sides: never copied, never deleted, never compared. Filtering only the source makes every excluded destination file extraneous, so adding an exclude rule to save bandwidth would delete the backup it was meant to leave alone. Approved 2026-09-01 |
+| D-38 | **Mirror removes destination files the source does not have; update never removes anything** | The user's call, and it matches SPEC.md §1. Mirror warns before the first destructive run; update's extraneous files are reported as informational only. Documented in the README's *Sync modes* section |
+| D-39 | A rule dropped under `ignore_rule` marks the chain **degraded**, and a degraded chain may never delete | Dropping a rule *widens* scope. In mirror mode that instantly reclassifies everything the rule was protecting as extraneous. This is the same class of hazard as D-19's incomplete scan, so it gets the same unconditional block rather than a policy knob |
+| D-40 | `on_error` defaults to `fail_run` for **includes as well as excludes** | SPEC.md §6.5 asks for it on excludes only. Includes need it at least as much: dropping the only include rule leaves an *empty* include set, and an empty include set admits everything. **This corrects a rationale I gave earlier and had backwards** — I had described a dropped include as failing safe by narrowing scope; it does the opposite |
+| D-41 | A destination that completes but withheld work makes the **run** `partial`, even though its own row is `success` | A destination that skipped its deletions genuinely succeeded at what it attempted; the run is the only level that can say the whole thing did less than it was asked to. Otherwise a degraded filter is invisible to the user |
+| D-42 | Directories to create are derived from the **planned copies**, not from admitted directory entries | A pattern like `*.jpg` matches `photos/a.jpg` but never the directory `photos`, so an include-only chain planned copies with no `mkdir` and every one of them failed with ENOENT. Deriving the set from the copies makes the two impossible to disagree |
+| D-43 | Ancestor matching applies to **every** pattern, not only those written with a trailing slash | `PrunesDir` and `Admits` are two views of one decision. When only trailing-slash patterns matched ancestors, `cache` was pruned from the walk while `cache/x.bin` was still admitted by the diff — one side of a mirror seeing a subtree the other does not is how a mirror deletes |
+| D-44 | Rule sources are resolved **once** per run and the compiled set partitioned | The chains and the prune chain each read the rule files, and a `target://` file that changed (or briefly failed) between the two reads gave the walk and the diff different scopes |
+| D-45 | Each chain clones its rules so counters are per-destination | Job-scoped rules are shared by every destination; with parallel fan-out the shared counters were a real data race, and even sequentially the numbers in the run log were the sum across destinations rather than that destination's own |
+| D-46 | Two destinations pointing at the same target are rejected at save time | `run_destinations` is keyed by `(run_id, dest_target_id)`, so the second insert violates the primary key. The job was creatable but could never run |
+| D-47 | `unavailable_policy: abort` fires on **unavailability**, not on copy failures | `abort` is the availability gate (§6.6). Ordinary copy failures are `on_error`'s job; conflating them made one unreadable file kill every remaining destination |
 
 ## 5. Review findings and resolution
 
@@ -207,26 +301,76 @@ bugs. All are fixed, each with a regression test in `internal/engine/regression_
 | P2-19 | A withheld-deletions reason was hidden when copies also failed | `classify` reports both, deletions first |
 | P2-20 | The scale test compared counts only; the tree-match helper walked source→dest so it could not see extras | bidirectional comparison, content spot-checks, deletion assertions |
 
-## 0b. Phase 3 — blocking question
+## 5c. Phase 3 review — findings and resolution
 
-**SPEC.md §6.1 step 4 says "Filter the source listing." Taken literally that destroys data in
-mirror mode.** Excluding `cache/` from the *source* removes those paths from the source tree; mirror
-then sees them present at the destination and absent from the source — the definition of extraneous
-— and deletes them. A user adding an exclude rule to skip copying a directory would silently delete
-it from their backup on the next run.
+A fresh-context subagent reviewed the Phase 3 diff against SPEC.md §6.5/§6.6 and the exit criteria.
+It confirmed **no building ahead** (no scheduler, no webhooks, no `sync_state`, no UI) and that the
+availability gate, the JSON dot-path extractor and the per-destination progress aggregation are
+clean. It found **five more paths to data loss**, all in the filter layer, plus a data race. All are
+fixed, each with a regression test (`internal/filter/regression_test.go`,
+`internal/engine/filter_test.go`, `internal/store/filters_test.go`, `test/phase3_integration_test.go`).
 
-Proposed: **apply the filter chain to both listings**, so an excluded path is invisible to the diff
-entirely — never copied, never deleted, never considered. That is FreeFileSync's actual behaviour
-and almost certainly what §6.5 intends, but it contradicts §6.1's wording, so it needs a decision
-rather than an assumption.
+The pattern is the same one Phase 2 had: everything dangerous lives in the delete path, and the
+mechanism is always **something that widens scope without anyone noticing**.
 
-Other Phase 3 questions (all with recommendations, none blocking): the pattern-matching library
-(`bmatcuk/doublestar/v4` plus our own gitignore rule layer); pruning the shared source walk with
-job-scoped rules only; `target://` rule files honouring the rule's `on_error`; `unavailable_policy`
-defaulting to `skip` with `prompt` rejected until Phase 4; `parallel_destinations` defaulting to
-sequential.
+| # | Finding | Fix |
+|---|---|---|
+| P0-1 | **`ignore_rule` turned "excluded, therefore protected" into "extraneous, therefore deleted".** Dropping any rule widens the chain; in mirror mode everything that rule was protecting is immediately extraneous. Rule files may live on a share, so a moment's unavailability was enough to trigger it | a dropped rule marks the chain degraded; `deletionGuard` refuses to delete from a degraded chain, exactly as it does for an incomplete scan (D-39). The run reports `partial` with the reason (D-41) |
+| P0-2 | **Include rules defaulted to `ignore_rule`, and my stated rationale for it was backwards.** I described a dropped include as failing safe by narrowing the set. It does the opposite: an empty include set admits *everything* | `fail_run` is now the default for both directions (D-40). Verified by probe: a chain with no rules admits `anything/at/all.bin` |
+| P0-3 | **`PrunesDir` and `Admits` disagreed** for any directory pattern written without a trailing slash: the source walk pruned `cache/` while the diff still admitted `cache/x.bin`. One side of a mirror seeing a subtree the other does not is how a mirror deletes | ancestor matching applies to every pattern, not only trailing-slash ones (D-43) |
+| P0-4 | **Rule files were read twice per run** — once for the diff chains, once for the prune chain — and the two reads could disagree, giving the walk and the diff different scopes | sources resolved once and the compiled set partitioned (D-44) |
+| P0-5 | **Include rules could not create the directories their copies needed.** `*.jpg` never matches the directory `photos`, so no `mkdir` was planned while the copy of `photos/a.jpg` was; every such copy failed with ENOENT | directories derived from the planned copies (D-42) |
+| P1-6 | **Data race on rule counters** in the parallel fan-out: job-scoped rules were shared by every destination. The parallel path had no test at all | per-chain rule clones (D-45); `TestParallelDestinations` runs it under `-race` |
+| P1-7 | **Two destinations on one target were creatable but unrunnable** — `run_destinations` is keyed by `(run_id, dest_target_id)`, so the second insert violated the primary key. A test asserted the broken behaviour was fine | rejected at save (D-46); the test was wrong and was replaced |
+| P1-8 | Per-rule counts were wrong three ways: pruning was not counted (a rule pruning 50k files reported "excluded 0"), `Explain` counted while `Admits` did not, and `filter-test` always returned zeroes | `decide()` is side-effect-free; both entry points count; `PrunesDir` counts |
+| P1-9 | An empty pattern list hard-failed the run, so a legitimately empty list file killed the job | `CompileRule` accepts zero patterns; an empty include set is an empty universe, which is meaningful |
+| P1-10 | `unavailable_policy: abort` fired on ordinary copy failures, so one unreadable file killed every remaining destination | `abort` is scoped to unavailability (D-47) |
+
+**Tracked but not fixed** — see §6.
 
 ## 6. Open items for the next session
+
+### Phase 3
+
+1. **Rule files are not validated at save time.** SPEC.md §6.5 asks for it; today a typo in a
+   `target://` path or a JSON key is only discovered when the run fails. The run-time error is
+   clear (that is the exit criterion), but the feedback belongs in the editor. Phase 4's UI is the
+   natural home.
+2. **§6.5's optional debug toggle to log every filtered path is not implemented.** Counts are.
+3. `handleFilterTest` returns 400 when the *source* is unavailable, which reads as "your request was
+   malformed". Should be 502/503, matching the target-test endpoint.
+4. `RunSnapshot` drops `FilesFound`/`DirsFound` from the per-destination trackers, so the run-level
+   view cannot show scan totals. Harmless today because the UI does not exist yet.
+5. **`ReadFileBounded` has no size cap.** A rule file pointed at a multi-gigabyte file on a share
+   would be read into memory in full. Bounded in *time*, not in size.
+6. Dead `p.anchored = false` assignment in `pattern.go` — no effect, but it invites the reader to
+   believe there is a case where a pattern is un-anchored after the fact.
+7. ~~A killed test run poisons the next one.~~ **Fixed** — `make harness-clean` (now a dependency of
+   `make test-integration`) drops leftover blackholes and lazily unmounts anything under
+   `/tmp/Test*`, and `blackhole()` drains stale rules before installing its own. A killed cable-pull
+   test leaves both an `iptables` DROP *and* CIFS mounts that retry forever, and while the kernel is
+   mid-reconnect to a server a **new** mount to it fails with error 115 — which reads exactly like a
+   broken change. Worth knowing before trusting a Phase 3 integration failure.
+
+   **The first version of that fix was itself a hang, and it is worth reading as a warning.** The
+   drain loop shelled out to `iptables` with no timeout, from the cleanup of the one test whose
+   premise is a wedged network. `iptables` waits on `/run/xtables.lock` indefinitely by default, and
+   fork/exec can stall outright in a process whose threads are parked in uninterruptible CIFS
+   syscalls — so the suite died on the 10-minute test timeout with the stack in `dropBlackholes`,
+   the blackhole still installed, and the dev container unkillable in `D` state (`docker restart`
+   returned *"tried to kill container, but did not receive an exit event"*, and every later `exec`
+   failed in `setns`). Recovery was: flush the rule so the `soft` mounts could finally error, then
+   recreate the container.
+
+   Two lessons, both already in CLAUDE.md and both of which I broke in test code because it "isn't
+   production code": **`exec.CommandContext` does not bound this** — its watchdog only arms after
+   `Start` returns, and the stall was inside `forkExec`. The bound has to be on the *caller*, via
+   the goroutine-plus-`select` idiom the engine uses. And a cleanup that cannot complete is worse
+   than no cleanup: this one left the harness dirtier than the mess it existed to clear. The helper
+   now passes `iptables -w 5`, bounds every invocation at 20s, and the cleanup fails the test loudly
+   rather than silently leaving a blackhole installed. **Verified:** the clean suite in §0a ran
+   `TestDestinationDisappearsMidRun` in its normal 42s, and the harness afterwards had 0 leftover
+   CIFS mounts and no leftover rules.
 
 ### Phase 2
 

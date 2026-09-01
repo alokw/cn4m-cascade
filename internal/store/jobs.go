@@ -59,6 +59,22 @@ const (
 	DeletePolicyProceed DeletePolicy = "proceed"
 )
 
+// UnavailablePolicy is what a run does when a destination cannot be
+// resolved (SPEC.md §6.1 step 2).
+type UnavailablePolicy string
+
+const (
+	// PolicySkip logs it, marks that destination skipped, and continues
+	// with the rest. A run finishing with any skipped destination is
+	// `partial`.
+	PolicySkip UnavailablePolicy = "skip"
+	// PolicyAbort fails the whole run immediately.
+	PolicyAbort UnavailablePolicy = "abort"
+	// PolicyPrompt pauses and asks. It needs a UI to ask in, so it arrives
+	// in Phase 4 and is rejected at validation until then.
+	PolicyPrompt UnavailablePolicy = "prompt"
+)
+
 // Workers bounds, from SPEC.md §6.1 step 7.
 const (
 	MinWorkers     = 1
@@ -90,7 +106,15 @@ type Job struct {
 	// run would otherwise write 100k rows (SPEC.md §6.5).
 	LogEveryFile bool `json:"log_every_file"`
 
+	// UnavailablePolicy governs an unreachable destination.
+	UnavailablePolicy UnavailablePolicy `json:"unavailable_policy"`
+	// ParallelDestinations runs destinations at the same time. Off by
+	// default: fan-out multiplies read load on the source share
+	// (SPEC.md §6.1 step 7).
+	ParallelDestinations bool `json:"parallel_destinations"`
+
 	Destinations []JobDestination `json:"destinations"`
+	Filters      []FilterRule     `json:"filters"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -129,6 +153,12 @@ func (j *Job) ApplyDefaults() {
 	}
 	if j.CompareToleranceSec == 0 {
 		j.CompareToleranceSec = 2
+	}
+	if j.UnavailablePolicy == "" {
+		j.UnavailablePolicy = PolicySkip
+	}
+	for i := range j.Filters {
+		j.Filters[i].ApplyDefaults()
 	}
 }
 
@@ -180,19 +210,26 @@ func (j *Job) Validate() error {
 		return fmt.Errorf("compare_tolerance_sec must not be negative, got %d", j.CompareToleranceSec)
 	}
 
-	switch len(j.Destinations) {
-	case 0:
-		return errors.New("at least one destination is required")
-	case 1:
+	switch j.UnavailablePolicy {
+	case PolicySkip, PolicyAbort:
+	case PolicyPrompt:
+		return errors.New(`unavailable_policy "prompt" is not implemented yet; use "skip" or "abort"`)
 	default:
-		// Fan-out is Phase 3; accepting several now would silently sync to
-		// only the first.
-		return errors.New("only one destination is supported in this version")
+		return fmt.Errorf("unavailable_policy must be %q or %q, got %q",
+			PolicySkip, PolicyAbort, j.UnavailablePolicy)
 	}
 
+	if len(j.Destinations) == 0 {
+		return errors.New("at least one destination is required")
+	}
+
+	seen := map[string]bool{}
 	for _, d := range j.Destinations {
 		if d.DestTargetID == "" {
 			return errors.New("each destination needs a target")
+		}
+		if err := validateSubpath("dest_subpath", d.DestSubpath); err != nil {
+			return err
 		}
 		if d.DestTargetID == j.SourceTargetID {
 			// Not just equality: a destination nested inside the source (or
@@ -203,11 +240,39 @@ func (j *Job) Validate() error {
 				return errors.New("a job's destination must not be the same location as its source, or nested inside it")
 			}
 		}
-		if err := validateSubpath("dest_subpath", d.DestSubpath); err != nil {
-			return err
+
+		// One destination per target, per job. `run_destinations` is keyed
+		// by (run_id, dest_target_id) in SPEC.md §7, so a second
+		// destination on the same target could be saved but could never
+		// run — and per-destination progress, filters and log entries are
+		// all keyed by target ID too.
+		if seen[d.DestTargetID] {
+			return errors.New("a job cannot have two destinations on the same target; use one destination per target")
+		}
+		seen[d.DestTargetID] = true
+	}
+
+	for i := range j.Filters {
+		rule := &j.Filters[i]
+		if err := rule.Validate(); err != nil {
+			return fmt.Errorf("filter rule %d: %w", i+1, err)
+		}
+		if rule.Scope == ScopeTarget && !j.hasDestination(rule.ScopeTargetID) {
+			return fmt.Errorf("filter rule %d is scoped to target %s, which is not a destination of this job",
+				i+1, rule.ScopeTargetID)
 		}
 	}
 	return nil
+}
+
+// hasDestination reports whether a target is one of this job's destinations.
+func (j *Job) hasDestination(targetID string) bool {
+	for _, d := range j.Destinations {
+		if d.DestTargetID == targetID {
+			return true
+		}
+	}
+	return false
 }
 
 // overlaps reports whether two subpaths of the same target are the same
@@ -243,7 +308,7 @@ func validateSubpath(field, subpath string) error {
 
 const jobColumns = `id, name, source_target_id, source_subpath, mode, compare,
 	compare_tolerance_sec, ignore_dst_hour, workers, on_error, delete_policy,
-	log_every_file, created_at, updated_at`
+	log_every_file, unavailable_policy, parallel_destinations, created_at, updated_at`
 
 // CreateJob inserts a job and its destinations in one transaction.
 func (d *DB) CreateJob(ctx context.Context, j *Job) error {
@@ -266,10 +331,11 @@ func (d *DB) CreateJob(ctx context.Context, j *Job) error {
 	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.ExecContext(ctx, `INSERT INTO jobs (`+jobColumns+`)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Name, j.SourceTargetID, j.SourceSubpath, string(j.Mode), string(j.Compare),
 		j.CompareToleranceSec, boolToInt(j.IgnoreDSTHour), j.Workers, string(j.OnError),
-		string(j.DeletePolicy), boolToInt(j.LogEveryFile),
+		string(j.DeletePolicy), boolToInt(j.LogEveryFile), string(j.UnavailablePolicy),
+		boolToInt(j.ParallelDestinations),
 		formatTime(j.CreatedAt), formatTime(j.UpdatedAt))
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -295,6 +361,12 @@ func (d *DB) CreateJob(ctx context.Context, j *Job) error {
 		}
 	}
 
+	for i := range j.Filters {
+		if err := insertFilterRule(ctx, tx, j.ID, &j.Filters[i], i); err != nil {
+			return err
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("creating job %q: %w", j.Name, err)
 	}
@@ -313,6 +385,9 @@ func (d *DB) GetJob(ctx context.Context, id string) (*Job, error) {
 	}
 
 	if j.Destinations, err = d.jobDestinations(ctx, id); err != nil {
+		return nil, err
+	}
+	if j.Filters, err = d.ListFilterRules(ctx, id); err != nil {
 		return nil, err
 	}
 	return j, nil
@@ -340,6 +415,9 @@ func (d *DB) ListJobs(ctx context.Context) ([]*Job, error) {
 
 	for _, j := range jobs {
 		if j.Destinations, err = d.jobDestinations(ctx, j.ID); err != nil {
+			return nil, err
+		}
+		if j.Filters, err = d.ListFilterRules(ctx, j.ID); err != nil {
 			return nil, err
 		}
 	}
@@ -380,17 +458,20 @@ func (d *DB) jobDestinations(ctx context.Context, jobID string) ([]JobDestinatio
 
 func scanJob(s scanner) (*Job, error) {
 	var (
-		j                            Job
-		mode, compare, onErr, delPol string
-		created, updated             string
-		ignoreDST, logEveryFile      int
+		j                                 Job
+		mode, compare, onErr, delPol      string
+		unavailable                       string
+		created, updated                  string
+		ignoreDST, logEveryFile, parallel int
 	)
 	err := s.Scan(&j.ID, &j.Name, &j.SourceTargetID, &j.SourceSubpath, &mode, &compare,
 		&j.CompareToleranceSec, &ignoreDST, &j.Workers, &onErr, &delPol, &logEveryFile,
-		&created, &updated)
+		&unavailable, &parallel, &created, &updated)
 	if err != nil {
 		return nil, err
 	}
+	j.UnavailablePolicy = UnavailablePolicy(unavailable)
+	j.ParallelDestinations = parallel != 0
 	j.Mode = SyncMode(mode)
 	j.Compare = CompareMethod(compare)
 	j.OnError = ErrorPolicy(onErr)

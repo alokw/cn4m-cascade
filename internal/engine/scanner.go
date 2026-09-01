@@ -53,6 +53,14 @@ type ScanResult struct {
 
 	// Errors lists directories that could not be read.
 	Errors []ScanError
+
+	// Pruned lists directories the walk skipped because a filter excluded
+	// them. They were never listed, so nothing beneath them is known.
+	Pruned []string
+
+	// Truncated is set when the walk stopped at Scanner.Limit, so the
+	// listing is a sample and not the whole tree.
+	Truncated bool
 }
 
 // Incomplete reports whether any part of the tree could not be read.
@@ -83,6 +91,19 @@ type Scanner struct {
 	// DefaultOpTimeout. Nothing here may block forever on a dead share
 	// (CLAUDE.md).
 	OpTimeout time.Duration
+
+	// Limit stops the walk once this many entries have been found. Zero
+	// means no limit. It exists for the filter-test preview, which needs a
+	// sample rather than a full listing of a 100k-file tree.
+	Limit int
+
+	// Prune, if set, is asked before descending into a directory. Skipping
+	// an excluded subtree is where filtering pays for itself: the walk never
+	// pays the latency of listing it (SPEC.md §6.1 step 4).
+	//
+	// Only rules that apply to every destination may prune, because the
+	// source is scanned once and shared across all of them.
+	Prune func(relDir string) bool
 }
 
 // DefaultScanWorkers is the middle of SPEC.md §6.1's suggested 8–16.
@@ -109,6 +130,7 @@ func (s *Scanner) Scan(ctx context.Context, root string) (*ScanResult, error) {
 		progressMu sync.Mutex
 
 		files, dirs, bytes atomic.Int64
+		truncated          atomic.Bool
 		// sem bounds concurrent readdir calls only. It is deliberately not
 		// held while waiting for child directories: a parent holding a slot
 		// while its children queue for one would deadlock.
@@ -161,6 +183,10 @@ func (s *Scanner) Scan(ctx context.Context, root string) (*ScanResult, error) {
 			if ctx.Err() != nil {
 				return
 			}
+			if s.Limit > 0 && files.Load()+dirs.Load() >= int64(s.Limit) {
+				truncated.Store(true)
+				return
+			}
 
 			relPath := de.Name()
 			if relDir != "" {
@@ -182,6 +208,13 @@ func (s *Scanner) Scan(ctx context.Context, root string) (*ScanResult, error) {
 			}
 
 			if de.IsDir() {
+				if s.Prune != nil && s.Prune(relPath) {
+					mu.Lock()
+					result.Pruned = append(result.Pruned, relPath)
+					mu.Unlock()
+					continue
+				}
+
 				mu.Lock()
 				result.Entries[relPath] = Entry{RelPath: relPath, IsDir: true}
 				mu.Unlock()
@@ -236,6 +269,7 @@ func (s *Scanner) Scan(ctx context.Context, root string) (*ScanResult, error) {
 		return nil, fmt.Errorf("scanning %s was cancelled: %w", root, err)
 	}
 
+	result.Truncated = truncated.Load()
 	result.Files = files.Load()
 	result.Dirs = dirs.Load()
 	result.Bytes = bytes.Load()

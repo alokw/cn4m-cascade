@@ -64,6 +64,22 @@ type Plan struct {
 	BlockedReason    string
 }
 
+// Matcher decides which paths are in scope. internal/filter implements it;
+// the engine only needs the two questions and stays unaware of how rules are
+// written or where they came from.
+type Matcher interface {
+	// Admits reports whether a path is in scope.
+	Admits(relPath string, isDir bool) bool
+	// PrunesDir reports whether a directory is excluded outright, so a walk
+	// can skip descending into it.
+	PrunesDir(relPath string) bool
+	// Degraded reports that a rule could not be loaded and was dropped. A
+	// dropped rule widens scope, which in mirror mode turns previously
+	// excluded destination files into extraneous ones, so a degraded filter
+	// must never be allowed to delete.
+	Degraded() (bool, string)
+}
+
 // DiffOptions are the comparison rules from SPEC.md §6.2.
 type DiffOptions struct {
 	Mode      store.SyncMode
@@ -75,6 +91,20 @@ type DiffOptions struct {
 	// differing only in case are the same file. SMB targets usually are
 	// (SPEC.md §6.5).
 	CaseInsensitiveDest bool
+
+	// Filter, if set, decides which paths are in scope.
+	//
+	// An excluded path is invisible on BOTH sides: never copied, never
+	// deleted, never compared. Filtering only the source would make mirror
+	// treat every excluded path as missing and delete it from the
+	// destination — so adding a rule to skip copying a directory would
+	// silently destroy the backup of that directory.
+	Filter Matcher
+}
+
+// admits reports whether a path is in scope. A nil filter admits everything.
+func (o DiffOptions) admits(relPath string, isDir bool) bool {
+	return o.Filter == nil || o.Filter.Admits(relPath, isDir)
 }
 
 // Diff produces the ordered action plan that makes dst match src under the
@@ -123,6 +153,9 @@ func Diff(src, dst *ScanResult, opts DiffOptions) *Plan {
 			continue
 		}
 		srcEntry := src.Entries[relPath]
+		if !opts.admits(relPath, srcEntry.IsDir) {
+			continue
+		}
 		dstEntry, exists := dst.Entries[relPath]
 
 		// A symlink at the source is never synced (SPEC.md §13).
@@ -242,6 +275,12 @@ func Diff(src, dst *ScanResult, opts DiffOptions) *Plan {
 			if _, exists := src.Entries[relPath]; exists {
 				continue
 			}
+			// Out of scope means out of scope on this side too. Without
+			// this, everything the filter excludes would look extraneous
+			// and be deleted.
+			if !opts.admits(relPath, dst.Entries[relPath].IsDir) {
+				continue
+			}
 			if opts.CaseInsensitiveDest && foldedSrc[strings.ToLower(relPath)] {
 				plan.Conflicts = append(plan.Conflicts, Conflict{
 					RelPath: relPath,
@@ -262,12 +301,19 @@ func Diff(src, dst *ScanResult, opts DiffOptions) *Plan {
 			}
 		}
 
-		if reason := deletionGuard(src, dst); reason != "" {
+		if reason := deletionGuard(src, dst, opts); reason != "" {
 			plan.DeletionsBlocked = len(deletes)+len(rmdirs) > 0
 			plan.BlockedReason = reason
 			deletes, rmdirs = nil, nil
 		}
 	}
+
+	// Every copy needs its parent directories to exist. Deriving them from
+	// the copies rather than from admitted directory entries is what makes
+	// include rules work: an include like "*.jpg" never matches the
+	// directory "photos", so relying on directory admission would plan the
+	// copy of "photos/a.jpg" without the mkdir it depends on.
+	mkdirs = append(mkdirs, requiredDirs(copies, dst, mkdirs)...)
 
 	// Shallowest first, so parents exist before their children.
 	sortByDepth(mkdirs, true)
@@ -294,11 +340,63 @@ func Diff(src, dst *ScanResult, opts DiffOptions) *Plan {
 	return plan
 }
 
+// requiredDirs returns mkdir actions for the ancestor directories that
+// planned copies need and that neither the destination nor the plan already
+// provides.
+func requiredDirs(copies []Action, dst *ScanResult, planned []Action) []Action {
+	have := make(map[string]bool, len(planned))
+	for _, a := range planned {
+		have[a.RelPath] = true
+	}
+
+	var extra []Action
+	for _, c := range copies {
+		for _, dir := range ancestors(c.RelPath) {
+			if have[dir] {
+				continue
+			}
+			have[dir] = true
+
+			if entry, exists := dst.Entries[dir]; exists && entry.IsDir {
+				continue // already there
+			}
+			extra = append(extra, Action{
+				Kind: ActionMkDir, RelPath: dir,
+				Reason: "needed for files being copied into it",
+			})
+		}
+	}
+	return extra
+}
+
+// ancestors lists a path's parent directories, shallowest first.
+func ancestors(relPath string) []string {
+	var out []string
+	for i := 0; i < len(relPath); i++ {
+		if relPath[i] == '/' {
+			out = append(out, relPath[:i])
+		}
+	}
+	return out
+}
+
 // deletionGuard returns a reason to withhold every deletion, or "".
 //
 // Both cases it catches are ways a mirror destroys data on the strength of a
 // source listing that does not reflect reality.
-func deletionGuard(src, dst *ScanResult) string {
+func deletionGuard(src, dst *ScanResult, opts DiffOptions) string {
+	// A filter rule that could not be loaded was dropped, so the chain is
+	// narrower than the user configured. Everything that rule protected is
+	// now in scope and looks extraneous. The rule file often lives on a
+	// share, and a share being briefly unavailable must not cost the user
+	// their backup of whatever it excluded.
+	if opts.Filter != nil {
+		if degraded, reason := opts.Filter.Degraded(); degraded {
+			return "a filter rule could not be loaded and was skipped (" + reason +
+				"), so the filter is narrower than configured and nothing was deleted"
+		}
+	}
+
 	// An unreadable source directory makes everything beneath it look
 	// extraneous at the destination.
 	if src.Incomplete() {

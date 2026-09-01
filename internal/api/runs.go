@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/alokw/cn4m-cascade/internal/engine"
 	"github.com/alokw/cn4m-cascade/internal/runner"
 	"github.com/alokw/cn4m-cascade/internal/store"
 )
@@ -14,7 +13,7 @@ import (
 // that has not yet been flushed to the database.
 type runResponse struct {
 	*store.Run
-	Progress *engine.Snapshot           `json:"progress,omitempty"`
+	Progress *runner.RunSnapshot        `json:"progress,omitempty"`
 	Counts   map[store.EventLevel]int64 `json:"event_counts,omitempty"`
 }
 

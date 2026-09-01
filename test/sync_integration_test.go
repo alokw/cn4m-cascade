@@ -520,18 +520,69 @@ func requireIptables(t *testing.T) {
 	}
 }
 
+// iptablesBounded runs one iptables command and never blocks for longer than
+// the bound, whatever the command does.
+//
+// Two things can wedge it. iptables waits on /run/xtables.lock indefinitely by
+// default, so -w caps that. And fork/exec itself can stall in a process whose
+// threads are parked in uninterruptible CIFS syscalls — which is the normal
+// state of the cable-pull test. exec.CommandContext cannot help there, because
+// its watchdog only arms after Start returns, so the wait is bounded here
+// instead. The channel is buffered so the abandoned goroutine always finishes
+// (CLAUDE.md: abandoning a goroutine parked in a syscall is the accepted cost
+// of not hanging).
+func iptablesBounded(args ...string) error {
+	done := make(chan error, 1)
+	go func() {
+		cmd := exec.Command("iptables", append([]string{"-w", "5"}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			err = fmt.Errorf("iptables %s: %w: %s", strings.Join(args, " "), err, out)
+		}
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(20 * time.Second):
+		return fmt.Errorf("iptables %s did not return within 20s", strings.Join(args, " "))
+	}
+}
+
+// dropBlackholes removes every DROP rule for an address, however many are
+// installed. A test process killed before its cleanup ran (a timeout, an
+// interrupted CI job) leaves its rule behind, and a stale rule makes every
+// later run fail at the mount with error 115 — which reads exactly like a
+// broken change. Draining on the way in makes the harness self-heal.
+//
+// It gives up on the first failure: "no such rule" is how the drain ends
+// normally, and a timeout means the harness is wedged badly enough that
+// looping again would only spend the test's remaining budget.
+func dropBlackholes(ip string) {
+	for i := 0; i < 16; i++ {
+		if err := iptablesBounded("-D", "OUTPUT", "-d", ip, "-j", "DROP"); err != nil {
+			return
+		}
+	}
+}
+
 // blackhole drops all traffic to an address until the test ends.
 func blackhole(t *testing.T, ip string) {
 	t.Helper()
 
-	add := exec.Command("iptables", "-A", "OUTPUT", "-d", ip, "-j", "DROP")
-	if out, err := add.CombinedOutput(); err != nil {
-		t.Skipf("could not install an iptables rule (needs NET_ADMIN): %v: %s", err, out)
+	dropBlackholes(ip)
+	if err := iptablesBounded("-A", "OUTPUT", "-d", ip, "-j", "DROP"); err != nil {
+		t.Skipf("could not install an iptables rule (needs NET_ADMIN): %v", err)
 	}
 	t.Cleanup(func() {
-		del := exec.Command("iptables", "-D", "OUTPUT", "-d", ip, "-j", "DROP")
-		if out, err := del.CombinedOutput(); err != nil {
-			t.Logf("could not remove the iptables rule: %v: %s", err, out)
+		// The rule must come out even if the drain below cannot finish:
+		// leaving it installed wedges every later test against this server.
+		if err := iptablesBounded("-D", "OUTPUT", "-d", ip, "-j", "DROP"); err != nil {
+			t.Errorf("could not remove the blackhole on %s; the harness is now dirty "+
+				"(run `make harness-clean`): %v", ip, err)
+			return
 		}
+		dropBlackholes(ip)
 	})
 }

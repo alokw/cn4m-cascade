@@ -91,6 +91,16 @@ func boundedRemove(ctx context.Context, timeout time.Duration, path string) erro
 	})
 }
 
+// ReadFileBounded reads a whole file without letting a dead share trap the
+// caller. Exported because filter rule files may live on a target
+// (SPEC.md §6.5's target:// references), and those are share paths like any
+// other.
+func ReadFileBounded(ctx context.Context, timeout time.Duration, path string) ([]byte, error) {
+	return bounded(ctx, timeout, "reading "+path, func() ([]byte, error) {
+		return os.ReadFile(path)
+	})
+}
+
 func boundedRename(ctx context.Context, timeout time.Duration, from, to string) error {
 	return boundedVoid(ctx, timeout, "renaming into place at "+to, func() error {
 		return os.Rename(from, to)

@@ -37,7 +37,9 @@ const (
 	DestSuccess   DestStatus = "success"
 	DestFailed    DestStatus = "failed"
 	DestCancelled DestStatus = "cancelled"
-	// DestSkippedUnavailable arrives with the availability gate in Phase 3.
+	// DestSkippedUnavailable means the destination could not be reached and
+	// the job's unavailable_policy said to carry on without it.
+	DestSkippedUnavailable DestStatus = "skipped_unavailable"
 )
 
 // Run is one execution of a job.

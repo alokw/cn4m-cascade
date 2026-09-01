@@ -94,6 +94,7 @@ Run `make help` for this list at any time.
 |---|---|
 | `make harness-up` | Build and start the Samba servers + dev container, then wait for port 445 |
 | `make harness-down` | **Stop the harness and delete its volumes** |
+| `make harness-clean` | Clear leftover mounts and firewall rules from a test run that was killed |
 | `make verify-cifs` | Prove the host kernel supports CIFS mounts |
 | `make demo` | Walk the Phase 1 exit criteria with curl |
 | `make test-unit` | Unit tests under the race detector — no kernel or Samba needed |
@@ -221,6 +222,13 @@ it never answers, restart Docker Desktop.
 
 **`make verify-cifs` fails with an unknown filesystem type.** The VM kernel lacks the `cifs` module.
 Nothing in this project can work around that; use a Linux host.
+
+**Integration tests fail with `mount error(115): Operation now in progress`.** Almost always a dirty
+harness rather than a real failure. A test process killed before its cleanup ran leaves behind an
+`iptables` blackhole (from the cable-pull test) and CIFS mounts that retry forever; while the kernel
+is mid-reconnect to a server, a *new* mount to that server returns 115. Run `make harness-clean` —
+`make test-integration` now does it for you. The tell is that only the first test or two fail, and
+the same shares work later in the run.
 
 **Integration tests report an unreachable host.** The Samba containers may not have bound port 445
 yet. `make harness-up` waits for them; if you started the stack with `docker compose` directly, run

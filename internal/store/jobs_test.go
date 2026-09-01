@@ -130,9 +130,60 @@ func TestJobValidate(t *testing.T) {
 		{"negative tolerance", func(j *Job) { j.CompareToleranceSec = -1 }, "must not be negative"},
 		{"no destination", func(j *Job) { j.Destinations = nil }, "at least one destination"},
 		{
-			"fan-out is not supported yet",
+			"several destinations are allowed",
 			func(j *Job) { j.Destinations = append(j.Destinations, JobDestination{DestTargetID: "other"}) },
-			"only one destination",
+			"",
+		},
+		{
+			"two destinations at the same place",
+			func(j *Job) {
+				j.Destinations = append(j.Destinations, JobDestination{DestTargetID: j.Destinations[0].DestTargetID})
+			},
+			"same target",
+		},
+		{
+			// run_destinations is keyed by (run_id, dest_target_id), so a
+			// second destination on one target could never run.
+			"same target twice, even with different subpaths",
+			func(j *Job) {
+				j.Destinations[0].DestSubpath = "one"
+				j.Destinations = append(j.Destinations, JobDestination{
+					DestTargetID: j.Destinations[0].DestTargetID, DestSubpath: "two",
+				})
+			},
+			"two destinations on the same target",
+		},
+		{
+			"prompt policy is not implemented yet",
+			func(j *Job) { j.UnavailablePolicy = PolicyPrompt },
+			"not implemented yet",
+		},
+		{
+			"unknown unavailable policy",
+			func(j *Job) { j.UnavailablePolicy = "panic" },
+			"unavailable_policy must be",
+		},
+		{
+			"a target-scoped rule must name a real destination",
+			func(j *Job) {
+				j.Filters = []FilterRule{{
+					Scope: ScopeTarget, ScopeTargetID: "not-a-destination",
+					Direction: FilterExclude, Source: SourceInline, Patterns: []string{"*.tmp"},
+					OnError: FilterFailRun,
+				}}
+			},
+			"not a destination of this job",
+		},
+		{
+			"a target-scoped rule naming a real destination is fine",
+			func(j *Job) {
+				j.Filters = []FilterRule{{
+					Scope: ScopeTarget, ScopeTargetID: j.Destinations[0].DestTargetID,
+					Direction: FilterExclude, Source: SourceInline, Patterns: []string{"*.tmp"},
+					OnError: FilterFailRun,
+				}}
+			},
+			"",
 		},
 		{
 			"destination same as source",

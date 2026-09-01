@@ -41,8 +41,22 @@ lint: ## golangci-lint
 test-unit: ## Unit tests under the race detector (no kernel, no Samba)
 	$(DEV) env CGO_ENABLED=1 go test -race -count=1 ./...
 
+# A test process killed before its cleanup ran (a timeout, ^C, a cancelled CI
+# job) leaves two things behind that poison every later run: an iptables
+# blackhole from the cable-pull test, and CIFS mounts that retry forever. The
+# retries are the nastier of the two — while the kernel is mid-reconnect to a
+# server, a *new* mount to it returns error 115, which reads exactly like a
+# broken change rather than a dirty harness.
+.PHONY: harness-clean
+harness-clean: ## Clear leftover mounts and blackholes from a killed test run
+	@$(DEV) sh -c 'mount -t cifs 2>/dev/null | awk "{print \$$3}" | grep "^/tmp/Test" \
+	  | while read m; do umount -l "$$m" 2>/dev/null && echo "unmounted $$m"; done; \
+	  for ip in 172.28.0.10 172.28.0.11; do \
+	    while iptables -D OUTPUT -d $$ip -j DROP 2>/dev/null; do echo "removed blackhole on $$ip"; done; \
+	  done; true'
+
 .PHONY: test-integration
-test-integration: ## Integration tests against the Samba harness
+test-integration: harness-clean ## Integration tests against the Samba harness
 	$(DEV) env CGO_ENABLED=1 go test -race -tags=integration -count=1 -v ./test/...
 
 .PHONY: test-scale

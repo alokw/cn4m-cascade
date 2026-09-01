@@ -13,10 +13,9 @@ import (
 // separate database writes. Every event is logged as it arrives, whether or
 // not it has been flushed yet (CLAUDE.md).
 type eventBuffer struct {
-	db     *store.DB
-	runID  string
-	destID string
-	log    *slog.Logger
+	db    *store.DB
+	runID string
+	log   *slog.Logger
 	// ctx is the run's finalisation context: it outlives cancellation, so a
 	// cancelled run can still record why it stopped.
 	ctx context.Context
@@ -28,20 +27,30 @@ type eventBuffer struct {
 // flushThreshold bounds how much is held in memory between ticks.
 const flushThreshold = 500
 
-func newEventBuffer(ctx context.Context, db *store.DB, runID, destID string, log *slog.Logger) *eventBuffer {
-	return &eventBuffer{ctx: ctx, db: db, runID: runID, destID: destID, log: log}
+func newEventBuffer(ctx context.Context, db *store.DB, runID string, log *slog.Logger) *eventBuffer {
+	return &eventBuffer{ctx: ctx, db: db, runID: runID, log: log}
 }
 
-// Add records an event. Safe to call from the executor's worker goroutines.
-func (b *eventBuffer) Add(ev engine.Event) {
+// sinkFor returns an EventSink that stamps every event with a destination,
+// for handing to one destination's executor.
+func (b *eventBuffer) sinkFor(destTargetID string) engine.EventSink {
+	return func(ev engine.Event) { b.AddFor(destTargetID, ev) }
+}
+
+// Add records a run-level event, one not attributable to a destination.
+func (b *eventBuffer) Add(ev engine.Event) { b.AddFor("", ev) }
+
+// AddFor records an event against a destination. Safe to call from the
+// executor's worker goroutines.
+func (b *eventBuffer) AddFor(destTargetID string, ev engine.Event) {
 	b.log.Log(b.ctx, levelToSlog(ev.Level), ev.Message,
-		"run_id", b.runID, "relpath", ev.RelPath)
+		"run_id", b.runID, "dest_target_id", destTargetID, "relpath", ev.RelPath)
 
 	b.mu.Lock()
 	b.pending = append(b.pending, store.RunEvent{
 		RunID:        b.runID,
 		Level:        ev.Level,
-		DestTargetID: b.destID,
+		DestTargetID: destTargetID,
 		RelPath:      ev.RelPath,
 		Message:      ev.Message,
 	})
