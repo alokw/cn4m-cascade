@@ -101,6 +101,25 @@ func run(log *slog.Logger) error {
 	runs := runner.New(db, provider, log)
 	server := api.NewServer(db, provider, mounts, healthc, box, runs, log)
 
+	// SMBSYNC_ADMIN_PASSWORD seeds first-run setup so a container can come up
+	// already configured (SPEC.md §8). It never overwrites an existing
+	// password: an env var left in a compose file must not silently reset
+	// the credential every restart.
+	if pw := os.Getenv("SMBSYNC_ADMIN_PASSWORD"); pw != "" {
+		set, err := db.AdminPasswordSet(ctx)
+		if err != nil {
+			return fmt.Errorf("checking whether an admin password is set: %w", err)
+		}
+		if !set {
+			if err := db.SetAdminPassword(ctx, pw); err != nil {
+				return fmt.Errorf("setting the admin password from SMBSYNC_ADMIN_PASSWORD: %w", err)
+			}
+			log.Info("admin password set from SMBSYNC_ADMIN_PASSWORD")
+		}
+	}
+
+	server.Start(ctx)
+
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           server.Handler(),
@@ -131,6 +150,9 @@ func run(log *slog.Logger) error {
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		log.Warn("http server did not shut down cleanly", "error", err)
 	}
+	// Disconnect event-feed clients before the runs they are watching go
+	// away, so nothing is broadcasting into a closing database.
+	server.Stop()
 	// SPEC.md §10: cancel running jobs, marking them cancelled, before the
 	// mounts they are using go away.
 	if err := runs.Shutdown(shutdownCtx); err != nil {

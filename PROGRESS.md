@@ -2,7 +2,9 @@
 
 Living handoff doc. Update at the end of every session (CLAUDE.md → Workflow).
 
-**Current phase:** Phase 4 — API + UI (SPEC.md §11). **Start in plan mode.**
+**Current phase:** Phase 4b — the React SPA (SPEC.md §9). **Start in plan mode.**
+**Phase 4a:** ✅ Code complete, all exit criteria pass — **pending the fresh-context review** (§6 Phase 4a item 0). Session auth, preview/confirm, the interactive prompt policy, the
+WebSocket feed, `/api/logs`, `/api/browse` and job update. See §0-4a.
 **Phase 3:** ✅ Complete — Filtering + multi-destination. All three exit criteria pass, the
 fresh-context review is done (it found five more paths to data loss, all filter-related, all fixed
 — §5c), and vet, lint, unit and integration are all green under `-race` in a single clean run.
@@ -10,6 +12,80 @@ fresh-context review is done (it found five more paths to data loss, all filter-
 data-loss bugs, all fixed with regression tests — §5b), and the bounded-I/O hard rule is satisfied.
 **Phase 1:** ✅ Complete (record retained below).
 **Last updated:** 2026-09-01 (Phase 3 complete)
+
+---
+
+## 0-4a. Phase 4a status — API, auth and live events
+
+Phase 4 was split (D-48): **4a is the API**, verifiable in the Samba harness; **4b is the SPA**,
+built against a now-frozen API. §11 states no exit criteria for Phase 4 at all — it is the only
+phase that does not — so a set was proposed and agreed before implementation.
+
+### Built
+| Package | Contents |
+|---|---|
+| `internal/store/auth.go` (new) | admin password (PBKDF2-HMAC-SHA256, stdlib), sessions keyed by token *hash*, settings accessors, expiry and purge |
+| `internal/api/auth.go` (new) | `requireSession` middleware, first-run setup, login/logout/session, per-address login rate limiting |
+| `internal/api/hub.go` (new) | `WS /api/ws`: run progress, prompts and completion, with slow clients dropped rather than allowed to block |
+| `internal/api/browse.go` (new) | `GET /api/browse` path picker, bounded I/O, `..` rejected |
+| `internal/api/logs.go` (new) | `GET /api/logs` across every run, filtered by level/job/run/time, newest first |
+| `internal/runner/gate.go` (new) | the availability prompt and the preview park, both bounded |
+| `internal/runner` | destination pipeline split into plan → (park) → execute, so a preview can hold between them |
+| `internal/store` (migration `0004`) | `sessions`, `prompt_timeout_sec`, `prompt_fallback`, `(level, ts)` event index |
+| `internal/api/jobs.go` | `PATCH /api/jobs/{id}`, `POST /api/jobs/{id}/confirm`, `preview` on run |
+| `internal/api/runs.go` | `POST /api/runs/{id}/prompt` |
+
+### Exit criteria (proposed and agreed — §11 states none)
+| Criterion | Status |
+|---|---|
+| `/api/*` closed to strangers; login works; logout invalidates; forged cookies rejected | ✅ `TestSessionAuthGuardsTheAPI`, `TestForgedSessionCookieIsRejected` |
+| A preview parks with a plan and copies nothing; confirming executes it | ✅ `TestPreviewHoldsUntilConfirmed` |
+| An unconfirmed preview cancels and still copies nothing | ✅ `TestUnconfirmedPreviewCancelsAndChangesNothing` |
+| `prompt` parks the destination while the healthy one completes; skip → partial, abort → failed | ✅ `TestPromptPolicyParksAndAnswersSkip`, `TestPromptPolicyAnswersAbort` |
+| No answer falls back and **says so** in the log | ✅ `TestUnansweredPromptFallsBackToSkip` |
+| A WS client sees progress and completion; a stalled client is dropped without delaying the run | ✅ `TestWebSocketStreamsRunProgress`, `TestStalledWebSocketClientDoesNotDelayARun` |
+| `/api/browse` lists a share and refuses escapes; `/api/logs` reads across runs | ✅ `TestBrowseListsAShareAndRefusesEscapes`, `TestLogsReadAcrossRuns` |
+
+### Verification (CLAUDE.md → Definition of done)
+| Gate | Result |
+|---|---|
+| `go vet -tags=integration ./...` | ✅ clean |
+| `golangci-lint run` | ✅ `0 issues.` |
+| Unit tests under `-race` | ✅ config, engine, filter, mountmgr, secrets, store all `ok` |
+| Integration under `-race` | ✅ **43/43, `ok ... 320.890s`** (29 before this phase, 14 new) |
+| Fresh-context subagent review | ⛔ **not yet run** — see §6 Phase 4a |
+
+```
+--- PASS: TestSessionAuthGuardsTheAPI (3.83s)
+--- PASS: TestForgedSessionCookieIsRejected (1.32s)
+--- PASS: TestPreviewHoldsUntilConfirmed (1.69s)
+--- PASS: TestUnconfirmedPreviewCancelsAndChangesNothing (6.57s)
+--- PASS: TestConfirmWithoutAPreviewIsRejected (1.38s)
+--- PASS: TestPromptPolicyParksAndAnswersSkip (37.42s)
+--- PASS: TestPromptPolicyAnswersAbort (37.31s)
+--- PASS: TestUnansweredPromptFallsBackToSkip (42.18s)
+--- PASS: TestWebSocketStreamsRunProgress (7.88s)
+--- PASS: TestStalledWebSocketClientDoesNotDelayARun (1.58s)
+--- PASS: TestBrowseListsAShareAndRefusesEscapes (1.31s)
+--- PASS: TestLogsReadAcrossRuns (1.83s)
+--- PASS: TestJobUpdateReplacesDestinationsAndFilters (1.61s)
+... all 29 Phase 1–3 cases still PASS, now signing in first
+ok  	github.com/alokw/cn4m-cascade/test	320.890s
+```
+
+Adding auth touched every existing integration test: the harness now completes first-run setup and
+holds a session cookie (`newHarness` → `signIn`), with `doAnon` for the cases that must be refused.
+The diff was wide but shallow, as expected.
+
+### Two bugs this phase found in existing code
+- **The logging middleware silently broke WebSockets.** `statusRecorder` wrapped the
+  `ResponseWriter` without forwarding `Hijack`, so the upgrade failed with `501` — a middleware
+  breaking a protocol two layers away, with nothing in the logs to say so. It now forwards `Hijack`
+  and `Flush`.
+- **`Run.Terminal()` was `Status != RunRunning`.** With `awaiting_confirmation` added, a parked run
+  would have been read as finished. It now enumerates the terminal statuses, and `Active()` was
+  added for the "still holds resources" question, which is the one Shutdown actually asks. The
+  integration harness had the same bug in `awaitRun` and was fixed with it.
 
 ---
 
@@ -63,6 +139,23 @@ ok  	github.com/alokw/cn4m-cascade/test	134.616s
 
 The harness was verified clean *after* the run — 0 leftover CIFS mounts, no leftover iptables rules
 — which is the end-to-end proof that the cleanup fix in §6 Phase 3 item 7 actually works.
+
+### Scale run after Phase 3 (`make test-scale`)
+```
+generating 100000 files...
+generated in 1m20s
+mirrored 100000 files in 2m8s
+re-ran in 2s                       (0 copies, 0 deletions)
+--- PASS: TestScaleMirror (236.73s)
+```
+Against the Phase 2 baseline of 2m2s, and prior runs of 2m4s and 2m8s — **no measurable
+regression**; the spread between identical runs is wider than the difference.
+
+**Read that number narrowly.** The scale job has no filter rules, so `filter.NewChain(nil)` is in
+play: the run pays the per-entry `Matcher` interface dispatch and the restructured fan-out loop,
+which is what this measures, but it never evaluates a pattern. The cost of *actual* matching at
+100k scale — particularly `**` patterns, which backtrack — is still unmeasured. Worth a scale
+variant with a realistic rule set; noted in §6.
 
 Getting to this single clean run took three attempts; the two failed ones are written up in §6
 Phase 3 item 7 because both failure modes look like broken product code and are not.
@@ -174,8 +267,15 @@ hygiene, bounded shutdown), `internal/storage` (SPEC §4 verbatim), `internal/ap
 
 ## 3. What's next
 
-Phase 4 — API + UI (SPEC.md §11). **Start in plan mode**: re-read SPEC.md §8 and §9, propose
-against Phase 4's exit criteria, wait for approval.
+Phase 4b — the React SPA (SPEC.md §9). **Start in plan mode**: re-read §9, propose against the
+five pages it lists, wait for approval.
+
+The API it builds on is now complete and tested, and deliberately frozen: 4b should not need new
+endpoints. Per D-49 the job editor ships **without** the Webhooks/API tab and run detail
+**without** conflict resolution — both land in Phase 5 with the backends they drive.
+
+Verification for 4b was agreed as **API-level integration tests plus a written click-through
+checklist** rather than Playwright (see §11 note), so the checklist belongs in this file.
 
 Phase 4 inherits three things worth knowing about:
 - `Server.Handler()` is still the auth seam (D-4). Session auth lands here.
@@ -247,6 +347,20 @@ D-1…D-13 were approved 2026-08-31 before implementation; D-14…D-17 came out 
 | D-45 | Each chain clones its rules so counters are per-destination | Job-scoped rules are shared by every destination; with parallel fan-out the shared counters were a real data race, and even sequentially the numbers in the run log were the sum across destinations rather than that destination's own |
 | D-46 | Two destinations pointing at the same target are rejected at save time | `run_destinations` is keyed by `(run_id, dest_target_id)`, so the second insert violates the primary key. The job was creatable but could never run |
 | D-47 | `unavailable_policy: abort` fires on **unavailability**, not on copy failures | `abort` is the availability gate (§6.6). Ordinary copy failures are `on_error`'s job; conflating them made one unreadable file kill every remaining destination |
+| D-48 | **Phase 4 is split into 4a (API) and 4b (UI)** | It is by far the largest phase and the only one §11 gives no exit criteria for. 4a is verifiable in the Samba harness; 4b then builds against a frozen, tested API rather than a moving one. Approved 2026-09-01 |
+| D-49 | **§9's "Webhooks/API tab" and the two-way conflict UI are deferred to Phase 5** | §9 describes the finished product; §11 is the ordering authority, and it puts trigger tokens, outbound callbacks and two-way sync in Phase 5. Building those tabs now would mean UI in front of endpoints that do not exist |
+| D-50 | **Phase 4a exit criteria were proposed and agreed**, since §11 states none | CLAUDE.md defines done as "exit criteria pass in the test harness". With none written, the phase had no definition of done at all. Listed in §0-4a |
+| D-51 | An unanswered **prompt** falls back (default `skip`, per-job `prompt_fallback`); an unconfirmed **preview** cancels | Both choose the option that does less. A skipped destination is corrected by the next run; an unconfirmed plan must never execute. The asymmetry is deliberate |
+| D-52 | `prompt_timeout_sec` defaults to 600, floor 5, ceiling 86400 | A run may be unattended — from Phase 5 it may be started by cron with nobody watching — so "wait for a human" can never mean "wait forever" |
+| D-53 | The **destination** parks on a prompt, not the run | The run stays `running` and its other destinations keep working, which is what makes fan-out useful when one server is down. A new `DestAwaitingPrompt` status carries it |
+| D-54 | Password hashing is **stdlib `crypto/pbkdf2`** (SHA-256, 600k iterations), not bcrypt or argon2 | Either would add `golang.org/x/crypto` for one function; the cgo-free, dependency-light build is a stated goal (§3.1). The iteration count is stored with the hash so it can be raised later |
+| D-55 | Sessions store a **SHA-256 of the token**, not the token | A stolen database must not yield live sessions — the same reasoning that encrypts target passwords (§5). A plain hash is right here where it would be wrong for a password: the token is 256 bits from `crypto/rand`, so there is no dictionary to attack |
+| D-56 | The session cookie sets `Secure` **only when the request arrived over TLS** | The container is normally reached over plain HTTP on a LAN (§3 host networking, no TLS terminator). An unconditional `Secure` would make the browser discard the cookie and login would fail with nothing to see |
+| D-57 | `Run.Terminal()` enumerates terminal statuses instead of `!= running`, and `Active()` was added | `awaiting_confirmation` is neither running nor finished. The old form would have called a parked run done |
+| D-58 | A confirmed preview executes the **held** plan, not a fresh diff | The user agreed to a specific set of changes; re-diffing could execute something they never saw. The cost is that the plan is a snapshot, which the executor already tolerates (a file that vanished is a normal event) |
+| D-59 | `PATCH /api/jobs/{id}` replaces destinations and filters wholesale, and is refused while the job runs | §8 lists only `POST /api/jobs` for "create/update"; a REST update of a job with nested children is a different operation, so this is recorded as an extension rather than a silent deviation. Children are positional and job-owned, so replace beats diff. Editing under a live diff is not something the engine is built to survive |
+| D-60 | The WS hub reads the **most recent** runs each tick, not only the live ones | A short run can start and finish inside one tick. A feed watching only live runs would never mention it, so a dashboard would show a job that quietly never reported anything |
+| D-61 | `github.com/coder/websocket` is the only new dependency | §3 decision 6 specifies WebSocket for live progress, so SSE was not an option despite being zero-dependency. coder/websocket is pure Go and cgo-free |
 
 ## 5. Review findings and resolution
 
@@ -330,6 +444,31 @@ mechanism is always **something that widens scope without anyone noticing**.
 
 ## 6. Open items for the next session
 
+### Phase 4a
+
+0. **The fresh-context review has not been run.** CLAUDE.md requires it before a phase is declared
+   complete, and it has found real data-loss bugs in each of the last two phases. Everything else
+   for 4a is done and green; this is the remaining gate. Not run because this session was told not
+   to spawn agents unless asked.
+1. **Password change has no endpoint.** `store.SetAdminPassword` and `DeleteAllSessions` exist and
+   are tested, but nothing calls them after first-run setup, so a password can only be changed by
+   deleting the row. Needs a `POST /api/auth/password` that requires the current password and then
+   invalidates every session. Small, and it belongs with the settings screen in 4b.
+2. **A previewed run holds its mounts for up to `prompt_timeout_sec`.** That is by design — the
+   confirmed plan must execute against what it planned against — but a job with a long timeout and
+   nobody watching keeps a mount referenced for that whole window. Worth revisiting if it ever
+   collides with the idle reaper.
+3. **The WS feed is server→client only.** SPEC.md §8 lists target health changes among the events;
+   only run progress, prompts and completion are broadcast. Health changes are still visible
+   through `GET /api/targets`, so the dashboard can poll for those until 4b needs better.
+4. **`recentRunWindow` is 50.** A burst of more than 50 runs between two one-second ticks would
+   lose completion events for the oldest. Not reachable today (one run per job at a time), but it
+   is an assumption worth naming before the scheduler arrives.
+5. **No rate limit on `/api/auth/setup`.** It self-closes once a password exists, so the exposure
+   is a single race on a brand-new instance, but it is the one auth endpoint without a limiter.
+6. `sessionResponse` does not report *when* a session expires, so the UI cannot warn before it
+   lapses. Cosmetic until 4b.
+
 ### Phase 3
 
 1. **Rule files are not validated at save time.** SPEC.md §6.5 asks for it; today a typo in a
@@ -339,6 +478,9 @@ mechanism is always **something that widens scope without anyone noticing**.
 2. **§6.5's optional debug toggle to log every filtered path is not implemented.** Counts are.
 3. `handleFilterTest` returns 400 when the *source* is unavailable, which reads as "your request was
    malformed". Should be 502/503, matching the target-test endpoint.
+3b. **Pattern-matching cost at scale is unmeasured.** The post-Phase-3 scale run had no filter rules,
+   so it exercised the `Matcher` dispatch but never a pattern. A `**`-heavy rule set over 100k
+   entries is the case worth timing before anyone relies on filters at that size.
 4. `RunSnapshot` drops `FilesFound`/`DirsFound` from the per-destination trackers, so the run-level
    view cannot show scan totals. Harmless today because the UI does not exist yet.
 5. **`ReadFileBounded` has no size cap.** A rule file pointed at a multi-gigabyte file on a share
@@ -405,8 +547,9 @@ mechanism is always **something that widens scope without anyone noticing**.
 
 ### Carried from Phase 1
 
-1. **CLAUDE.md says "Go 1.22+" but the toolchain is now 1.25** (D-17). Either update that line or
-   pin older dependencies. Needs a decision — it is your file, so I left it alone.
+1. ~~**CLAUDE.md says "Go 1.22+" but the toolchain is now 1.25** (D-17).~~ **Done 2026-09-01** with
+   the user's approval — the line now reads "Go 1.25+" and names why (`modernc.org/sqlite` requires
+   it; `crypto/hkdf` already needed 1.24). Matches `go.mod`'s `go 1.25.0`.
 2. ~~README still describes an unrelated project.~~ **Done** — rewritten with status, quickstart,
    command reference, teardown, configuration, a verified curl walkthrough, repo layout and
    troubleshooting, including the SPEC.md §3 privileged-container rationale. Note the old one-line

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -109,4 +110,54 @@ func (s *Server) writeRunError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusInternalServerError, "run_error", err.Error(), "")
+}
+
+// promptRequest answers a target-unavailable prompt (SPEC.md §8).
+type promptRequest struct {
+	Action       runner.PromptAction `json:"action"`
+	DestTargetID string              `json:"dest_target_id"`
+}
+
+// handlePrompt records a human's decision about an unavailable destination,
+// completing the `prompt` policy of SPEC.md §6.6.
+func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("id")
+	if _, err := s.db.GetRun(r.Context(), runID); err != nil {
+		s.writeRunError(w, err)
+		return
+	}
+
+	var req promptRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "The request body is not valid JSON.", err.Error())
+		return
+	}
+	if req.DestTargetID == "" {
+		writeError(w, http.StatusBadRequest, "missing_destination",
+			"Say which destination this answer is about.", "")
+		return
+	}
+	if !runner.ValidPromptAction(req.Action) {
+		writeError(w, http.StatusBadRequest, "invalid_action",
+			`action must be "skip", "retry" or "abort".`, string(req.Action))
+		return
+	}
+
+	switch err := s.runner.AnswerPrompt(runID, req.DestTargetID, req.Action); {
+	case err == nil:
+		s.log.Info("prompt answered", "run_id", runID,
+			"dest_target_id", req.DestTargetID, "action", req.Action)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "accepted"})
+	case errors.Is(err, runner.ErrNotRunning):
+		writeError(w, http.StatusConflict, "not_running",
+			"That run has already finished.", "")
+	case errors.Is(err, runner.ErrNoSuchPrompt):
+		// The countdown ran out, or somebody else answered first. Not an
+		// error the user did anything about.
+		writeError(w, http.StatusConflict, "no_such_prompt",
+			"That destination is no longer waiting for an answer.", "")
+	default:
+		writeError(w, http.StatusInternalServerError, "prompt_failed",
+			"Could not record that answer.", err.Error())
+	}
 }

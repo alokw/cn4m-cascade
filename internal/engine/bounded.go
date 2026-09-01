@@ -64,12 +64,27 @@ func boundedVoid(ctx context.Context, timeout time.Duration, what string, fn fun
 }
 
 func boundedReadDir(ctx context.Context, timeout time.Duration, path string) ([]os.DirEntry, error) {
+	return ReadDirBounded(ctx, timeout, path)
+}
+
+// ReadDirBounded lists a directory without letting a dead share trap the
+// caller. Exported because the API's path picker (SPEC.md §8's /api/browse)
+// lists share directories directly, and the hard rule against unbounded
+// os.ReadDir on a share path applies just as much outside the engine.
+func ReadDirBounded(ctx context.Context, timeout time.Duration, path string) ([]os.DirEntry, error) {
 	return bounded(ctx, timeout, "listing "+path, func() ([]os.DirEntry, error) {
 		return os.ReadDir(path)
 	})
 }
 
 func boundedInfo(ctx context.Context, timeout time.Duration, entry os.DirEntry, path string) (fs.FileInfo, error) {
+	return InfoBounded(ctx, timeout, entry, path)
+}
+
+// InfoBounded stats a directory entry without letting a dead share trap the
+// caller. os.DirEntry.Info is a syscall on anything that was not cached by the
+// listing, so on a share it needs the same bound as every other one.
+func InfoBounded(ctx context.Context, timeout time.Duration, entry os.DirEntry, path string) (fs.FileInfo, error) {
 	return bounded(ctx, timeout, "reading the details of "+path, entry.Info)
 }
 

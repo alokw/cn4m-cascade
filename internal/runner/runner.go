@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alokw/cn4m-cascade/internal/engine"
@@ -49,6 +50,15 @@ type handle struct {
 	progress *progress
 	// cancelled distinguishes a user cancellation from a failure.
 	cancelled bool
+
+	// preview means the run plans its work and waits to be confirmed
+	// before touching anything (SPEC.md §6.1 step 6).
+	preview bool
+	// parked is true while the run is holding a plan awaiting confirmation.
+	// Read without the Runner lock, hence atomic.
+	parked atomic.Bool
+	// gate holds whatever the run is waiting for a human to answer.
+	gate *gate
 }
 
 // New builds a Runner.
@@ -67,6 +77,16 @@ func New(db *store.DB, provider *storage.Provider, log *slog.Logger) *Runner {
 // The run does not inherit the caller's context: an HTTP request finishing
 // must not cancel a sync that may take hours.
 func (r *Runner) Start(ctx context.Context, job *store.Job) (*store.Run, error) {
+	return r.start(ctx, job, false)
+}
+
+// StartPreview plans the run and parks it until confirmed, without copying,
+// deleting or creating anything (SPEC.md §6.1 step 6).
+func (r *Runner) StartPreview(ctx context.Context, job *store.Job) (*store.Run, error) {
+	return r.start(ctx, job, true)
+}
+
+func (r *Runner) start(ctx context.Context, job *store.Job, preview bool) (*store.Run, error) {
 	if len(job.Destinations) == 0 {
 		return nil, errors.New("this job has no destination")
 	}
@@ -110,6 +130,8 @@ func (r *Runner) Start(ctx context.Context, job *store.Job) (*store.Run, error) 
 		jobID:    job.ID,
 		cancel:   cancel,
 		progress: newProgress(time.Now(), destIDs),
+		preview:  preview,
+		gate:     newGate(),
 	}
 
 	// The wait group is incremented before the handle is published, so
@@ -260,15 +282,39 @@ func (r *Runner) execute(ctx context.Context, h *handle, job *store.Job, run *st
 		log.Error("could not record scan totals", "error", err)
 	}
 
-	// 4. Fan out.
+	// 4. Plan every destination. Nothing is written yet: planning holds the
+	//    mounts so a confirmed preview executes against what it planned.
 	stopFlusher := r.startFlusher(finalCtx, h, run.ID)
-	outcomes := r.runDestinations(ctx, h, job, run, srcRoot, srcScan, chains, events, log)
+	planned := r.planDestinations(ctx, h, job, run, srcRoot, srcScan, chains, events, log)
+	defer releaseAll(planned)
+
+	// 5. If this is a preview, hold the plan until a human confirms it.
+	if h.preview {
+		confirmed := r.awaitConfirmation(ctx, h, job, run, events, log)
+		if !confirmed {
+			stopFlusher()
+			h.progress.setPhase(engine.PhaseDone)
+			r.flushProgress(finalCtx, h, run.ID)
+			// A run the user cancelled reads as cancelled; one that simply
+			// went unanswered says so. Both end up cancelled, but the
+			// reason a user sees should be the true one.
+			if r.wasCancelled(run.ID) {
+				r.cancelRun(finalCtx, job, run, events)
+				return
+			}
+			r.abandonPreview(finalCtx, job, run, planned, events, log)
+			return
+		}
+	}
+
+	// 6. Execute.
+	outcomes := r.executePlanned(ctx, h, job, run, srcRoot, planned, log)
 	stopFlusher()
 
 	h.progress.setPhase(engine.PhaseDone)
 	r.flushProgress(finalCtx, h, run.ID)
 
-	// 5. Finalise.
+	// 7. Finalise.
 	if r.wasCancelled(run.ID) {
 		r.cancelRun(finalCtx, job, run, events)
 		return
@@ -298,25 +344,71 @@ type destOutcome struct {
 	degraded bool
 }
 
-// runDestinations executes every destination, sequentially by default.
-func (r *Runner) runDestinations(ctx context.Context, h *handle, job *store.Job, run *store.Run, srcRoot string, srcScan *engine.ScanResult, chains map[string]*filter.Chain, events *eventBuffer, log *slog.Logger) []destOutcome {
-	outcomes := make([]destOutcome, len(job.Destinations))
+// plannedDest is one destination that has been resolved, scanned and diffed.
+// It holds its mount reference until the plan is executed or abandoned, which
+// is what lets a previewed run park between planning and doing.
+type plannedDest struct {
+	dest     store.JobDestination
+	targetID string
+	chain    *filter.Chain
+	sink     engine.EventSink
+	tracker  *engine.Tracker
+
+	root       string
+	dstStorage storage.Storage
+	release    func()
+	plan       *engine.Plan
+
+	// outcome is set when planning short-circuited — unavailable, failed,
+	// or cancelled — and there is nothing left to execute.
+	outcome *destOutcome
+}
+
+// releaseAll drops every mount reference a planning pass acquired. Planning
+// holds them so that a confirmed preview executes against the same mounts it
+// planned against; every exit path has to give them back.
+func releaseAll(planned []*plannedDest) {
+	for _, p := range planned {
+		if p != nil && p.release != nil {
+			p.release()
+		}
+	}
+}
+
+// outcomesOf collects what planning and execution decided, in job order.
+func outcomesOf(planned []*plannedDest) []destOutcome {
+	out := make([]destOutcome, len(planned))
+	for i, p := range planned {
+		if p.outcome != nil {
+			out[i] = *p.outcome
+		}
+	}
+	return out
+}
+
+// planDestinations resolves, scans and diffs every destination without writing
+// anything. Sequential by default, matching execution.
+func (r *Runner) planDestinations(ctx context.Context, h *handle, job *store.Job, run *store.Run, srcRoot string, srcScan *engine.ScanResult, chains map[string]*filter.Chain, events *eventBuffer, log *slog.Logger) []*plannedDest {
+	planned := make([]*plannedDest, len(job.Destinations))
 
 	work := func(i int, dest store.JobDestination) {
-		outcomes[i] = r.runOneDestination(ctx, h, job, run, srcRoot, srcScan, chains[dest.DestTargetID], dest, events, log)
+		planned[i] = r.planOneDestination(ctx, h, job, run, srcRoot, srcScan, chains[dest.DestTargetID], dest, events, log)
 	}
 
 	if !job.ParallelDestinations {
 		for i, dest := range job.Destinations {
 			// An abort policy stops the remaining destinations too.
-			if i > 0 && job.UnavailablePolicy == store.PolicyAbort && unavailableEarlier(outcomes[:i]) {
-				outcomes[i] = destOutcome{targetID: dest.DestTargetID, status: store.DestCancelled,
-					summary: "not attempted: an earlier destination was unavailable and this job aborts"}
+			if i > 0 && job.UnavailablePolicy == store.PolicyAbort && unavailableEarlierPlanned(planned[:i]) {
+				planned[i] = &plannedDest{
+					dest: dest, targetID: dest.DestTargetID,
+					outcome: &destOutcome{targetID: dest.DestTargetID, status: store.DestCancelled,
+						summary: "not attempted: an earlier destination was unavailable and this job aborts"},
+				}
 				continue
 			}
 			work(i, dest)
 		}
-		return outcomes
+		return planned
 	}
 
 	// Parallel fan-out multiplies read load on the source share, which is
@@ -330,50 +422,38 @@ func (r *Runner) runDestinations(ctx context.Context, h *handle, job *store.Job,
 		}()
 	}
 	wg.Wait()
-	return outcomes
+	return planned
 }
 
-// runOneDestination is resolve → availability gate → scan → diff → execute
-// for a single destination.
-func (r *Runner) runOneDestination(ctx context.Context, h *handle, job *store.Job, run *store.Run, srcRoot string, srcScan *engine.ScanResult, chain *filter.Chain, dest store.JobDestination, events *eventBuffer, log *slog.Logger) destOutcome {
+// planOneDestination is resolve → availability gate → scan → diff for a single
+// destination. It writes nothing.
+func (r *Runner) planOneDestination(ctx context.Context, h *handle, job *store.Job, run *store.Run, srcRoot string, srcScan *engine.ScanResult, chain *filter.Chain, dest store.JobDestination, events *eventBuffer, log *slog.Logger) *plannedDest {
 	finalCtx := context.WithoutCancel(ctx)
 	destID := dest.DestTargetID
 	sink := events.sinkFor(destID)
-	tracker := h.progress.tracker(destID)
 
-	outcome := destOutcome{targetID: destID}
+	p := &plannedDest{
+		dest:     dest,
+		targetID: destID,
+		chain:    chain,
+		sink:     sink,
+		tracker:  h.progress.tracker(destID),
+	}
 
 	dstTarget, err := r.db.GetTarget(ctx, destID)
 	if err != nil {
-		return r.destFailed(finalCtx, run, destID, sink, h, fmt.Sprintf("the destination target could not be loaded: %v", err))
+		failed := r.destFailed(finalCtx, run, destID, sink, h, fmt.Sprintf("the destination target could not be loaded: %v", err))
+		p.outcome = &failed
+		return p
 	}
 
-	// Availability gate (SPEC.md §6.1 step 2). The interactive prompt lands
-	// with the UI in Phase 4; here the policy is skip or abort.
-	dstRoot, dstStorage, releaseDst, err := r.resolve(ctx, dstTarget, dest.DestSubpath)
-	if err != nil {
-		message := fmt.Sprintf("destination %s is unavailable: %v", dstTarget.Describe(), err)
-
-		if job.UnavailablePolicy == store.PolicyAbort {
-			sink(engine.Event{Level: store.LevelError, Message: message + " — this job aborts on an unavailable destination"})
-			failed := r.destFailed(finalCtx, run, destID, sink, h, message)
-			failed.unavailable = true
-			// Stop anything already running for the other destinations too:
-			// abort means the run fails immediately, not after the rest
-			// finish.
-			h.cancel()
-			return failed
-		}
-
-		sink(engine.Event{Level: store.LevelWarn, Message: message + " — skipping it and continuing"})
-		h.progress.setStatus(destID, store.DestSkippedUnavailable)
-		if err := r.db.FinishRunDestination(finalCtx, run.ID, destID, store.DestSkippedUnavailable, message); err != nil {
-			log.Error("could not record a skipped destination", "dest_target_id", destID, "error", err)
-		}
-		outcome.status, outcome.summary, outcome.unavailable = store.DestSkippedUnavailable, message, true
-		return outcome
+	// Availability gate (SPEC.md §6.1 step 2): skip, abort, or ask.
+	root, dstStorage, release, gated := r.resolveDestination(ctx, h, job, run, dest, dstTarget, sink, log)
+	if gated != nil {
+		p.outcome = gated
+		return p
 	}
-	defer releaseDst()
+	p.root, p.dstStorage, p.release = root, dstStorage, release
 
 	h.progress.setStatus(destID, store.DestRunning)
 
@@ -381,14 +461,16 @@ func (r *Runner) runOneDestination(ctx context.Context, h *handle, job *store.Jo
 	// invisible on both sides and can never be mistaken for extraneous.
 	dstScan, err := (&engine.Scanner{
 		Prune: func(relDir string) bool { return chain.PrunesDir(relDir) },
-	}).Scan(ctx, dstRoot)
+	}).Scan(ctx, root)
 	if err != nil {
 		if ctx.Err() != nil {
 			h.progress.setStatus(destID, store.DestCancelled)
-			outcome.status = store.DestCancelled
-			return outcome
+			p.outcome = &destOutcome{targetID: destID, status: store.DestCancelled}
+			return p
 		}
-		return r.destFailed(finalCtx, run, destID, sink, h, fmt.Sprintf("scanning the destination failed: %v", err))
+		failed := r.destFailed(finalCtx, run, destID, sink, h, fmt.Sprintf("scanning the destination failed: %v", err))
+		p.outcome = &failed
+		return p
 	}
 	for _, link := range dstScan.Symlinks {
 		sink(engine.Event{Level: store.LevelWarn, RelPath: link,
@@ -404,6 +486,7 @@ func (r *Runner) runOneDestination(ctx context.Context, h *handle, job *store.Jo
 		CaseInsensitiveDest: dstTarget.Type == store.TargetSMB,
 		Filter:              chain,
 	})
+	p.plan = plan
 
 	for _, c := range plan.Conflicts {
 		sink(engine.Event{Level: store.LevelWarn, RelPath: c.RelPath, Message: c.Reason})
@@ -419,21 +502,171 @@ func (r *Runner) runOneDestination(ctx context.Context, h *handle, job *store.Jo
 		sink(engine.Event{Level: store.LevelError, Message: plan.BlockedReason})
 	}
 
-	if err := r.db.StartRunDestination(finalCtx, run.ID, destID, int64(plan.Copies), plan.CopyBytes); err != nil {
+	h.progress.setPlan(destID, destPlanOf(destID, plan))
+	p.tracker.SetTotals(int64(plan.Copies), plan.CopyBytes)
+	h.progress.markPlanned(destID)
+	return p
+}
+
+// destPlanOf projects an engine plan onto what the API reports.
+func destPlanOf(destID string, plan *engine.Plan) DestPlan {
+	dp := DestPlan{
+		DestTargetID:     destID,
+		MkDirs:           plan.MkDirs,
+		Copies:           plan.Copies,
+		Deletes:          plan.Deletes,
+		RmDirs:           plan.RmDirs,
+		CopyBytes:        plan.CopyBytes,
+		DeletionsBlocked: plan.DeletionsBlocked,
+		BlockedReason:    plan.BlockedReason,
+	}
+	for _, c := range plan.Conflicts {
+		dp.Conflicts = append(dp.Conflicts, c.RelPath+": "+c.Reason)
+	}
+	return dp
+}
+
+// resolveDestination applies the availability gate, looping while a human asks
+// to retry. It returns a non-nil outcome when the destination will not be used.
+func (r *Runner) resolveDestination(ctx context.Context, h *handle, job *store.Job, run *store.Run, dest store.JobDestination, dstTarget *store.Target, sink engine.EventSink, log *slog.Logger) (string, storage.Storage, func(), *destOutcome) {
+	finalCtx := context.WithoutCancel(ctx)
+	destID := dest.DestTargetID
+
+	for {
+		root, dstStorage, release, err := r.resolve(ctx, dstTarget, dest.DestSubpath)
+		if err == nil {
+			return root, dstStorage, release, nil
+		}
+
+		message := fmt.Sprintf("destination %s is unavailable: %v", dstTarget.Describe(), err)
+		policy := job.UnavailablePolicy
+
+		if policy == store.PolicyPrompt {
+			action, answered := r.askAboutDestination(ctx, h, job, run, destID, message, sink, log)
+			if ctx.Err() != nil {
+				h.progress.setStatus(destID, store.DestCancelled)
+				return "", nil, nil, &destOutcome{targetID: destID, status: store.DestCancelled}
+			}
+			switch action {
+			case PromptRetry:
+				sink(engine.Event{Level: store.LevelInfo, Message: "retrying the destination at your request"})
+				continue
+			case PromptAbort:
+				policy = store.PolicyAbort
+			default:
+				policy = store.PolicySkip
+			}
+			if !answered {
+				message += fmt.Sprintf(" — no answer within %ds, falling back to %s",
+					job.PromptTimeoutSec, job.PromptFallback)
+			}
+		}
+
+		if policy == store.PolicyAbort {
+			sink(engine.Event{Level: store.LevelError, Message: message + " — this job aborts on an unavailable destination"})
+			failed := r.destFailed(finalCtx, run, destID, sink, h, message)
+			failed.unavailable = true
+			// Stop anything already running for the other destinations too:
+			// abort means the run fails immediately, not after the rest
+			// finish.
+			h.cancel()
+			return "", nil, nil, &failed
+		}
+
+		sink(engine.Event{Level: store.LevelWarn, Message: message + " — skipping it and continuing"})
+		h.progress.setStatus(destID, store.DestSkippedUnavailable)
+		if err := r.db.FinishRunDestination(finalCtx, run.ID, destID, store.DestSkippedUnavailable, message); err != nil {
+			log.Error("could not record a skipped destination", "dest_target_id", destID, "error", err)
+		}
+		return "", nil, nil, &destOutcome{
+			targetID: destID, status: store.DestSkippedUnavailable,
+			summary: message, unavailable: true,
+		}
+	}
+}
+
+// askAboutDestination parks one destination and waits for a human. The run
+// stays running and its other destinations carry on: only the one that cannot
+// be reached waits.
+func (r *Runner) askAboutDestination(ctx context.Context, h *handle, job *store.Job, run *store.Run, destID, message string, sink engine.EventSink, log *slog.Logger) (PromptAction, bool) {
+	finalCtx := context.WithoutCancel(ctx)
+	timeout := time.Duration(job.PromptTimeoutSec) * time.Second
+	deadline := time.Now().Add(timeout)
+
+	ch := h.gate.open(destID)
+	h.progress.setStatus(destID, store.DestAwaitingPrompt)
+	h.progress.setPrompt(destID, deadline, message)
+	if err := r.db.SetRunDestinationStatus(finalCtx, run.ID, destID, store.DestAwaitingPrompt); err != nil {
+		log.Error("could not record a waiting destination", "dest_target_id", destID, "error", err)
+	}
+	sink(engine.Event{Level: store.LevelWarn, Message: fmt.Sprintf(
+		"%s — waiting up to %ds for a decision; with no answer this destination will %s",
+		message, job.PromptTimeoutSec, job.PromptFallback)})
+
+	action, answered := waitForPrompt(ctx, ch, timeout, job.PromptFallback)
+
+	h.gate.close(destID)
+	h.progress.clearPrompt(destID)
+
+	if answered {
+		sink(engine.Event{Level: store.LevelInfo, Message: fmt.Sprintf(
+			"answered %q for this destination", action)})
+	} else if ctx.Err() == nil {
+		sink(engine.Event{Level: store.LevelWarn, Message: fmt.Sprintf(
+			"no answer after %ds; falling back to %s", job.PromptTimeoutSec, job.PromptFallback)})
+	}
+	return action, answered
+}
+
+// executePlanned carries out the plans that planning produced.
+func (r *Runner) executePlanned(ctx context.Context, h *handle, job *store.Job, run *store.Run, srcRoot string, planned []*plannedDest, log *slog.Logger) []destOutcome {
+	work := func(p *plannedDest) {
+		if p.outcome != nil {
+			return
+		}
+		outcome := r.executeOneDestination(ctx, h, job, run, srcRoot, p, log)
+		p.outcome = &outcome
+	}
+
+	if !job.ParallelDestinations {
+		for _, p := range planned {
+			work(p)
+		}
+		return outcomesOf(planned)
+	}
+
+	var wg sync.WaitGroup
+	for _, p := range planned {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			work(p)
+		}()
+	}
+	wg.Wait()
+	return outcomesOf(planned)
+}
+
+// executeOneDestination carries out one already-computed plan.
+func (r *Runner) executeOneDestination(ctx context.Context, h *handle, job *store.Job, run *store.Run, srcRoot string, p *plannedDest, log *slog.Logger) destOutcome {
+	finalCtx := context.WithoutCancel(ctx)
+	destID := p.targetID
+	outcome := destOutcome{targetID: destID}
+
+	if err := r.db.StartRunDestination(finalCtx, run.ID, destID, int64(p.plan.Copies), p.plan.CopyBytes); err != nil {
 		log.Error("could not start the destination record", "dest_target_id", destID, "error", err)
 	}
-	tracker.SetTotals(int64(plan.Copies), plan.CopyBytes)
-	h.progress.markPlanned(destID)
+	h.progress.setStatus(destID, store.DestRunning)
 
 	exec := &engine.Executor{
 		Copier:  &engine.Copier{},
-		Tracker: tracker,
-		OnEvent: sink,
+		Tracker: p.tracker,
+		OnEvent: p.sink,
 		// SPEC.md §5: when the server goes offline mid-job the run aborts
 		// cleanly rather than grinding through every remaining file.
-		CheckDestination: func(checkCtx context.Context) error { return dstStorage.Health(checkCtx) },
+		CheckDestination: func(checkCtx context.Context) error { return p.dstStorage.Health(checkCtx) },
 	}
-	result, execErr := exec.Execute(ctx, srcRoot, dstRoot, plan, engine.ExecOptions{
+	result, execErr := exec.Execute(ctx, srcRoot, p.root, p.plan, engine.ExecOptions{
 		Workers:      job.Workers,
 		OnError:      job.OnError,
 		DeletePolicy: job.DeletePolicy,
@@ -449,8 +682,8 @@ func (r *Runner) runOneDestination(ctx context.Context, h *handle, job *store.Jo
 		return outcome
 	}
 
-	status, summary, degraded := classifyDestination(result, plan)
-	sink(engine.Event{Level: levelForDest(status), Message: fmt.Sprintf(
+	status, summary, degraded := classifyDestination(result, p.plan)
+	p.sink(engine.Event{Level: levelForDest(status), Message: fmt.Sprintf(
 		"destination %s: %d copied (%d bytes), %d deleted, %d skipped, %d failed",
 		status, result.FilesCopied, result.BytesCopied, result.FilesDeleted,
 		result.Skipped, len(result.Failures))})
@@ -482,13 +715,15 @@ func (r *Runner) destFailed(ctx context.Context, run *store.Run, destID string, 
 	return destOutcome{targetID: destID, status: store.DestFailed, summary: message}
 }
 
-// unavailableEarlier reports whether a previous destination could not be
-// reached. SPEC.md §6.1 step 2 scopes the abort policy to *unavailability*;
-// a destination that resolved fine and merely had a file fail to copy is
+// unavailableEarlierPlanned reports whether an earlier destination could not
+// be reached, so an aborting job stops planning the rest.
+//
+// SPEC.md §6.1 step 2 scopes the abort policy to *unavailability*: a
+// destination that resolved fine and merely had a file fail to copy is
 // governed by the job's on_error setting instead.
-func unavailableEarlier(outcomes []destOutcome) bool {
-	for _, o := range outcomes {
-		if o.unavailable {
+func unavailableEarlierPlanned(planned []*plannedDest) bool {
+	for _, p := range planned {
+		if p != nil && p.outcome != nil && p.outcome.unavailable {
 			return true
 		}
 	}

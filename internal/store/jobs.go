@@ -70,9 +70,31 @@ const (
 	PolicySkip UnavailablePolicy = "skip"
 	// PolicyAbort fails the whole run immediately.
 	PolicyAbort UnavailablePolicy = "abort"
-	// PolicyPrompt pauses and asks. It needs a UI to ask in, so it arrives
-	// in Phase 4 and is rejected at validation until then.
+	// PolicyPrompt parks that destination and asks, leaving the run's other
+	// destinations to carry on. An unanswered prompt falls back to
+	// PromptFallback after PromptTimeoutSec.
 	PolicyPrompt UnavailablePolicy = "prompt"
+)
+
+// PromptFallback is what an unanswered prompt does (SPEC.md §9's "countdown
+// to the fallback action").
+type PromptFallback string
+
+const (
+	// FallbackSkip leaves the destination alone and lets the run finish
+	// partial. The default: a skipped destination is corrected by the next
+	// run, which makes it the recoverable direction.
+	FallbackSkip PromptFallback = "skip"
+	// FallbackAbort ends the run.
+	FallbackAbort PromptFallback = "abort"
+)
+
+// Prompt timeout bounds. A run may be unattended — from Phase 5 it may be
+// started by cron with nobody watching at all — so the wait is always bounded.
+const (
+	MinPromptTimeoutSec     = 5
+	MaxPromptTimeoutSec     = 86400
+	DefaultPromptTimeoutSec = 600
 )
 
 // Workers bounds, from SPEC.md §6.1 step 7.
@@ -108,6 +130,11 @@ type Job struct {
 
 	// UnavailablePolicy governs an unreachable destination.
 	UnavailablePolicy UnavailablePolicy `json:"unavailable_policy"`
+	// PromptTimeoutSec bounds how long a `prompt` run waits for an answer,
+	// and how long a previewed run holds its plan before being cancelled.
+	PromptTimeoutSec int `json:"prompt_timeout_sec"`
+	// PromptFallback is what happens when nobody answers in time.
+	PromptFallback PromptFallback `json:"prompt_fallback"`
 	// ParallelDestinations runs destinations at the same time. Off by
 	// default: fan-out multiplies read load on the source share
 	// (SPEC.md §6.1 step 7).
@@ -156,6 +183,12 @@ func (j *Job) ApplyDefaults() {
 	}
 	if j.UnavailablePolicy == "" {
 		j.UnavailablePolicy = PolicySkip
+	}
+	if j.PromptTimeoutSec == 0 {
+		j.PromptTimeoutSec = DefaultPromptTimeoutSec
+	}
+	if j.PromptFallback == "" {
+		j.PromptFallback = FallbackSkip
 	}
 	for i := range j.Filters {
 		j.Filters[i].ApplyDefaults()
@@ -211,12 +244,21 @@ func (j *Job) Validate() error {
 	}
 
 	switch j.UnavailablePolicy {
-	case PolicySkip, PolicyAbort:
-	case PolicyPrompt:
-		return errors.New(`unavailable_policy "prompt" is not implemented yet; use "skip" or "abort"`)
+	case PolicySkip, PolicyAbort, PolicyPrompt:
 	default:
-		return fmt.Errorf("unavailable_policy must be %q or %q, got %q",
-			PolicySkip, PolicyAbort, j.UnavailablePolicy)
+		return fmt.Errorf("unavailable_policy must be %q, %q or %q, got %q",
+			PolicySkip, PolicyAbort, PolicyPrompt, j.UnavailablePolicy)
+	}
+
+	switch j.PromptFallback {
+	case FallbackSkip, FallbackAbort:
+	default:
+		return fmt.Errorf("prompt_fallback must be %q or %q, got %q",
+			FallbackSkip, FallbackAbort, j.PromptFallback)
+	}
+	if j.PromptTimeoutSec < MinPromptTimeoutSec || j.PromptTimeoutSec > MaxPromptTimeoutSec {
+		return fmt.Errorf("prompt_timeout_sec must be between %d and %d, got %d",
+			MinPromptTimeoutSec, MaxPromptTimeoutSec, j.PromptTimeoutSec)
 	}
 
 	if len(j.Destinations) == 0 {
@@ -291,7 +333,12 @@ func overlaps(a, b string) bool {
 	return strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
 }
 
-func validateSubpath(field, subpath string) error {
+func validateSubpath(field, subpath string) error { return ValidateSubpath(field, subpath) }
+
+// ValidateSubpath rejects a path that is absolute or escapes its root.
+// Exported because the API's path picker validates browse paths the same way
+// job subpaths are validated (SPEC.md §8's /api/browse).
+func ValidateSubpath(field, subpath string) error {
 	if subpath == "" {
 		return nil
 	}
@@ -308,7 +355,8 @@ func validateSubpath(field, subpath string) error {
 
 const jobColumns = `id, name, source_target_id, source_subpath, mode, compare,
 	compare_tolerance_sec, ignore_dst_hour, workers, on_error, delete_policy,
-	log_every_file, unavailable_policy, parallel_destinations, created_at, updated_at`
+	log_every_file, unavailable_policy, parallel_destinations,
+	prompt_timeout_sec, prompt_fallback, created_at, updated_at`
 
 // CreateJob inserts a job and its destinations in one transaction.
 func (d *DB) CreateJob(ctx context.Context, j *Job) error {
@@ -330,20 +378,39 @@ func (d *DB) CreateJob(ctx context.Context, j *Job) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	_, err = tx.ExecContext(ctx, `INSERT INTO jobs (`+jobColumns+`)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		j.ID, j.Name, j.SourceTargetID, j.SourceSubpath, string(j.Mode), string(j.Compare),
-		j.CompareToleranceSec, boolToInt(j.IgnoreDSTHour), j.Workers, string(j.OnError),
-		string(j.DeletePolicy), boolToInt(j.LogEveryFile), string(j.UnavailablePolicy),
-		boolToInt(j.ParallelDestinations),
-		formatTime(j.CreatedAt), formatTime(j.UpdatedAt))
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs (`+jobColumns+`)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, jobInsertArgs(j)...); err != nil {
 		if isUniqueViolation(err) {
 			return fmt.Errorf("a job named %q already exists: %w", j.Name, ErrNameTaken)
 		}
 		return fmt.Errorf("creating job %q: %w", j.Name, err)
 	}
 
+	if err := insertJobChildren(ctx, tx, j); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("creating job %q: %w", j.Name, err)
+	}
+	return nil
+}
+
+// jobInsertArgs lists a job's columns in jobColumns order. Create and update
+// share it so the two can never drift out of step.
+func jobInsertArgs(j *Job) []any {
+	return []any{
+		j.ID, j.Name, j.SourceTargetID, j.SourceSubpath, string(j.Mode), string(j.Compare),
+		j.CompareToleranceSec, boolToInt(j.IgnoreDSTHour), j.Workers, string(j.OnError),
+		string(j.DeletePolicy), boolToInt(j.LogEveryFile), string(j.UnavailablePolicy),
+		boolToInt(j.ParallelDestinations), j.PromptTimeoutSec, string(j.PromptFallback),
+		formatTime(j.CreatedAt), formatTime(j.UpdatedAt),
+	}
+}
+
+// insertJobChildren writes a job's destinations and filter rules. Both are
+// fully owned by the job, which is what lets UpdateJob replace them wholesale.
+func insertJobChildren(ctx context.Context, tx *sql.Tx, j *Job) error {
 	for i := range j.Destinations {
 		destID, err := newID()
 		if err != nil {
@@ -366,9 +433,66 @@ func (d *DB) CreateJob(ctx context.Context, j *Job) error {
 			return err
 		}
 	}
+	return nil
+}
+
+// UpdateJob replaces a job, its destinations and its filter rules in one
+// transaction (SPEC.md §8's "create/update job").
+//
+// Destinations and filters are replaced wholesale rather than diffed: they are
+// positional, fully owned by the job, and the UI edits them as a single form.
+// Callers must refuse this while the job is running — see api.handleUpdateJob;
+// changing destinations under a live diff is not something the engine is built
+// to survive.
+func (d *DB) UpdateJob(ctx context.Context, id string, j *Job) error {
+	j.ApplyDefaults()
+	if err := j.Validate(); err != nil {
+		return err
+	}
+
+	existing, err := d.GetJob(ctx, id)
+	if err != nil {
+		return err
+	}
+	j.ID = existing.ID
+	j.CreatedAt = existing.CreatedAt
+	j.UpdatedAt = time.Now().UTC()
+
+	tx, err := d.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("updating job %q: %w", j.Name, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	const set = `UPDATE jobs SET name=?, source_target_id=?, source_subpath=?, mode=?, compare=?,
+		compare_tolerance_sec=?, ignore_dst_hour=?, workers=?, on_error=?, delete_policy=?,
+		log_every_file=?, unavailable_policy=?, parallel_destinations=?,
+		prompt_timeout_sec=?, prompt_fallback=?, updated_at=? WHERE id=?`
+
+	if _, err := tx.ExecContext(ctx, set,
+		j.Name, j.SourceTargetID, j.SourceSubpath, string(j.Mode), string(j.Compare),
+		j.CompareToleranceSec, boolToInt(j.IgnoreDSTHour), j.Workers, string(j.OnError),
+		string(j.DeletePolicy), boolToInt(j.LogEveryFile), string(j.UnavailablePolicy),
+		boolToInt(j.ParallelDestinations), j.PromptTimeoutSec, string(j.PromptFallback),
+		formatTime(j.UpdatedAt), j.ID); err != nil {
+		if isUniqueViolation(err) {
+			return fmt.Errorf("a job named %q already exists: %w", j.Name, ErrNameTaken)
+		}
+		return fmt.Errorf("updating job %q: %w", j.Name, err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM job_destinations WHERE job_id = ?`, j.ID); err != nil {
+		return fmt.Errorf("updating the destinations of job %q: %w", j.Name, err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM filter_rules WHERE job_id = ?`, j.ID); err != nil {
+		return fmt.Errorf("updating the filters of job %q: %w", j.Name, err)
+	}
+	if err := insertJobChildren(ctx, tx, j); err != nil {
+		return err
+	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("creating job %q: %w", j.Name, err)
+		return fmt.Errorf("updating job %q: %w", j.Name, err)
 	}
 	return nil
 }
@@ -460,17 +584,18 @@ func scanJob(s scanner) (*Job, error) {
 	var (
 		j                                 Job
 		mode, compare, onErr, delPol      string
-		unavailable                       string
+		unavailable, promptFallback       string
 		created, updated                  string
 		ignoreDST, logEveryFile, parallel int
 	)
 	err := s.Scan(&j.ID, &j.Name, &j.SourceTargetID, &j.SourceSubpath, &mode, &compare,
 		&j.CompareToleranceSec, &ignoreDST, &j.Workers, &onErr, &delPol, &logEveryFile,
-		&unavailable, &parallel, &created, &updated)
+		&unavailable, &parallel, &j.PromptTimeoutSec, &promptFallback, &created, &updated)
 	if err != nil {
 		return nil, err
 	}
 	j.UnavailablePolicy = UnavailablePolicy(unavailable)
+	j.PromptFallback = PromptFallback(promptFallback)
 	j.ParallelDestinations = parallel != 0
 	j.Mode = SyncMode(mode)
 	j.Compare = CompareMethod(compare)

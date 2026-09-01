@@ -12,6 +12,12 @@ import (
 type DestSnapshot struct {
 	DestTargetID string           `json:"dest_target_id"`
 	Status       store.DestStatus `json:"status"`
+	// PromptDeadline is when an unanswered prompt for this destination
+	// falls back (SPEC.md §9's visible countdown). Zero unless Status is
+	// awaiting_prompt.
+	PromptDeadline time.Time `json:"prompt_deadline,omitempty"`
+	// PromptReason is why the destination is being asked about.
+	PromptReason string `json:"prompt_reason,omitempty"`
 	engine.Snapshot
 }
 
@@ -39,8 +45,35 @@ type RunSnapshot struct {
 	PendingDestinations   int   `json:"pending_destinations"`
 	EstimatedPendingBytes int64 `json:"estimated_pending_bytes"`
 
+	// ConfirmDeadline is when a previewed run gives up waiting and cancels
+	// itself. Zero unless the run is awaiting confirmation.
+	ConfirmDeadline time.Time `json:"confirm_deadline,omitempty"`
+
 	Destinations []DestSnapshot        `json:"destinations"`
 	InFlight     []engine.FileInFlight `json:"in_flight"`
+	// Plans is the previewed work, present once planning is done. In a
+	// preview run this is what the user is being asked to confirm.
+	Plans []DestPlan `json:"plans,omitempty"`
+}
+
+// DestPlan is what a run intends to do to one destination (SPEC.md §6.1
+// step 6). It is a snapshot: a confirmed preview executes exactly this, not a
+// freshly recomputed diff, because this is what the user agreed to.
+type DestPlan struct {
+	DestTargetID string `json:"dest_target_id"`
+
+	MkDirs    int   `json:"mkdirs"`
+	Copies    int   `json:"copies"`
+	Deletes   int   `json:"deletes"`
+	RmDirs    int   `json:"rmdirs"`
+	CopyBytes int64 `json:"copy_bytes"`
+
+	// DeletionsBlocked reports that deletions were planned and withheld;
+	// the UI must show this, because it is the difference between "nothing
+	// to delete" and "refusing to delete".
+	DeletionsBlocked bool     `json:"deletions_blocked,omitempty"`
+	BlockedReason    string   `json:"blocked_reason,omitempty"`
+	Conflicts        []string `json:"conflicts,omitempty"`
 }
 
 // progress aggregates one tracker per destination.
@@ -54,6 +87,15 @@ type progress struct {
 	statuses map[string]store.DestStatus
 	// planned marks destinations whose totals are known.
 	planned map[string]bool
+
+	// promptDeadlines and promptReasons drive the countdown the UI shows
+	// while a destination waits for an answer.
+	promptDeadlines map[string]time.Time
+	promptReasons   map[string]string
+	// confirmDeadline is when an unconfirmed preview cancels itself.
+	confirmDeadline time.Time
+	// plans is what each destination intends to do, once diffed.
+	plans map[string]DestPlan
 }
 
 // phaseRank orders phases by how far through the pipeline they are, so the
@@ -80,12 +122,15 @@ func busiestPhase(runPhase engine.Phase, dests []DestSnapshot) engine.Phase {
 
 func newProgress(now time.Time, destTargetIDs []string) *progress {
 	p := &progress{
-		started:  now,
-		phase:    engine.PhaseScanning,
-		order:    append([]string{}, destTargetIDs...),
-		trackers: map[string]*engine.Tracker{},
-		statuses: map[string]store.DestStatus{},
-		planned:  map[string]bool{},
+		started:         now,
+		phase:           engine.PhaseScanning,
+		order:           append([]string{}, destTargetIDs...),
+		trackers:        map[string]*engine.Tracker{},
+		statuses:        map[string]store.DestStatus{},
+		planned:         map[string]bool{},
+		promptDeadlines: map[string]time.Time{},
+		promptReasons:   map[string]string{},
+		plans:           map[string]DestPlan{},
 	}
 	for _, id := range destTargetIDs {
 		p.trackers[id] = engine.NewTracker(now)
@@ -113,6 +158,37 @@ func (p *progress) setStatus(destTargetID string, status store.DestStatus) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.statuses[destTargetID] = status
+}
+
+// setPrompt records that a destination is waiting for an answer, and when
+// that wait runs out.
+func (p *progress) setPrompt(destTargetID string, deadline time.Time, reason string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.promptDeadlines[destTargetID] = deadline
+	p.promptReasons[destTargetID] = reason
+}
+
+// clearPrompt records that a destination is no longer waiting.
+func (p *progress) clearPrompt(destTargetID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.promptDeadlines, destTargetID)
+	delete(p.promptReasons, destTargetID)
+}
+
+// setConfirmDeadline records when an unconfirmed preview gives up.
+func (p *progress) setConfirmDeadline(at time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.confirmDeadline = at
+}
+
+// setPlan records what a destination intends to do.
+func (p *progress) setPlan(destTargetID string, plan DestPlan) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.plans[destTargetID] = plan
 }
 
 // markPlanned notes that a destination's totals are now known.
@@ -158,6 +234,9 @@ func (p *progress) snapshot(now time.Time) RunSnapshot {
 	trackers := make(map[string]*engine.Tracker, len(p.trackers))
 	statuses := make(map[string]store.DestStatus, len(p.statuses))
 	planned := make(map[string]bool, len(p.planned))
+	promptDeadlines := make(map[string]time.Time, len(p.promptDeadlines))
+	promptReasons := make(map[string]string, len(p.promptReasons))
+	plans := make(map[string]DestPlan, len(p.plans))
 	for k, v := range p.trackers {
 		trackers[k] = v
 	}
@@ -167,11 +246,26 @@ func (p *progress) snapshot(now time.Time) RunSnapshot {
 	for k, v := range p.planned {
 		planned[k] = v
 	}
+	for k, v := range p.promptDeadlines {
+		promptDeadlines[k] = v
+	}
+	for k, v := range p.promptReasons {
+		promptReasons[k] = v
+	}
+	for k, v := range p.plans {
+		plans[k] = v
+	}
 	phase := p.phase
 	started := p.started
+	confirmDeadline := p.confirmDeadline
 	p.mu.Unlock()
 
-	out := RunSnapshot{Phase: phase, ElapsedSec: now.Sub(started).Seconds(), ETASeconds: engine.ETAUnknown}
+	out := RunSnapshot{
+		Phase:           phase,
+		ElapsedSec:      now.Sub(started).Seconds(),
+		ETASeconds:      engine.ETAUnknown,
+		ConfirmDeadline: confirmDeadline,
+	}
 
 	var plannedCount int
 	for _, id := range order {
@@ -193,10 +287,15 @@ func (p *progress) snapshot(now time.Time) RunSnapshot {
 		}
 
 		out.Destinations = append(out.Destinations, DestSnapshot{
-			DestTargetID: id,
-			Status:       statuses[id],
-			Snapshot:     snap,
+			DestTargetID:   id,
+			Status:         statuses[id],
+			PromptDeadline: promptDeadlines[id],
+			PromptReason:   promptReasons[id],
+			Snapshot:       snap,
 		})
+		if plan, ok := plans[id]; ok {
+			out.Plans = append(out.Plans, plan)
+		}
 	}
 
 	// The run-level phase is whatever the destinations are actually doing.

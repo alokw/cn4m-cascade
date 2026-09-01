@@ -20,7 +20,7 @@
 - Update PROGRESS.md (what's done / what's next / decisions made) at the end of every session before context is cleared.
 
 ## Build & test
-- Go 1.22+, `golangci-lint run` must pass before any commit.
+- Go 1.25+ (`modernc.org/sqlite` requires it; `crypto/hkdf` already needed 1.24), `golangci-lint run` must pass before any commit.
 - Test harness: `docker compose -f docker-compose.test.yml up` starts two Samba containers; `make test-integration` runs against them. Build this harness FIRST (before Phase 1 code) if it doesn't exist.
 - Unit tests colocated (`_test.go`); integration tests in /test tagged `//go:build integration`.
 - Table-driven tests preferred. Every bug fix gets a regression test.

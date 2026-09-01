@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -44,15 +45,24 @@ const (
 	otherPass    = "otherpass"
 )
 
+// adminPassword is what the harness sets up and signs in with. Every API
+// route except /api/auth/* and /healthz needs a session from Phase 4a onwards.
+const adminPassword = "integration-harness-password"
+
 // harness is a fully wired server backed by the real ExecMounter.
 type harness struct {
-	t         *testing.T
-	server    *httptest.Server
-	db        *store.DB
-	mounts    *mountmgr.Manager
-	runner    *runner.Runner
-	logs      *syncBuffer
-	mountRoot string
+	t      *testing.T
+	server *httptest.Server
+	// client carries the session cookie. Tests that need to check the
+	// unauthenticated behaviour use anonClient instead.
+	client     *http.Client
+	anonClient *http.Client
+	db         *store.DB
+	mounts     *mountmgr.Manager
+	runner     *runner.Runner
+	api        *api.Server
+	logs       *syncBuffer
+	mountRoot  string
 }
 
 // syncBuffer collects log output so tests can assert that credentials never
@@ -118,10 +128,32 @@ func newHarness(t *testing.T, tune func(*mountmgr.Config)) *harness {
 
 	provider := storage.NewProvider(mounts, healthc)
 	runs := runner.New(db, provider, log)
-	srv := httptest.NewServer(api.NewServer(db, provider, mounts, healthc, box, runs, log).Handler())
+	apiSrv := api.NewServer(db, provider, mounts, healthc, box, runs, log)
 
-	h := &harness{t: t, server: srv, db: db, mounts: mounts, runner: runs, logs: logs, mountRoot: mountRoot}
+	// The event hub and session sweeper are background work the server owns;
+	// without Start the WebSocket feed never broadcasts.
+	apiCtx, stopAPI := context.WithCancel(context.Background())
+	apiSrv.Start(apiCtx)
+
+	srv := httptest.NewServer(apiSrv.Handler())
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatalf("building a cookie jar: %v", err)
+	}
+	authed := srv.Client()
+	authed.Jar = jar
+
+	h := &harness{
+		t: t, server: srv, client: authed, anonClient: &http.Client{},
+		db: db, mounts: mounts, runner: runs, api: apiSrv,
+		logs: logs, mountRoot: mountRoot,
+	}
+	h.signIn()
+
 	t.Cleanup(func() {
+		stopAPI()
+		apiSrv.Stop()
 		srv.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -156,7 +188,7 @@ func (h *harness) do(method, path string, body any) (int, map[string]any) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := h.server.Client().Do(req)
+	resp, err := h.client.Do(req)
 	if err != nil {
 		h.t.Fatalf("%s %s: %v", method, path, err)
 	}
@@ -256,4 +288,27 @@ func offlineIP(t *testing.T) string { return env(t, "SMBSYNC_TEST_OFFLINE") }
 
 func uniqueName(prefix string) string {
 	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+}
+
+// signIn completes first-run setup and logs the harness client in, so every
+// later request carries a session cookie.
+func (h *harness) signIn() {
+	h.t.Helper()
+
+	status, body := h.do(http.MethodPost, "/api/auth/setup", map[string]any{"password": adminPassword})
+	if status != http.StatusOK {
+		h.t.Fatalf("POST /api/auth/setup = %d, want 200: %v", status, body)
+	}
+}
+
+// doAnon issues a request without the session cookie, for asserting that the
+// API is actually closed to strangers.
+func (h *harness) doAnon(method, path string, body any) (int, map[string]any) {
+	h.t.Helper()
+
+	saved := h.client
+	h.client = h.anonClient
+	defer func() { h.client = saved }()
+
+	return h.do(method, path, body)
 }

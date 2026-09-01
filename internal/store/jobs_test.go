@@ -118,6 +118,8 @@ func TestJobValidate(t *testing.T) {
 	}{
 		{"valid", func(*Job) {}, ""},
 		{"update mode is valid", func(j *Job) { j.Mode = ModeUpdate }, ""},
+		{"prompt policy is valid from Phase 4a", func(j *Job) { j.UnavailablePolicy = PolicyPrompt }, ""},
+		{"abort fallback is valid", func(j *Job) { j.PromptFallback = FallbackAbort }, ""},
 		{"no name", func(j *Job) { j.Name = "" }, "name is required"},
 		{"no source", func(j *Job) { j.SourceTargetID = "" }, "source target is required"},
 		{"unknown mode", func(j *Job) { j.Mode = "sideways" }, "mode must be"},
@@ -154,9 +156,21 @@ func TestJobValidate(t *testing.T) {
 			"two destinations on the same target",
 		},
 		{
-			"prompt policy is not implemented yet",
-			func(j *Job) { j.UnavailablePolicy = PolicyPrompt },
-			"not implemented yet",
+			"unknown prompt fallback",
+			func(j *Job) { j.PromptFallback = "ask-again" },
+			"prompt_fallback must be",
+		},
+		{
+			// The whole point of the availability gate is that a run may
+			// be unattended, so the wait has to be bounded.
+			"prompt timeout below the floor",
+			func(j *Job) { j.PromptTimeoutSec = 1 },
+			"prompt_timeout_sec must be between",
+		},
+		{
+			"prompt timeout above the ceiling",
+			func(j *Job) { j.PromptTimeoutSec = 90000 },
+			"prompt_timeout_sec must be between",
 		},
 		{
 			"unknown unavailable policy",

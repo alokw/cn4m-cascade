@@ -84,29 +84,64 @@ func (d *DB) AppendEvents(ctx context.Context, events []RunEvent) error {
 }
 
 // EventFilter narrows an event listing.
+//
+// Every field is optional. With no RunID this reads across every run, which is
+// what the global log view of SPEC.md §8 (`GET /api/logs`) needs; migration
+// 0004 adds the ts and (level, ts) indexes that keeps off a full table scan.
 type EventFilter struct {
 	RunID        string
+	JobID        string
 	Level        EventLevel
 	DestTargetID string
-	Limit        int
-	Offset       int
+	// Since bounds the listing to events at or after this time. The zero
+	// value means no lower bound.
+	Since time.Time
+	// Newest reverses the order. A task log reads oldest first; a global
+	// error log reads newest first.
+	Newest bool
+	Limit  int
+	Offset int
 }
 
-// ListEvents returns events oldest first, which is the order a task log reads.
+// ListEvents returns events oldest first by default, which is the order a task
+// log reads; set Newest for the global log view.
 func (d *DB) ListEvents(ctx context.Context, f EventFilter) ([]RunEvent, error) {
-	query := `SELECT id, run_id, ts, level, dest_target_id, relpath, message
-		FROM run_events WHERE run_id = ?`
-	args := []any{f.RunID}
+	query := `SELECT e.id, e.run_id, e.ts, e.level, e.dest_target_id, e.relpath, e.message
+		FROM run_events e`
+	args := []any{}
 
+	// Only join when filtering by job: the join is pure cost otherwise, and
+	// this table is the largest in the schema.
+	if f.JobID != "" {
+		query += ` JOIN runs r ON r.id = e.run_id`
+	}
+	query += ` WHERE 1=1`
+
+	if f.RunID != "" {
+		query += ` AND e.run_id = ?`
+		args = append(args, f.RunID)
+	}
+	if f.JobID != "" {
+		query += ` AND r.job_id = ?`
+		args = append(args, f.JobID)
+	}
 	if f.Level != "" {
-		query += ` AND level = ?`
+		query += ` AND e.level = ?`
 		args = append(args, string(f.Level))
 	}
 	if f.DestTargetID != "" {
-		query += ` AND dest_target_id = ?`
+		query += ` AND e.dest_target_id = ?`
 		args = append(args, f.DestTargetID)
 	}
-	query += ` ORDER BY id`
+	if !f.Since.IsZero() {
+		query += ` AND e.ts >= ?`
+		args = append(args, formatTime(f.Since.UTC()))
+	}
+	if f.Newest {
+		query += ` ORDER BY e.ts DESC, e.id DESC`
+	} else {
+		query += ` ORDER BY e.id`
+	}
 
 	if f.Limit <= 0 || f.Limit > 1000 {
 		f.Limit = 200
@@ -116,7 +151,7 @@ func (d *DB) ListEvents(ctx context.Context, f EventFilter) ([]RunEvent, error) 
 
 	rows, err := d.sql.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("listing events for run %s: %w", f.RunID, err)
+		return nil, fmt.Errorf("listing run events: %w", err)
 	}
 	defer rows.Close()
 
@@ -128,14 +163,14 @@ func (d *DB) ListEvents(ctx context.Context, f EventFilter) ([]RunEvent, error) 
 			level string
 		)
 		if err := rows.Scan(&e.ID, &e.RunID, &ts, &level, &e.DestTargetID, &e.RelPath, &e.Message); err != nil {
-			return nil, fmt.Errorf("listing events for run %s: %w", f.RunID, err)
+			return nil, fmt.Errorf("listing run events: %w", err)
 		}
 		e.TS = parseTime(ts)
 		e.Level = EventLevel(level)
 		events = append(events, e)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("listing events for run %s: %w", f.RunID, err)
+		return nil, fmt.Errorf("listing run events: %w", err)
 	}
 	return events, nil
 }

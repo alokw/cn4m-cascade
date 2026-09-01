@@ -12,12 +12,15 @@ import (
 type RunStatus string
 
 const (
-	RunRunning   RunStatus = "running"
-	RunSuccess   RunStatus = "success"
-	RunPartial   RunStatus = "partial"
-	RunFailed    RunStatus = "failed"
-	RunCancelled RunStatus = "cancelled"
-	// RunWaitingPrompt arrives with the availability gate in Phase 3/4.
+	RunRunning RunStatus = "running"
+	// RunAwaitingConfirmation is a previewed run that has planned its work
+	// and is holding it, plus its mounts, until a human confirms or the
+	// job's prompt timeout expires (SPEC.md §6.1 step 6).
+	RunAwaitingConfirmation RunStatus = "awaiting_confirmation"
+	RunSuccess              RunStatus = "success"
+	RunPartial              RunStatus = "partial"
+	RunFailed               RunStatus = "failed"
+	RunCancelled            RunStatus = "cancelled"
 )
 
 // RunTrigger records what started a run.
@@ -40,6 +43,11 @@ const (
 	// DestSkippedUnavailable means the destination could not be reached and
 	// the job's unavailable_policy said to carry on without it.
 	DestSkippedUnavailable DestStatus = "skipped_unavailable"
+	// DestAwaitingPrompt means the destination could not be reached and the
+	// job's unavailable_policy is `prompt`, so it is waiting for an answer.
+	// The *run* stays running and its other destinations keep working: only
+	// the one that cannot be reached waits.
+	DestAwaitingPrompt DestStatus = "awaiting_prompt"
 )
 
 // Run is one execution of a job.
@@ -73,7 +81,24 @@ type RunDestination struct {
 }
 
 // Terminal reports whether a run has finished, however it ended.
-func (r *Run) Terminal() bool { return r.Status != RunRunning }
+//
+// The terminal states are enumerated rather than derived from "not running":
+// a run awaiting confirmation is neither running nor finished, and the older
+// `Status != RunRunning` form would have called it done and let callers treat
+// a parked run as a completed one.
+func (r *Run) Terminal() bool {
+	switch r.Status {
+	case RunSuccess, RunPartial, RunFailed, RunCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// Active reports whether a run still holds resources — it is either working
+// or parked waiting for a human. Shutdown and the "already running" check both
+// need this rather than Terminal's inverse, because a parked run holds mounts.
+func (r *Run) Active() bool { return !r.Terminal() }
 
 const runColumns = `id, job_id, trigger, status, started_at, finished_at,
 	files_scanned, bytes_total, error_summary`
@@ -176,6 +201,27 @@ func (d *DB) UpdateRunDestinationProgress(ctx context.Context, runID, destTarget
 	return nil
 }
 
+// SetRunDestinationStatus records a non-terminal state change, such as a
+// destination parking to wait for an answer. FinishRunDestination remains the
+// only way to record an outcome.
+func (d *DB) SetRunDestinationStatus(ctx context.Context, runID, destTargetID string, status DestStatus) error {
+	if _, err := d.sql.ExecContext(ctx,
+		`UPDATE run_destinations SET status = ? WHERE run_id = ? AND dest_target_id = ?`,
+		string(status), runID, destTargetID); err != nil {
+		return fmt.Errorf("recording the state of destination %s in run %s: %w", destTargetID, runID, err)
+	}
+	return nil
+}
+
+// SetRunStatus records a non-terminal run state, such as parking on a preview.
+func (d *DB) SetRunStatus(ctx context.Context, runID string, status RunStatus) error {
+	if _, err := d.sql.ExecContext(ctx,
+		`UPDATE runs SET status = ? WHERE id = ?`, string(status), runID); err != nil {
+		return fmt.Errorf("recording the state of run %s: %w", runID, err)
+	}
+	return nil
+}
+
 // FinishRunDestination closes out one destination.
 func (d *DB) FinishRunDestination(ctx context.Context, runID, destTargetID string, status DestStatus, errorSummary string) error {
 	_, err := d.sql.ExecContext(ctx,
@@ -259,20 +305,37 @@ func (d *DB) ListRuns(ctx context.Context, f RunFilter) ([]*Run, error) {
 	return runs, nil
 }
 
-// ReconcileInterruptedRuns marks runs that were still "running" at startup as
-// failed: the process died mid-run, so nothing will ever finish them.
+// ReconcileInterruptedRuns settles runs that were still live at startup: the
+// process died, so nothing will ever finish them.
+//
+// A run that was *working* failed. A run that was merely parked awaiting
+// confirmation is cancelled instead, because an unconfirmed preview executed
+// nothing — calling that a failure would report work as lost that was never
+// started. Either way no run may survive a restart still holding a state that
+// waits for a human who is no longer being asked.
 func (d *DB) ReconcileInterruptedRuns(ctx context.Context) (int64, error) {
-	const msg = "the server stopped while this run was in progress"
+	const (
+		failedMsg    = "the server stopped while this run was in progress"
+		cancelledMsg = "the server stopped while this run was waiting to be confirmed; nothing was copied"
+	)
+	now := formatTime(time.Now().UTC())
 
 	res, err := d.sql.ExecContext(ctx,
 		`UPDATE runs SET status = ?, finished_at = ?, error_summary = ? WHERE status = ?`,
-		string(RunFailed), formatTime(time.Now().UTC()), msg, string(RunRunning))
+		string(RunFailed), now, failedMsg, string(RunRunning))
+	if err != nil {
+		return 0, fmt.Errorf("reconciling interrupted runs: %w", err)
+	}
+	parked, err := d.sql.ExecContext(ctx,
+		`UPDATE runs SET status = ?, finished_at = ?, error_summary = ? WHERE status = ?`,
+		string(RunCancelled), now, cancelledMsg, string(RunAwaitingConfirmation))
 	if err != nil {
 		return 0, fmt.Errorf("reconciling interrupted runs: %w", err)
 	}
 	if _, err := d.sql.ExecContext(ctx,
-		`UPDATE run_destinations SET status = ?, finished_at = ? WHERE status IN (?, ?)`,
-		string(DestFailed), formatTime(time.Now().UTC()), string(DestRunning), string(DestPending)); err != nil {
+		`UPDATE run_destinations SET status = ?, finished_at = ? WHERE status IN (?, ?, ?)`,
+		string(DestFailed), now,
+		string(DestRunning), string(DestPending), string(DestAwaitingPrompt)); err != nil {
 		return 0, fmt.Errorf("reconciling interrupted runs: %w", err)
 	}
 
@@ -280,7 +343,11 @@ func (d *DB) ReconcileInterruptedRuns(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("counting reconciled runs: %w", err)
 	}
-	return n, nil
+	p, err := parked.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("counting reconciled runs: %w", err)
+	}
+	return n + p, nil
 }
 
 func (d *DB) runDestinations(ctx context.Context, runID string) ([]RunDestination, error) {

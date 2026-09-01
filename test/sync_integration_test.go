@@ -97,13 +97,26 @@ func (h *harness) awaitRun(t *testing.T, runID string, timeout time.Duration) ma
 		if status != http.StatusOK {
 			t.Fatalf("GET run = %d: %v", status, body)
 		}
-		if s, _ := body["status"].(string); s != string(store.RunRunning) {
+		// A parked preview is neither running nor finished, so "not
+		// running" is not the same question as "done".
+		if terminalRunStatus(body["status"]) {
 			return body
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("run %s did not finish within %v", runID, timeout)
 	return nil
+}
+
+// terminalRunStatus mirrors store.Run.Terminal for a decoded JSON body.
+func terminalRunStatus(v any) bool {
+	s, _ := v.(string)
+	switch store.RunStatus(s) {
+	case store.RunSuccess, store.RunPartial, store.RunFailed, store.RunCancelled:
+		return true
+	default:
+		return false
+	}
 }
 
 // awaitCopying blocks until the run is demonstrably copying files. Sleeping a

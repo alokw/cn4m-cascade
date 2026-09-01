@@ -164,6 +164,86 @@ GET            /healthz
 Leave `username` empty to mount as a guest. `GET /api/runs/{id}` includes live progress and ETA
 while a run is in flight.
 
+## Signing in
+
+Every `/api/*` route needs a session, except `/api/auth/*` and `/healthz`.
+
+On a fresh database there is no password yet. Either set one at first run:
+
+```bash
+curl -sX POST localhost:8080/api/auth/setup \
+  -H 'content-type: application/json' \
+  -d '{"password":"a good long password"}' -c cookies.txt
+```
+
+…or seed it from the environment, which is what a compose file should do:
+
+```yaml
+environment:
+  SMBSYNC_ADMIN_PASSWORD: "a good long password"
+```
+
+`SMBSYNC_ADMIN_PASSWORD` only ever *sets* an unset password — it never overwrites an existing one,
+so leaving it in a compose file cannot silently reset the credential on every restart.
+
+Then sign in and keep the cookie:
+
+```bash
+curl -sX POST localhost:8080/api/auth/login \
+  -H 'content-type: application/json' \
+  -d '{"password":"a good long password"}' -c cookies.txt
+
+curl -s localhost:8080/api/targets -b cookies.txt
+```
+
+`GET /api/auth/session` reports `{"setup_required":true}` before first-run setup, which is how the
+UI decides whether to show a setup form or a login form.
+
+The cookie is `HttpOnly` and `SameSite=Lax`. It is marked `Secure` **only** when the request
+arrived over TLS: this service is normally reached over plain HTTP on a LAN, and an unconditional
+`Secure` flag would make the browser throw the cookie away and login would fail with nothing
+visible to explain it. Put it behind a TLS proxy and the flag turns itself on.
+
+## Previewing a run before it happens
+
+```bash
+# Plan the work and hold it — nothing is copied or deleted
+curl -sX POST localhost:8080/api/jobs/$JOB/run -b cookies.txt \
+  -H 'content-type: application/json' -d '{"preview":true}'
+
+# Inspect what it intends to do
+curl -s localhost:8080/api/runs/$RUN -b cookies.txt | jq '.progress.plans'
+
+# Go ahead
+curl -sX POST localhost:8080/api/jobs/$JOB/confirm -b cookies.txt
+```
+
+A previewed run holds its mounts while it waits. If nobody confirms within the job's
+`prompt_timeout_sec` (default 600), it **cancels itself and changes nothing** — an unconfirmed plan
+must never execute.
+
+## When a destination is unreachable
+
+`unavailable_policy` decides what happens when a destination cannot be reached:
+
+| Value | Behaviour |
+|---|---|
+| `skip` (default) | Log it, mark that destination skipped, carry on. The run ends `partial`. |
+| `abort` | Fail the whole run immediately. |
+| `prompt` | Park **that destination** and wait for a person. The run keeps going, and its other destinations finish normally. |
+
+Answer a prompt with:
+
+```bash
+curl -sX POST localhost:8080/api/runs/$RUN/prompt -b cookies.txt \
+  -H 'content-type: application/json' \
+  -d '{"dest_target_id":"'$DEST'","action":"skip"}'   # skip | retry | abort
+```
+
+If nobody answers within `prompt_timeout_sec`, the run falls back to `prompt_fallback` (default
+`skip`) and records that it did so in the run log — a destination is never quietly dropped. The
+wait is always bounded, because a run may be started by a schedule with nobody watching.
+
 ## Configuration
 
 | Variable | Default | Notes |

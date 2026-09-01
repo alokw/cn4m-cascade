@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"io"
 	"net/http"
 
 	"github.com/alokw/cn4m-cascade/internal/runner"
@@ -26,6 +27,8 @@ type jobPayload struct {
 	DeletePolicy string `json:"delete_policy"`
 
 	UnavailablePolicy    string `json:"unavailable_policy"`
+	PromptTimeoutSec     int    `json:"prompt_timeout_sec"`
+	PromptFallback       string `json:"prompt_fallback"`
 	ParallelDestinations bool   `json:"parallel_destinations"`
 
 	Destinations []destPayload   `json:"destinations"`
@@ -57,6 +60,8 @@ func (p *jobPayload) toJob() *store.Job {
 		SourceSubpath:        p.SourceSubpath,
 		Mode:                 store.SyncMode(p.Mode),
 		UnavailablePolicy:    store.UnavailablePolicy(p.UnavailablePolicy),
+		PromptTimeoutSec:     p.PromptTimeoutSec,
+		PromptFallback:       store.PromptFallback(p.PromptFallback),
 		ParallelDestinations: p.ParallelDestinations,
 		Compare:              store.CompareMethod(p.Compare),
 		IgnoreDSTHour:        p.IgnoreDSTHour,
@@ -134,6 +139,13 @@ func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// runRequest is the body of POST /api/jobs/{id}/run (SPEC.md §8).
+type runRequest struct {
+	// Preview plans the run and holds it until confirmed, without copying,
+	// deleting or creating anything (SPEC.md §6.1 step 6).
+	Preview bool `json:"preview"`
+}
+
 // handleRunJob starts a run and returns 202 with the run record. The run
 // outlives this request.
 func (s *Server) handleRunJob(w http.ResponseWriter, r *http.Request) {
@@ -143,7 +155,20 @@ func (s *Server) handleRunJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	run, err := s.runner.Start(r.Context(), job)
+	// An absent body means a plain run: the flag is optional.
+	var req runRequest
+	if err := decodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid_body",
+			"The request body is not valid JSON for a run.", err.Error())
+		return
+	}
+
+	start := s.runner.Start
+	if req.Preview {
+		start = s.runner.StartPreview
+	}
+
+	run, err := start(r.Context(), job)
 	if err != nil {
 		if errors.Is(err, runner.ErrAlreadyRunning) {
 			writeError(w, http.StatusConflict, "already_running",
@@ -154,7 +179,7 @@ func (s *Server) handleRunJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.log.Info("run started", "run_id", run.ID, "job_id", job.ID, "name", job.Name)
+	s.log.Info("run started", "run_id", run.ID, "job_id", job.ID, "name", job.Name, "preview", req.Preview)
 	writeJSON(w, http.StatusAccepted, run)
 }
 
@@ -201,4 +226,82 @@ func (s *Server) writeJobError(w http.ResponseWriter, err error) {
 	default:
 		writeError(w, http.StatusBadRequest, "invalid_job", err.Error(), "")
 	}
+}
+
+// handleUpdateJob replaces a job, its destinations and its filter rules
+// (SPEC.md §8's "create/update job").
+//
+// §8 lists only POST /api/jobs for both create and update. A PATCH on the job
+// is used instead: replacing a job with nested destinations and filters is a
+// materially different operation from creating one, and the UI needs to
+// address an existing job by id. Recorded as an extension of §8 rather than a
+// silent deviation.
+func (s *Server) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	// A job whose destinations or filters change under a live diff is not
+	// something the engine is built to survive, so editing is refused while
+	// it runs rather than raced.
+	if _, running := s.runner.Progress(id); running {
+		writeError(w, http.StatusConflict, "job_running",
+			"This job is running. Wait for it to finish, or cancel it, before editing.", "")
+		return
+	}
+	if runs, err := s.db.ListRuns(r.Context(), store.RunFilter{JobID: id, Status: store.RunRunning, Limit: 1}); err == nil && len(runs) > 0 {
+		writeError(w, http.StatusConflict, "job_running",
+			"This job is running. Wait for it to finish, or cancel it, before editing.", "")
+		return
+	}
+
+	var p jobPayload
+	if err := decodeJSON(r, &p); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_body", "The request body is not valid JSON for a job.", err.Error())
+		return
+	}
+
+	job := p.toJob()
+	if err := s.db.UpdateJob(r.Context(), id, job); err != nil {
+		s.writeJobError(w, err)
+		return
+	}
+
+	updated, err := s.db.GetJob(r.Context(), id)
+	if err != nil {
+		s.writeJobError(w, err)
+		return
+	}
+	s.log.Info("job updated", "job_id", id, "name", updated.Name)
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// handleConfirmJob releases a previewed run so it executes the plan it is
+// holding (SPEC.md §8's POST /api/jobs/{id}/confirm).
+func (s *Server) handleConfirmJob(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("id")
+	if _, err := s.db.GetJob(r.Context(), jobID); err != nil {
+		s.writeJobError(w, err)
+		return
+	}
+
+	// Only one run of a job can be in flight, so the parked run is
+	// unambiguous; asking the runner avoids racing the database row.
+	runID, parked := s.runner.AwaitingConfirmation(jobID)
+	if !parked {
+		writeError(w, http.StatusConflict, "not_awaiting_confirmation",
+			"This job has no previewed run waiting to be confirmed.", "")
+		return
+	}
+
+	if err := s.runner.Confirm(runID); err != nil {
+		if errors.Is(err, runner.ErrNotRunning) {
+			writeError(w, http.StatusConflict, "not_running", "That run has already finished.", "")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "confirm_failed",
+			"Could not confirm that run.", err.Error())
+		return
+	}
+
+	s.log.Info("previewed run confirmed", "run_id", runID, "job_id", jobID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "confirmed", "run_id": runID})
 }

@@ -3,9 +3,13 @@
 package api
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
@@ -29,18 +33,53 @@ type Server struct {
 	box      *secrets.Box
 	runner   *runner.Runner
 	log      *slog.Logger
+
+	logins *loginLimiter
+	hub    *hub
 }
 
 // NewServer wires up the API.
 func NewServer(db *store.DB, provider *storage.Provider, mounts *mountmgr.Manager, healthc *health.Cache, box *secrets.Box, runs *runner.Runner, log *slog.Logger) *Server {
-	return &Server{db: db, provider: provider, mounts: mounts, healthc: healthc, box: box, runner: runs, log: log}
+	return &Server{
+		db: db, provider: provider, mounts: mounts, healthc: healthc,
+		box: box, runner: runs, log: log,
+		logins: newLoginLimiter(),
+		hub:    newHub(runs, db, log),
+	}
 }
+
+// Start begins the background work the API owns: the WebSocket broadcast loop
+// and the expired-session sweep.
+func (s *Server) Start(ctx context.Context) {
+	s.hub.start(ctx)
+
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if n, err := s.db.PurgeExpiredSessions(ctx); err != nil {
+					s.log.Warn("could not purge expired sessions", "error", err)
+				} else if n > 0 {
+					s.log.Info("purged expired sessions", "count", n)
+				}
+			}
+		}
+	}()
+}
+
+// Stop releases what Start acquired.
+func (s *Server) Stop() { s.hub.stop() }
 
 // Handler returns the routed, middleware-wrapped handler.
 //
-// Session authentication (SPEC.md §8) is deliberately absent in Phase 1 and
-// lands with the UI in Phase 4 (PROGRESS.md D-4); the middleware seam is
-// this function.
+// Session authentication (SPEC.md §8) wraps everything here except the auth
+// endpoints and the liveness probe — see requireSession. The webhook
+// endpoints of §8, which use bearer tokens rather than sessions, arrive in
+// Phase 5 and will bypass this middleware rather than extend it.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -57,15 +96,28 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/jobs", s.handleListJobs)
 	mux.HandleFunc("GET /api/jobs/{id}", s.handleGetJob)
 	mux.HandleFunc("DELETE /api/jobs/{id}", s.handleDeleteJob)
+	mux.HandleFunc("PATCH /api/jobs/{id}", s.handleUpdateJob)
 	mux.HandleFunc("POST /api/jobs/{id}/run", s.handleRunJob)
+	mux.HandleFunc("POST /api/jobs/{id}/confirm", s.handleConfirmJob)
 	mux.HandleFunc("POST /api/jobs/{id}/filter-test", s.handleFilterTest)
 
 	mux.HandleFunc("GET /api/runs", s.handleListRuns)
 	mux.HandleFunc("GET /api/runs/{id}", s.handleGetRun)
 	mux.HandleFunc("GET /api/runs/{id}/events", s.handleRunEvents)
 	mux.HandleFunc("POST /api/runs/{id}/cancel", s.handleCancelRun)
+	mux.HandleFunc("POST /api/runs/{id}/prompt", s.handlePrompt)
 
-	return s.withLogging(mux)
+	mux.HandleFunc("GET /api/logs", s.handleLogs)
+	mux.HandleFunc("GET /api/browse", s.handleBrowse)
+
+	mux.HandleFunc("POST /api/auth/setup", s.handleSetup)
+	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
+	mux.HandleFunc("POST /api/auth/logout", s.handleLogout)
+	mux.HandleFunc("GET /api/auth/session", s.handleSession)
+
+	mux.HandleFunc("GET /api/ws", s.handleWS)
+
+	return s.withLogging(s.requireSession(mux))
 }
 
 // withLogging records one line per request. It never logs request bodies,
@@ -92,6 +144,26 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
+}
+
+// Hijack forwards to the underlying writer so a WebSocket upgrade can take the
+// connection. Without it the wrapper silently hides the Hijacker interface and
+// the handshake fails with 501 — a middleware breaking a protocol two layers
+// away, with nothing in the logs to say so.
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("this connection cannot be hijacked")
+	}
+	return hj.Hijack()
+}
+
+// Flush forwards to the underlying writer, so streaming responses are not held
+// back by the wrapper.
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func (s *Server) handleLiveness(w http.ResponseWriter, _ *http.Request) {
