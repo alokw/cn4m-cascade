@@ -206,6 +206,19 @@ func TestDiffBlocksDeletionsWhenTheSourceScanIsIncomplete(t *testing.T) {
 	if plan.BlockedReason == "" {
 		t.Error("no reason was recorded for withholding deletions")
 	}
+
+	// The actions are gone, but the scale of the refusal has to survive them:
+	// "refusing to delete 2 files" is a different message from "deletions
+	// blocked", and the count is the only record left once the actions are
+	// discarded. The source holds only kept.txt, so "other.txt" and
+	// "unreadable/data.bin" are the extraneous files and "unreadable/" the
+	// extraneous directory.
+	if plan.WithheldDeletes != 2 {
+		t.Errorf("withheld deletes = %d, want 2", plan.WithheldDeletes)
+	}
+	if plan.WithheldRmDirs != 1 {
+		t.Errorf("withheld rmdirs = %d, want 1", plan.WithheldRmDirs)
+	}
 }
 
 // Withholding is only reported when there was actually something to withhold.
@@ -216,6 +229,10 @@ func TestDiffIncompleteScanWithNothingToDelete(t *testing.T) {
 	plan := Diff(src, dst, mirrorOpts())
 	if plan.DeletionsBlocked {
 		t.Error("reported blocked deletions when there were none to make")
+	}
+	if plan.WithheldDeletes != 0 || plan.WithheldRmDirs != 0 {
+		t.Errorf("counted withheld removals when there were none: %d deletes, %d rmdirs",
+			plan.WithheldDeletes, plan.WithheldRmDirs)
 	}
 }
 

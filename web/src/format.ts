@@ -2,7 +2,9 @@ import { ETA_UNKNOWN } from './api/types'
 
 export function bytes(n: number | undefined): string {
   if (n === undefined || n < 0) return '—'
-  if (n < 1024) return `${n} B`
+  // Rounded: throughput is a float, and an unrounded one renders as
+  // "2.650562150193176 B/s".
+  if (n < 1024) return `${Math.round(n)} B`
   const units = ['KiB', 'MiB', 'GiB', 'TiB']
   let v = n / 1024
   let i = 0

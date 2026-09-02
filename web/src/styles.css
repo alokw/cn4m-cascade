@@ -138,3 +138,64 @@ fieldset.types label { margin: 0; }
 input[type="radio"] { width: auto; display: inline; margin: 0; }
 
 .warn { color: var(--warn); font-size: 0.85rem; }
+
+/* Run detail */
+.bar {
+  height: 8px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+  margin: 0.5rem 0;
+}
+.bar-fill { height: 100%; background: var(--accent); transition: width 0.3s ease; }
+
+.dest-panel { margin-top: 0.75rem; }
+.dest-panel + .dest-panel { margin-top: 0.75rem; }
+
+.badge.status-running { color: var(--accent); border-color: var(--accent); }
+.badge.status-success { color: var(--ok); border-color: var(--ok); }
+.badge.status-partial,
+.badge.status-awaiting_confirmation,
+.badge.status-awaiting_prompt { color: var(--warn); border-color: var(--warn); }
+.badge.status-failed { color: var(--err); border-color: var(--err); }
+.badge.status-cancelled,
+.badge.status-skipped_unavailable { color: var(--muted); }
+
+.in-flight, .events, .paths {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  font-size: 0.85rem;
+}
+.in-flight li, .events li { padding: 0.15rem 0; }
+.paths { max-height: 18rem; overflow: auto; margin-top: 0.4rem; }
+.paths li { padding: 0.1rem 0; }
+
+.events .lvl { text-transform: uppercase; font-size: 0.7rem; }
+.events li.warn .lvl { color: var(--warn); }
+.events li.error .lvl { color: var(--err); }
+.events li.info .lvl { color: var(--muted); }
+
+.filters { display: flex; gap: 0.5rem; align-items: center; }
+select {
+  padding: 0.3rem 0.4rem;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.85rem;
+}
+
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85em; }
+
+/* Confirm screen */
+.confirm { margin: 1rem 0; }
+.plan-dest { border-top: 1px solid var(--line); margin-top: 1rem; padding-top: 0.75rem; }
+.plan-dest h3 { margin: 0 0 0.5rem; font-size: 1rem; }
+.plan-counts { list-style: none; margin: 0 0 0.5rem; padding: 0; display: flex; gap: 1rem; flex-wrap: wrap; font-size: 0.9rem; }
+.danger { color: var(--err); }
+.danger-btn { background: var(--err); color: #fff; }
+
+.modal.prompt { width: min(30rem, 100%); }

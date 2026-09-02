@@ -262,10 +262,51 @@ export interface DestPlan {
   deletes: number
   rmdirs: number
   copy_bytes: number
+  /** Removals that clear something of the wrong type out of the way. NOT
+   *  included in `deletes`, which counts only the trailing delete pass. This
+   *  is what the replaces list checks itself against. */
+  replaces: number
+  /** Copies that replace an existing destination file. An overwrite destroys
+   *  the destination's version as permanently as a delete. */
+  overwrites: number
   /** Distinct from "nothing to delete": the engine refused. Always surface it. */
   deletions_blocked?: boolean
   blocked_reason?: string
+  /** How many removals the guard discarded. The actions themselves are gone,
+   *  so this is the only record of the refusal's scale — "refusing to delete
+   *  412 files" rather than a bare "deletions blocked". */
+  withheld_deletes?: number
+  withheld_rmdirs?: number
   conflicts?: string[]
+}
+
+/** One path a run intends to act on — GET /api/runs/{id}/plan. */
+export interface PlannedAction {
+  relpath: string
+  size?: number
+  reason?: string
+  overwrite?: boolean
+}
+
+/** The per-path detail behind a DestPlan's counts. Served by its own endpoint
+ *  rather than on the progress payload, which is broadcast every second. */
+export interface DestActions {
+  dest_target_id: string
+  mkdirs: string[]
+  copies: PlannedAction[]
+  /** The trailing delete pass only. */
+  deletes: PlannedAction[]
+  rmdirs: string[]
+  /** Removals that clear something of the wrong type out of the way of a copy
+   *  or mkdir. They destroy data too, so they are shown — but separately, as
+   *  DestPlan.deletes deliberately does not count them. */
+  replaces: PlannedAction[]
+  /** At least one list was capped; the true totals are on the DestPlan. */
+  truncated: boolean
+}
+
+export interface RunPlan {
+  destinations: DestActions[]
 }
 
 export interface RunSnapshot {
@@ -325,6 +366,10 @@ export interface BrowseResult {
   path: string
   parent?: string
   entries: BrowseEntry[]
+  /** The directory held more than the server's cap; entries is the first page.
+   *  Show it, or a partial listing reads as the whole directory. */
+  truncated: boolean
+  total: number
 }
 
 export type PromptAction = 'skip' | 'retry' | 'abort'

@@ -155,13 +155,17 @@ export function TargetModal({ target, onClose, onSaved }: Props) {
             Folder path
             <input
               value={form.local_path}
-              placeholder="/mnt/local/stuff"
+              placeholder="/mnt/local"
               onChange={(e) => set('local_path', e.target.value)}
             />
             <span className="hint">
-              An absolute path <strong>inside the container</strong>, not on your host — mount the
-              host directory into the container first (SPEC.md §10 shows the volume). No credentials
-              and no mounting: the engine reads it directly.
+              Use <code>/mnt/local</code> — that is your <code>~/cn4m</code> folder
+              (<code>%USERPROFILE%\cn4m</code> on Windows), shared with the server. Anything you put
+              there can be synced. Subfolders work too, e.g. <code>/mnt/local/photos</code>.
+              <br />
+              This is a path <strong>inside the container</strong>, so an arbitrary path from your
+              own machine will not resolve unless you have mounted it: set{' '}
+              <code>CN4M_LOCAL_DIR</code> in <code>.env</code> to point the share somewhere else.
             </span>
           </label>
         )}

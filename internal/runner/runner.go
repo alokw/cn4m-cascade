@@ -59,6 +59,15 @@ type handle struct {
 	parked atomic.Bool
 	// gate holds whatever the run is waiting for a human to answer.
 	gate *gate
+
+	// planned is what planning produced, published so the API can show a
+	// human the individual paths a run intends to remove before they confirm
+	// it (CLAUDE.md: deletions are never summarised). Guarded by Runner.mu.
+	//
+	// Only the slice header needs the lock: each plannedDest.plan is
+	// immutable once the diff returns, and the outcome field that execution
+	// writes is not read here.
+	planned []*plannedDest
 }
 
 // New builds a Runner.
@@ -179,6 +188,41 @@ func (r *Runner) Progress(runID string) (RunSnapshot, bool) {
 		return RunSnapshot{}, false
 	}
 	return h.progress.snapshot(time.Now()), true
+}
+
+// publishPlan makes one destination's plan readable from outside the run, so
+// the API can show a human exactly what a preview intends to remove.
+func (r *Runner) publishPlan(h *handle, p *plannedDest) {
+	if p == nil || p.plan == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	h.planned = append(h.planned, p)
+}
+
+// PlanFor returns the planned actions for a run still held in this process,
+// per destination and in the differ's order. It reports false once the run has
+// finished: nothing persists a plan, and a plan for a run that already executed
+// would invite showing a user work that has already happened.
+func (r *Runner) PlanFor(runID string) ([]DestActions, bool) {
+	r.mu.Lock()
+	h, ok := r.active[runID]
+	var planned []*plannedDest
+	if ok {
+		planned = append(planned, h.planned...)
+	}
+	r.mu.Unlock()
+
+	if !ok {
+		return nil, false
+	}
+
+	out := make([]DestActions, 0, len(planned))
+	for _, p := range planned {
+		out = append(out, actionsOf(p.targetID, p.plan))
+	}
+	return out, true
 }
 
 // ActiveForJob reports whether a job currently holds a run in this process,
@@ -430,6 +474,10 @@ func (r *Runner) planDestinations(ctx context.Context, h *handle, job *store.Job
 	work := func(i int, dest store.JobDestination) {
 		p := r.planOneDestination(ctx, h, job, run, srcRoot, srcScan, chains[dest.DestTargetID], dest, events, log)
 		planned[i] = p
+		// Published before execution, not after: a non-preview run executes
+		// inline, so waiting for planDestinations to return would hide the
+		// plan until the whole run had already finished.
+		r.publishPlan(h, p)
 		if execInline != nil {
 			execInline(p)
 		}
@@ -557,8 +605,12 @@ func destPlanOf(destID string, plan *engine.Plan) DestPlan {
 		Deletes:          plan.Deletes,
 		RmDirs:           plan.RmDirs,
 		CopyBytes:        plan.CopyBytes,
+		Replaces:         plan.Unblocks,
+		Overwrites:       plan.Overwrites,
 		DeletionsBlocked: plan.DeletionsBlocked,
 		BlockedReason:    plan.BlockedReason,
+		WithheldDeletes:  plan.WithheldDeletes,
+		WithheldRmDirs:   plan.WithheldRmDirs,
 	}
 	for _, c := range plan.Conflicts {
 		dp.Conflicts = append(dp.Conflicts, c.RelPath+": "+c.Reason)

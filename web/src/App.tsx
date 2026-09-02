@@ -1,7 +1,9 @@
 import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 import { AuthProvider, useAuth } from './auth'
-import { useEvents } from './hooks/useEvents'
+import { EventsProvider, useEvents } from './hooks/useEvents'
 import { SignIn } from './screens/SignIn'
+import { RunDetail } from './screens/RunDetail'
+import { Runs } from './screens/Runs'
 import { Targets } from './screens/Targets'
 
 /** The feed is either live or falling back to polling; both keep the data
@@ -23,11 +25,13 @@ function Shell() {
   const { signOut } = useAuth()
 
   return (
+    <EventsProvider>
     <div className="shell">
       <header>
         <span className="brand">SMB Sync</span>
         <nav>
           <NavLink to="/targets">Targets</NavLink>
+          <NavLink to="/runs">Runs</NavLink>
         </nav>
         <FeedIndicator />
         <button className="link" onClick={() => void signOut()}>
@@ -38,11 +42,14 @@ function Shell() {
       <main>
         <Routes>
           <Route path="/targets" element={<Targets />} />
-          {/* Dashboard, job editor, run detail and logs arrive in 4b-2. */}
+          <Route path="/runs" element={<Runs />} />
+          <Route path="/runs/:id" element={<RunDetail />} />
+          {/* Dashboard, job editor and logs arrive in 4b-2b. */}
           <Route path="*" element={<Navigate to="/targets" replace />} />
         </Routes>
       </main>
     </div>
+    </EventsProvider>
   )
 }
 

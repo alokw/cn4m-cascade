@@ -104,6 +104,33 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "cancelling"})
 }
 
+// handleRunPlan returns the individual paths a run intends to act on, so a
+// preview's confirm screen can name the files it is about to delete rather
+// than summarising them (CLAUDE.md; SPEC.md §9's "action plan").
+//
+// It is a separate endpoint rather than a field on the progress payload
+// because progress is broadcast to every WebSocket client once a second, and
+// path lists have no business in that traffic.
+func (s *Server) handleRunPlan(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("id")
+
+	plans, live := s.runner.PlanFor(runID)
+	if !live {
+		// Nothing persists a plan, so a finished run has none. Distinguish
+		// "no such run" from "that run has moved on" — the UI closes a stale
+		// confirm screen on the second, and that should not read as an error.
+		if _, err := s.db.GetRun(r.Context(), runID); err != nil {
+			s.writeRunError(w, err)
+			return
+		}
+		writeError(w, http.StatusConflict, "no_plan",
+			"That run has finished, so its plan is no longer available.", "")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"destinations": plans})
+}
+
 func (s *Server) writeRunError(w http.ResponseWriter, err error) {
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "not_found", "No such run.", err.Error())

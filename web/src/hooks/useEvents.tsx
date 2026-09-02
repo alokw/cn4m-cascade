@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
+import { createContext, useContext, useEffect, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import { api } from '../api/client'
 import type { Run, RunSnapshot, WsEvent } from '../api/types'
 import { isTerminal } from '../api/types'
@@ -38,7 +39,13 @@ const MAX_TRACKED = 100
  * files and — the one that matters — a prompt's countdown deadline all sat
  * frozen at whatever the last WS frame said.
  */
-export function useEvents(): Feed {
+/**
+ * The feed itself. Call this once, in EventsProvider — every call opens its
+ * own WebSocket, and three components each wanting live data would mean three
+ * sockets, three copies of the state, and three times the chance of tripping
+ * the hub's slow-client drop.
+ */
+function useFeed(): Feed {
   const [runs, setRuns] = useState<Map<string, LiveRun>>(new Map())
   const [status, setStatus] = useState<FeedStatus>('connecting')
 
@@ -172,4 +179,19 @@ export function useEvents(): Feed {
   }, [])
 
   return { runs, status }
+}
+
+const FeedContext = createContext<Feed | null>(null)
+
+/** Mounts the single feed for the app. */
+export function EventsProvider({ children }: { children: ReactNode }) {
+  const feed = useFeed()
+  return <FeedContext.Provider value={feed}>{children}</FeedContext.Provider>
+}
+
+/** Reads the shared feed. Safe to call from as many components as you like. */
+export function useEvents(): Feed {
+  const ctx = useContext(FeedContext)
+  if (!ctx) throw new Error('useEvents used outside EventsProvider')
+  return ctx
 }

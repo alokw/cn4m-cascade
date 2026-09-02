@@ -265,6 +265,34 @@ Two things to know about the hold:
 The preview gate is the one thing that holds an entire run. An unreachable destination under
 `prompt` does not — see below.
 
+## Syncing a folder from your own machine
+
+The server runs in a container, so it can only read paths that exist *inside* it. One folder on your
+machine is shared in by default:
+
+| Your machine | Inside the container |
+|---|---|
+| `~/cn4m` (macOS, Linux) | `/mnt/local` |
+| `%USERPROFILE%\cn4m` (Windows) | `/mnt/local` |
+
+`make harness-up` creates it. To use it, add a target of type **Local folder** with the path
+`/mnt/local` — or a subfolder such as `/mnt/local/photos`. That target can be a source or a
+destination like any other.
+
+Type the *container* path (`/mnt/local`), not the path on your own machine. `/Users/you/cn4m` means
+nothing inside the container and the target will not resolve.
+
+To share a different folder instead, set `CN4M_LOCAL_DIR` — in your shell, or in a `.env` file beside
+`docker-compose.test.yml`:
+
+```
+CN4M_LOCAL_DIR=/Volumes/media/to-back-up
+```
+
+Then `make harness-up` again. It still appears as `/mnt/local` inside the container, so nothing you
+configured has to change. On Linux, files the server writes there are owned by root, because the
+container runs as root; `sudo chown -R "$USER" ~/cn4m` if that gets in your way.
+
 ## When a destination is unreachable
 
 `unavailable_policy` decides what happens when a destination cannot be reached:

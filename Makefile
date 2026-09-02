@@ -8,8 +8,18 @@ DEV     := $(COMPOSE) exec -T dev
 help:
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  %-18s %s\n", $$1, $$2}'
 
+# The host folder exposed to the container as /mnt/local, so a "local" target
+# can point at real files on your machine. Override in your shell or a .env
+# file; see docker-compose.test.yml for the full explanation.
+CN4M_LOCAL_DIR ?= $(if $(HOME),$(HOME),$(USERPROFILE))/cn4m
+export CN4M_LOCAL_DIR
+
+.PHONY: local-dir
+local-dir: ## Create the host folder shared with the container as /mnt/local
+	@mkdir -p "$(CN4M_LOCAL_DIR)" && echo "local folder: $(CN4M_LOCAL_DIR) -> /mnt/local"
+
 .PHONY: harness-up
-harness-up: ## Build and start the Samba servers + dev container
+harness-up: local-dir ## Build and start the Samba servers + dev container
 	$(COMPOSE) up -d --build
 	$(DEV) bash /src/test/wait-for-samba.sh
 

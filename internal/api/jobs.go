@@ -209,6 +209,13 @@ func (s *Server) handleFilterTest(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.runner.FilterTest(r.Context(), job, req.SampleLimit)
 	if err != nil {
+		// A share being down is not a malformed request. Reporting it as 400
+		// made the UI say "your request was malformed" about an unplugged NAS,
+		// which sends the user to look at their rules.
+		if errors.Is(err, runner.ErrSourceUnavailable) {
+			writeError(w, http.StatusBadGateway, "source_unavailable", err.Error(), "")
+			return
+		}
 		// A broken rule is the user's to fix, and its message already says
 		// which rule and why.
 		writeError(w, http.StatusBadRequest, "filter_test_failed", err.Error(), "")

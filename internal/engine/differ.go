@@ -56,12 +56,32 @@ type Plan struct {
 	RmDirs    int
 	CopyBytes int64
 
+	// Unblocks counts removals that clear something of the wrong type out of
+	// the way of a copy or mkdir. They are not in Deletes or RmDirs — those
+	// count only the trailing removal passes — but they destroy data just as
+	// permanently, so anything showing a user what a run will do has to be
+	// able to state how many there are.
+	Unblocks int
+	// Overwrites counts copies that replace an existing destination file
+	// rather than creating a new one. An overwrite destroys the destination's
+	// version as surely as a delete does.
+	Overwrites int
+
 	// Conflicts are paths skipped rather than acted on.
 	Conflicts []Conflict
 
 	// DeletionsBlocked is set when deletions were planned but withheld.
 	DeletionsBlocked bool
 	BlockedReason    string
+
+	// WithheldDeletes and WithheldRmDirs are how many removals the guard
+	// discarded. The actions themselves are dropped — a blocked deletion must
+	// not be executable, and retaining it in Actions would put it one bug away
+	// from running — but the count has to survive, or the most consequential
+	// message the UI shows can only say "deletions blocked" and never
+	// "refusing to delete 412 files". Zero unless DeletionsBlocked.
+	WithheldDeletes int
+	WithheldRmDirs  int
 }
 
 // Matcher decides which paths are in scope. internal/filter implements it;
@@ -304,6 +324,11 @@ func Diff(src, dst *ScanResult, opts DiffOptions) *Plan {
 		if reason := deletionGuard(src, dst, opts); reason != "" {
 			plan.DeletionsBlocked = len(deletes)+len(rmdirs) > 0
 			plan.BlockedReason = reason
+			// Counted before the actions are discarded: this is the only
+			// record that survives, and "refusing to delete 412 files" is a
+			// materially different message from "deletions blocked".
+			plan.WithheldDeletes = len(deletes)
+			plan.WithheldRmDirs = len(rmdirs)
 			deletes, rmdirs = nil, nil
 		}
 	}
@@ -327,8 +352,12 @@ func Diff(src, dst *ScanResult, opts DiffOptions) *Plan {
 	plan.Copies = len(copies)
 	plan.Deletes = len(deletes)
 	plan.RmDirs = len(rmdirs)
+	plan.Unblocks = len(unblocks)
 	for _, a := range copies {
 		plan.CopyBytes += a.Size
+		if a.Overwrite {
+			plan.Overwrites++
+		}
 	}
 
 	plan.Actions = make([]Action, 0, len(unblocks)+len(mkdirs)+len(copies)+len(deletes)+len(rmdirs))

@@ -68,12 +68,124 @@ type DestPlan struct {
 	RmDirs    int   `json:"rmdirs"`
 	CopyBytes int64 `json:"copy_bytes"`
 
+	// Replaces counts removals that clear something of the wrong type out of
+	// the way. Deletes deliberately excludes them, so without this count the
+	// one list the UI shows would have no total to check itself against —
+	// which is how a truncated list of destructive actions gets approved.
+	Replaces int `json:"replaces"`
+	// Overwrites counts copies that replace an existing destination file.
+	Overwrites int `json:"overwrites"`
+
 	// DeletionsBlocked reports that deletions were planned and withheld;
 	// the UI must show this, because it is the difference between "nothing
 	// to delete" and "refusing to delete".
-	DeletionsBlocked bool     `json:"deletions_blocked,omitempty"`
-	BlockedReason    string   `json:"blocked_reason,omitempty"`
-	Conflicts        []string `json:"conflicts,omitempty"`
+	DeletionsBlocked bool   `json:"deletions_blocked,omitempty"`
+	BlockedReason    string `json:"blocked_reason,omitempty"`
+	// WithheldDeletes and WithheldRmDirs say *how many* were withheld, so the
+	// refusal can be stated at its real scale rather than as a bare flag.
+	WithheldDeletes int      `json:"withheld_deletes,omitempty"`
+	WithheldRmDirs  int      `json:"withheld_rmdirs,omitempty"`
+	Conflicts       []string `json:"conflicts,omitempty"`
+}
+
+// planPathLimit caps each list in DestActions. A mirror of a large tree can
+// plan hundreds of thousands of removals, and a confirm screen that tries to
+// render all of them helps nobody; the untruncated counts live on DestPlan.
+// Matches the convention of storage.listLimit and FilterTestResult's samples.
+const planPathLimit = 2000
+
+// PlannedAction is one path a run intends to act on. Deletions are listed
+// individually because CLAUDE.md forbids summarising them: a user confirming
+// "412 files" is entitled to see which 412.
+type PlannedAction struct {
+	RelPath string `json:"relpath"`
+	Size    int64  `json:"size,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	// Overwrite marks a copy that replaces an existing file rather than
+	// creating a new one.
+	Overwrite bool `json:"overwrite,omitempty"`
+}
+
+// DestActions is the per-path detail behind a DestPlan's counts, served by
+// GET /api/runs/{id}/plan rather than ridden along on every progress frame:
+// plans are broadcast to every WebSocket client once a second, and path lists
+// have no business in that traffic.
+type DestActions struct {
+	DestTargetID string `json:"dest_target_id"`
+
+	MkDirs []string        `json:"mkdirs"`
+	Copies []PlannedAction `json:"copies"`
+	// Deletes is the trailing delete pass only.
+	Deletes []PlannedAction `json:"deletes"`
+	RmDirs  []string        `json:"rmdirs"`
+	// Replaces are removals that clear something of the wrong type out of the
+	// way of a copy or mkdir (engine.Action.Unblock). They destroy data too,
+	// so they are shown — but they are *not* folded into Deletes, whose count
+	// on DestPlan deliberately excludes them. Conflating the two would show a
+	// user more rows than the number printed beside them.
+	Replaces []PlannedAction `json:"replaces"`
+
+	// Truncated reports that at least one list above was capped at
+	// planPathLimit. The true totals are on the matching DestPlan.
+	Truncated bool `json:"truncated"`
+}
+
+// actionsOf projects an engine plan onto the per-path view.
+func actionsOf(destID string, plan *engine.Plan) DestActions {
+	da := DestActions{
+		DestTargetID: destID,
+		MkDirs:       []string{},
+		Copies:       []PlannedAction{},
+		Deletes:      []PlannedAction{},
+		RmDirs:       []string{},
+		Replaces:     []PlannedAction{},
+	}
+	if plan == nil {
+		return da
+	}
+
+	for _, a := range plan.Actions {
+		switch {
+		// Unblock first, mirroring engine's partition. Both ActionDelete and
+		// ActionRmDir can carry it today; checking Kind first would silently
+		// file a future unblocked mkdir or copy under "will be created",
+		// hiding a removal.
+		case a.Unblock:
+			if len(da.Replaces) < planPathLimit {
+				da.Replaces = append(da.Replaces, PlannedAction{
+					RelPath: a.RelPath, Size: a.Size, Reason: a.Reason})
+			} else {
+				da.Truncated = true
+			}
+		case a.Kind == engine.ActionMkDir:
+			if len(da.MkDirs) < planPathLimit {
+				da.MkDirs = append(da.MkDirs, a.RelPath)
+			} else {
+				da.Truncated = true
+			}
+		case a.Kind == engine.ActionCopy:
+			if len(da.Copies) < planPathLimit {
+				da.Copies = append(da.Copies, PlannedAction{
+					RelPath: a.RelPath, Size: a.Size, Reason: a.Reason, Overwrite: a.Overwrite})
+			} else {
+				da.Truncated = true
+			}
+		case a.Kind == engine.ActionDelete:
+			if len(da.Deletes) < planPathLimit {
+				da.Deletes = append(da.Deletes, PlannedAction{
+					RelPath: a.RelPath, Size: a.Size, Reason: a.Reason})
+			} else {
+				da.Truncated = true
+			}
+		case a.Kind == engine.ActionRmDir:
+			if len(da.RmDirs) < planPathLimit {
+				da.RmDirs = append(da.RmDirs, a.RelPath)
+			} else {
+				da.Truncated = true
+			}
+		}
+	}
+	return da
 }
 
 // progress aggregates one tracker per destination.

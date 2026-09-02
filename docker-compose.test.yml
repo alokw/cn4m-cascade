@@ -35,6 +35,23 @@ services:
       - .:/src
       - gomodcache:/go/pkg/mod
       - gobuildcache:/root/.cache/go-build
+      # A folder on YOUR machine, usable as a "local" sync target. Inside the
+      # container it is always /mnt/local, so that is the path you type when
+      # creating a local target in the UI — regardless of where it lives on
+      # your host.
+      #
+      # Default: ~/cn4m on macOS and Linux, %USERPROFILE%\cn4m on Windows.
+      # `make harness-up` creates it if it does not exist.
+      #
+      # To use a different folder, set CN4M_LOCAL_DIR — either in your shell
+      # or in a .env file beside this one:
+      #
+      #     CN4M_LOCAL_DIR=/Volumes/media/to-back-up
+      #
+      # The nesting below is the cross-platform part: HOME is set on macOS and
+      # Linux, USERPROFILE on Windows. Docker Desktop accepts forward slashes
+      # in a Windows path, so C:\Users\you/cn4m resolves correctly.
+      - ${CN4M_LOCAL_DIR:-${HOME:-${USERPROFILE:-/tmp}}/cn4m}:/mnt/local
     # Reachable from the host browser for the manual pass: 8384 is the Go
     # server (`make run`), 5173 is the Vite dev server (`make web-dev`), which
     # proxies /api to 8384 inside the container.

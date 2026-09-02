@@ -2,7 +2,10 @@
 
 Living handoff doc. Update at the end of every session (CLAUDE.md → Workflow).
 
-**Current phase:** Phase 4b-2 — dashboard, job editor, run detail, logs. **Start in plan mode.**
+**Current phase:** Phase 4b-2b — dashboard, job editor + Filters tab, logs. **Start in plan mode.**
+**Phase 4b-2a:** ✅ Code complete — the plan endpoint, withheld deletion counts, the browse cap, the
+filter-test status split, and run detail with the prompt modal and confirm screen. **Pending the
+fresh-context review and a manual browser pass.** See §0-4b2a.
 **Phase 4b-1:** ✅ **Complete.** All four exit criteria pass — the two HTTP-layer ones by test, the
 two screen ones by a manual browser pass the user confirmed on 2026-09-02. The fresh-context review
 is done (§5e; eight findings fixed, including a `.gitignore` regression I introduced). Vite/React/TS
@@ -18,7 +21,77 @@ fresh-context review is done (it found five more paths to data loss, all filter-
 **Phase 2:** ✅ Complete — all exit criteria met, the fresh-context review is done (it found seven
 data-loss bugs, all fixed with regression tests — §5b), and the bounded-I/O hard rule is satisfied.
 **Phase 1:** ✅ Complete (record retained below).
-**Last updated:** 2026-09-02 (Phase 4b-1 complete: review done, manual pass done)
+**Last updated:** 2026-09-02 (Phase 4b-2a code complete; review pending)
+
+---
+
+## 0-4b2a. Phase 4b-2a status — plan visibility and run detail
+
+Phase 4b-2 is split: **4b-2a** is everything that touches deletions, **4b-2b** is the remaining
+forms (dashboard, job editor, logs).
+
+### Built
+| Area | Contents |
+|---|---|
+| `internal/engine/differ.go` | `Plan.WithheldDeletes` / `WithheldRmDirs`, captured at the guard site *before* the actions are discarded |
+| `internal/runner/progress.go` | `PlannedAction`, `DestActions`, `actionsOf`, `planPathLimit`; withheld counts on `DestPlan` |
+| `internal/runner/runner.go` | `handle.planned` published per destination as it is planned, plus `Runner.PlanFor` |
+| `internal/api/runs.go` | `GET /api/runs/{id}/plan` — the per-path detail |
+| `internal/api/browse.go` | `browseLimit` (2000) + `truncated`/`total`, and `browseBudget` bounding the whole listing |
+| `internal/api/jobs.go`, `internal/runner/filtertest.go` | `ErrSourceUnavailable` → 502 `source_unavailable`, distinct from a 400 for a bad rule |
+| `web/src/components/ConfirmPlan.tsx` | the preview confirm screen: deletions listed individually, refusal shown with its count |
+| `web/src/components/PromptModal.tsx` | blocking prompt with a countdown, treating `409 no_such_prompt` as "stale, close it" |
+| `web/src/screens/RunDetail.tsx` | per-destination panels, in-flight files, cancel, filtered event log |
+| `web/src/screens/Runs.tsx` | a minimal run list so run detail is reachable before the dashboard lands |
+
+### Why the paths got their own endpoint (D-68)
+`DestPlan` rides `RunSnapshot.plans`, and `setPlan` is called for **every** run, not just previews
+(`runner.go`), with the hub broadcasting progress to every client once a second. Inlining path lists
+would have put them on every tick of every run. `GET /api/runs/{id}/plan` is fetched once when the
+confirm screen opens instead. It reads live runner state, so a finished run returns **409 `no_plan`**
+rather than 404 — the UI closes a stale confirm tab on that, and it should not read as an error.
+
+### Two things the trace turned up that were nearly got wrong (D-69)
+- **`Unblock` actions are not ordinary deletes.** `plan.Deletes` counts only the trailing delete
+  pass, but the type-conflict clears are *also* `ActionDelete`. Filtering `Actions` by kind alone
+  would have listed more rows than the count printed beside them. They are reported separately as
+  `replaces` — they destroy data, so they are shown, just not conflated.
+- **A blocked deletion loses its actions *and* its count.** The differ does `deletes, rmdirs = nil,
+  nil` after setting a bool, so the UI could only ever say "deletions blocked". The counts are now
+  captured first, so the screen says "refusing to delete 2 files" — a materially different sentence,
+  and the one CLAUDE.md's "never summarised" rule is about.
+
+### Exit criteria (SPEC.md §11)
+| Criterion | Status |
+|---|---|
+| A preview's confirm view names the files it will delete; confirming executes that plan | ✅ `TestRunPlanNamesTheFilesItWillDelete` — asserts the specific paths, that a source file is *not* among them, and that the count beside the list matches the list. **Confirmed in a browser 2026-09-02**: the screen listed the pre-existing file and warned it would be deleted; confirming removed it and copied the source tree |
+| A blocked run says so with the count, never "nothing to delete" | ✅ `TestDiffBlocksDeletionsWhenTheSourceScanIsIncomplete` (2 deletes, 1 rmdir withheld) |
+| `prompt` shows a counting-down modal while the healthy destination completes | ✅ **Confirmed in a browser 2026-09-02**: the healthy destination reached `success` (3/3 files) while the unreachable one sat at `awaiting_prompt`, and the run ended `partial`. That walkthrough also exposed three UI bugs — see §5g |
+| Killing the WS mid-run leaves progress advancing via polling | ⚠️ **Not verified by hand.** Browsers offer no way to close a WebSocket directly, and DevTools' Offline toggle also blocks the polling it would test. The fallback is covered by inspection and by the reconnect logic in `useEvents`, not by a manual pass. Honest gap |
+| `/api/browse` caps a large listing; `filter-test` returns 502 for an unreachable source | ✅ `TestBrowseCapsALargeListing`, `TestFilterTestReportsAnUnreachableSourceAsUnavailable` |
+
+### Verification (CLAUDE.md → Definition of done)
+| Gate | Result |
+|---|---|
+| `go vet -tags=integration ./...` | ✅ clean |
+| `golangci-lint run` | ✅ `0 issues.` |
+| `npm run lint` / `npm run build` | ✅ clean; 257 kB / 82 kB gzipped |
+| Unit tests under `-race` | ✅ all `ok` |
+| Integration under `-race` | ✅ **53 PASS / 0 FAIL, `ok ... 345.548s`** (49 before this phase, 4 new; 1 SKIP is `TestScaleMirror`). Re-run clean after the §5f fixes. Unit tests now include `internal/runner`, which had no test files before |
+| Fresh-context subagent review | ✅ Done — see §5f. Nine findings, seven fixed |
+| Manual browser pass | ⛔ not done — open item 1 |
+
+### Open items
+1. **No manual browser pass yet.** The confirm screen, prompt modal and run detail have never been
+   rendered; only their data paths are tested. **`test/manual-4b2a.sh` sets up both runs** —
+   there is no job editor until 4b-2b, so a job cannot be made by clicking. The script creates a
+   throwaway local source, points a mirror job at a scratch subpath you name, and prints the run
+   URL. Verified end to end against the harness: the preview parks, the plan endpoint names the
+   extraneous files individually, and the counts match the lists.
+2. `Runs.tsx` is a placeholder front door for run detail. 4b-2b's dashboard replaces it.
+3. The confirm screen fetches the plan once when it opens. If a destination is still being planned
+   at that moment the list is short by one destination; there is no refetch. Harmless for a preview
+   (which parks only after every destination is planned) but wrong if it is ever reused elsewhere.
 
 ---
 
@@ -508,6 +581,9 @@ D-1…D-13 were approved 2026-08-31 before implementation; D-14…D-17 came out 
 | D-57 | `Run.Terminal()` enumerates terminal statuses instead of `!= running`, and `Active()` was added | `awaiting_confirmation` is neither running nor finished. The old form would have called a parked run done |
 | D-58 | A confirmed preview executes the **held** plan, not a fresh diff | The user agreed to a specific set of changes; re-diffing could execute something they never saw. The cost is that the plan is a snapshot, which the executor already tolerates (a file that vanished is a normal event). **Amended by the §5d review:** that reasoning covers copies but not deletes, which are not undoable — see §6 Phase 4a item 8. The trade-off stands; the exposure is now documented in the README and needs a shorter hold or a re-check on confirm |
 | D-59 | **Preview mode moved from Phase 6 to Phase 4, in SPEC.md §11** | §11 assigned it to Phase 6 by name while §6.1/§8/§9 all specified it as part of the run pipeline and job editor — a contradiction in the spec. Resolved toward Phase 4 because the preview gate's only interface is the run-detail screen; building it apart from that screen means building it twice. Recorded in the spec, not just here, so the contradiction cannot be rediscovered. §11 Phase 4 also gained the exit criteria it never had |
+| D-70 | **A host folder is shared into the container as `/mnt/local` by default** | Requested by the user 2026-09-02: local folders are a common source, and telling people to find a path that exists *inside* a container is a bad first experience. `~/cn4m` (`%USERPROFILE%\cn4m` on Windows) is created by `make harness-up` and mounted at `/mnt/local`, so the answer to "what do I type?" is always the same string regardless of platform. Overridable with `CN4M_LOCAL_DIR` in the shell or a `.env`. Cross-platform via Compose's nested defaults, `${CN4M_LOCAL_DIR:-${HOME:-${USERPROFILE:-/tmp}}/cn4m}` — verified that an unset `HOME` falls through to `USERPROFILE`, which is the Windows case. **Verified end to end**: a file written on the host in `~/cn4m` synced to an SMB share with `run: success`. The production compose of SPEC.md §10 should mirror this when it is built |
+| D-68 | **The plan's per-path detail is its own endpoint, not a field on the progress payload** | `RunSnapshot.plans` is broadcast to every WebSocket client once a second, and `setPlan` runs for every destination of every run, not just previews. Inlining delete paths would have put a path list on every tick of every run. `GET /api/runs/{id}/plan` is fetched once, when the confirm screen opens. It reads live runner state — nothing persists a plan — so a finished run is **409 `no_plan`**, distinct from a 404, because a stale confirm tab hitting it is an ordinary race and must not read as a failure |
+| D-69 | **`Unblock` removals are reported separately from deletions, and withheld deletions keep their count** | Two traps found while tracing the deletion path. (1) `plan.Deletes` counts only the trailing delete pass, but the type-conflict clears appended earlier are *also* `ActionDelete`; filtering `Actions` by kind alone would list more rows than the number printed beside them, so they are surfaced as `replaces` — shown, because they destroy data, but not conflated. (2) The guard does `deletes, rmdirs = nil, nil` after setting a bool, destroying the count along with the actions; `WithheldDeletes`/`WithheldRmDirs` are now captured first, so the UI can say "refusing to delete 2 files" instead of a bare "deletions blocked". The actions themselves stay discarded — a blocked deletion must not be one bug away from executing |
 | D-66 | **The admin password has no policy at all — any length, including empty** | Requested by the user 2026-09-02: the service usually runs on a closed network where a long password is friction rather than protection. The 8-character minimum in `store.SetAdminPassword` is gone. Three things were kept deliberately: a blank password is still a **credential** (the wrong one is still a 401, the rate limiter still applies — it is not an "auth off" switch), first-run setup still closes after first use, and the hashing is unchanged (fresh salt, 600k PBKDF2 iterations) so raising the bar later costs nothing. `TestAdminPasswordHasNoMinimumLength` and `TestBlankAndShortAdminPasswordsWork` cover it, the latter through the real setup → login → authenticated-request flow with a fresh cookie jar, because a blank password that could be set but not used would be worse than refusing it. **`weak_password` is gone from `/api/auth/setup`**: with no policy left, any error there is the database or the hash failing, so it is a 500 `setup_failed` rather than a 400 blaming the caller. The README explains when a blank password is and is not appropriate |
 | D-67 | **An empty `SMBSYNC_ADMIN_PASSWORD` still means "not configured", not "no password"** | The asymmetry with D-66 is intentional. SPEC.md §10's compose file passes `ADMIN_PASSWORD=${ADMIN_PASSWORD}`, which expands to an empty string when the variable is unset on the host; treating that as a deliberate blank would turn a forgotten variable into a server anyone can sign into. Choosing no password has to be an explicit act, so it is only reachable through first-run setup |
 | D-64 | **The target modal gained a type selector, so a local folder can be a source (or destination)** | Requested by the user 2026-09-02. The backend already supported it end to end — `store` validated `TargetLocal`, `storage.Provider.For` returned `LocalStorage`, and `Target.UNCPath`/`Describe` handled it — but **nothing exercised the path**: no integration test, and the UI hardcoded `type: "smb"`, so the combination had never run. Verified manually first (a local source mirrored to an SMB share, `success`, correct bytes on the share), then pinned by `TestLocalSourceMirrorsToSMB` and `TestTargetCanBeSwitchedBetweenSMBAndLocal`. **The modal sends the other type's fields as `""` rather than omitting them**, because the server validates the two as mutually exclusive and an omitted field keeps its stored value — without that, switching an existing SMB target to local is rejected with a validation error that reads as user error |
@@ -684,7 +760,75 @@ that uses it.
   "0 free". Go-side, low stakes, not in a frozen-API-breaking position.
 - `client.ts` does not `encodeURIComponent` ids; they are server-generated UUIDs.
 
+## 5f. Phase 4b-2a review — findings and resolution
+
+A fresh-context subagent reviewed the 4b-2a diff against SPEC.md §6.1/§8/§9/§11, the CLAUDE.md hard
+rules and the 4b-2a exit criteria.
+
+**The core claim held.** The reviewer traced deletion-count consistency end to end and confirmed
+`DestPlan.Deletes` and `DestActions.Deletes` **cannot disagree** — both derive from the same
+post-guard slice, and when the guard fires both go to zero together. The withheld-count capture
+point is right, the `PlanFor`/`publishPlan` locking is race-free (the lock pair supplies the
+happens-before edge for the `p.plan` write, and `-race` is green), the new endpoint is behind the
+session guard with the 404/409 split correct, and `st.Release` still works after the budget expires.
+
+### Fixed
+
+| # | Finding | Fix |
+|---|---|---|
+| P0-1 | **The browse cap truncated *before* the dirs-first sort.** `ReadDir` returns entries in name order, so slicing the first 2000 kept the alphabetically-earliest names and dropped every directory sorting after them. A share root with 200k `f*.txt` files and a `zzz-media/` directory returned 2000 files and **no directories** — a path picker that cannot navigate, which is the only thing a path picker is for | sort before truncating (`browse.go`). `TestBrowseCapsALargeListing` now seeds a directory that sorts after every file; **verified to fail** against the old ordering |
+| P0-2 | **`browseBudget` bounded latency but not the syscall fan-out, and my comment claimed otherwise.** `engine.bounded` launches its goroutine and *then* selects — there is no `ctx.Err()` pre-check — so an expired budget did not stop the loop starting another `lstat`. A share dying mid-listing fired one goroutine per remaining entry in a burst: up to 2000 threads parked in the kernel per request, against Go's 10,000-thread hard limit | explicit `ctx.Err() == nil` check before each `InfoBounded`; sizes are dropped rather than rows, since a listing without sizes is still a usable picker. The comment now says what the code does |
+| P1-3 | **`replaces` was the one list with no count anywhere** — `DestPlan` had no total for unblock removals, so a truncated list of >2000 of them showed 2000 rows with no number stating the real figure. The under-reporting D-69 exists to prevent, arriving through the list D-69 created | `engine.Plan.Unblocks` → `DestPlan.Replaces`, and the list checks itself against it |
+| P1-4 | **One `truncated` flag across five lists cried wolf.** A first mirror of a large tree exceeds the cap on `mkdirs` and `copies` — lists the confirm screen never renders — so the user saw "some lists are truncated" while every list shown was complete. That trains people to dismiss the notice that matters | per-list reporting: `PathList` takes the authoritative count and says "N more not listed" only for the list actually short |
+| P1-5 | **Two WebSockets per page.** `useEvents` was a plain hook with its own `useEffect`, mounted in the shell *and* in `Runs`/`RunDetail`, so each screen held two sockets with two independent states — doubling the chance of tripping the hub's slow-client drop, and doubling the poll load on fallback | lifted into `EventsProvider`, mounted once in `Shell`; `useEvents` now reads context and throws outside it |
+| P1-6 | **A destination with counts but no path detail rendered as if complete**, with Confirm still enabled — counts without paths is exactly the state that looks finished | `safeToConfirm` blocks the button when any destination plans removals whose paths are missing, with an explicit message |
+| P2-7 | **`actionsOf` checked `Unblock` *after* the mkdir and copy cases**, where `engine.partition` checks it first. They agree only because `Diff` never sets `Unblock` on a mkdir or copy today; if that changed, the executor would remove a path the screen filed under "will be created" | `case a.Unblock:` hoisted to the top, mirroring `partition`. `TestActionsOfTreatsAnyUnblockAsARemoval` pins it |
+| P2-9 | **Overwrites were invisible.** `PlannedAction.overwrite` was populated and typed but never rendered; a mirror overwriting 500 destination files said only "500 to copy", though an overwrite destroys the destination's version as permanently as a delete | `engine.Plan.Overwrites` → `DestPlan.Overwrites`, surfaced on the confirm screen |
+
+**Also closed the coverage gap the reviewer flagged**: `internal/runner` had no test files at all, so
+`actionsOf` — the function this sub-phase exists for — had zero direct coverage. `progress_test.go`
+now covers unblock separation, truncation, a nil plan, and that `DestPlan`'s counts match the lists.
+
+### Tracked, not fixed
+- **P2-8: the prompt modal has no dismiss control.** Partly addressed — both 409s now close it, and
+  it no longer renders over a terminal run — but there is still no explicit close button. If a
+  future state strands it, the user's only recourse is a reload. §6 Phase 4b-2 item 1.
+- Exit criterion 2 (withheld counts) is proven in `internal/engine` and now in `internal/runner`,
+  but nothing asserts the count survives to the wire. Narrow rather than vacuous. §6 item 2.
+
+## 5g. What the 4b-2a manual pass caught
+
+The browser walkthrough (2026-09-02) confirmed both screens work — and found three bugs that every
+automated test had missed, because all three are about what the *screen* does over time rather than
+what the API returns.
+
+| # | Bug | Fix |
+|---|---|---|
+| 1 | **The event log never refreshed.** `EventLog` fetched once on mount and never again, so a run detail page opened as a run started showed "Nothing logged yet" for the entire run. The events existed the whole time — verified 5 of them in the database for a run whose UI showed none; nothing ever asked for them a second time | polls every 3s while the run is live, and refetches once when it goes terminal so the final events land without pressing Refresh |
+| 2 | **A finished run showed a destination still `awaiting_prompt`.** `useEvents` deliberately retains the last progress snapshot after `run_finished` so a completed run keeps its final numbers — but that snapshot was taken *before* the fallback fired, so the panel contradicted the summary directly above it ("1 skipped (unavailable)") | once the run is terminal the panels are built from `run.destinations` (the database, authoritative) rather than the retained snapshot. Throughput, ETA and in-flight files are now live-only fields, since printing a rate for a stopped run is a lie |
+| 3 | **Unformatted throughput** — `2.650562150193176 B/s`. `bytes()` rounded nothing below 1 KiB, and throughput is a float | rounded |
+
+None of these was reachable from the API tests: the endpoints were correct in all three cases. They
+are the argument for the manual pass being a real gate rather than a formality.
+
 ## 6. Open items for the next session
+
+### Phase 4b-2
+
+1. **The prompt modal has no explicit dismiss control.** Both 409s close it and it no longer renders
+   over a terminal run (§5f P2-8), but if some future state strands it the only way out is a reload.
+   A close button that leaves the prompt unanswered would be honest — the fallback still fires.
+2. **Nothing asserts `withheld_deletes` survives to the wire.** It is unit-tested in the differ and
+   in `destPlanOf`, but no test reads it out of a JSON response, so a dropped assignment or a bad
+   tag would ship silently. An integration case with an unreadable source directory would close it.
+3. `ConfirmPlan` fetches the plan once when it opens and never refetches. Correct for a preview,
+   which parks only after every destination is planned, but wrong if the component is reused for a
+   live run.
+4. `Runs.tsx` is a placeholder front door, replaced by the dashboard in 4b-2b.
+5. **Files the server writes into the shared folder are root-owned on Linux**, because the container
+   runs as root. Harmless on Docker Desktop (macOS/Windows), which maps ownership, but a Linux user
+   syncing *into* `~/cn4m` will need `sudo chown`. Noted in the README. A `user:` mapping on the
+   compose service would fix it properly and is worth doing before anyone deploys on Linux.
 
 ### Phase 4a
 
@@ -729,12 +873,17 @@ that uses it.
    below `prompt_timeout_sec`'s 86400 ceiling; re-scan the destination on confirm and re-prompt if
    the delete set changed. The exposure is now documented in the README under "Previewing a run".
    Preview stays in Phase 4 (D-59), so this item is live, not moot.
-9. **`DestPlan` carries only counts, so a confirm gate over deletions shows no paths.**
+9. ~~`DestPlan` carries only counts, so a confirm gate over deletions shows no paths.~~ **Fixed in
+   4b-2a** — `GET /api/runs/{id}/plan` (D-68) lists them individually, and the confirm screen renders
+   them. *Original:*
    `progress.go:60-77` exposes `mkdirs / copies / deletes / rmdirs / copy_bytes` and conflict
    strings. A user confirming "412 to delete" cannot see *which* 412. SPEC.md §9 asks run detail to
    show "the action plan", and CLAUDE.md is explicit that removing data "is logged individually,
    never summarised". Needs the delete paths in the payload before 4b builds the modal.
-10. **`/api/browse` has no entry cap and no aggregate bound.** Each `InfoBounded` call is
+10. ~~`/api/browse` has no entry cap and no aggregate bound.~~ **Fixed in 4b-2a** — `browseLimit`
+    (2000) with `truncated`/`total`, and `browseBudget` (30s) over the whole listing so a share that
+    dies partway stops the loop instead of paying the per-call timeout 2000 times.
+    `TestBrowseCapsALargeListing` covers it. *Original:* Each `InfoBounded` call is
     individually bounded at 15s — the hard rule is satisfied *per call* — but the loop is not.
     **Scenario:** an admin opens the picker on a 200k-entry directory, `ReadDir` succeeds from
     `cache=loose`, then the server dies → 200k × 15s, each spawning a goroutine that holds an OS
@@ -784,8 +933,10 @@ that uses it.
    clear (that is the exit criterion), but the feedback belongs in the editor. Phase 4's UI is the
    natural home.
 2. **§6.5's optional debug toggle to log every filtered path is not implemented.** Counts are.
-3. `handleFilterTest` returns 400 when the *source* is unavailable, which reads as "your request was
-   malformed". Should be 502/503, matching the target-test endpoint.
+3. ~~`handleFilterTest` returns 400 when the *source* is unavailable.~~ **Fixed in 4b-2a** —
+   `runner.ErrSourceUnavailable` is wrapped at the resolve failure and mapped to 502
+   `source_unavailable`; a bad rule still returns 400. `TestFilterTestReportsAnUnreachableSourceAsUnavailable`
+   covers it.
 3b. **Pattern-matching cost at scale is unmeasured.** The post-Phase-3 scale run had no filter rules,
    so it exercised the `Matcher` dispatch but never a pattern. A `**`-heavy rule set over 100k
    entries is the case worth timing before anyone relies on filters at that size.

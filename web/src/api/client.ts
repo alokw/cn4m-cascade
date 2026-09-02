@@ -7,6 +7,7 @@ import type {
   Run,
   RunDetail,
   RunEvent,
+  RunPlan,
   SessionState,
   Target,
   TargetPayload,
@@ -133,6 +134,9 @@ export const api = {
     events: (id: string, params: { level?: string; dest?: string; limit?: number; offset?: number } = {}) =>
       get<{ events: RunEvent[] }>(`/api/runs/${id}/events${query(params)}`).then((r) => r.events ?? []),
     cancel: (id: string) => post<{ status: string }>(`/api/runs/${id}/cancel`),
+    /** The individual paths a run intends to act on. Only available while the
+     *  runner still holds the run — a finished run 409s with no_plan. */
+    plan: (id: string) => get<RunPlan>(`/api/runs/${id}/plan`),
     prompt: (id: string, destTargetId: string, action: PromptAction) =>
       post<{ status: string }>(`/api/runs/${id}/prompt`, {
         dest_target_id: destTargetId,

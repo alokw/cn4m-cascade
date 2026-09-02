@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -46,6 +47,10 @@ type FilterTestResult struct {
 
 // FilterTest previews a job's filters against a sample of its real source
 // (SPEC.md §6.5, §8).
+// ErrSourceUnavailable reports that a filter test could not reach the source,
+// as opposed to failing on the rules themselves.
+var ErrSourceUnavailable = errors.New("the source is unavailable")
+
 func (r *Runner) FilterTest(ctx context.Context, job *store.Job, sampleLimit int) (*FilterTestResult, error) {
 	if sampleLimit <= 0 || sampleLimit > 1000 {
 		sampleLimit = DefaultFilterSampleLimit
@@ -65,7 +70,11 @@ func (r *Runner) FilterTest(ctx context.Context, job *store.Job, sampleLimit int
 	}
 	srcRoot, _, release, err := r.resolve(ctx, srcTarget, job.SourceSubpath)
 	if err != nil {
-		return nil, fmt.Errorf("the source is unavailable: %w", err)
+		// Wrapped in a sentinel so the API can answer 502 rather than 400: a
+		// share being down is not a malformed request, and telling the user
+		// their filter rules are wrong when the NAS is unplugged sends them
+		// looking in the wrong place.
+		return nil, fmt.Errorf("%w: %w", ErrSourceUnavailable, err)
 	}
 	defer release()
 
