@@ -1,0 +1,140 @@
+:root {
+  --bg: #12141a;
+  --panel: #1b1e26;
+  --line: #2b303c;
+  --text: #e6e8ee;
+  --muted: #9aa2b1;
+  --accent: #5b9dff;
+  --ok: #47c07f;
+  --warn: #e0a94a;
+  --err: #e2635f;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.shell > header {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0.75rem 1.5rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.brand { font-weight: 600; letter-spacing: 0.02em; }
+
+nav { display: flex; gap: 1rem; flex: 1; }
+nav a { color: var(--muted); text-decoration: none; padding: 0.25rem 0; }
+nav a.active, nav a:hover { color: var(--text); border-bottom: 2px solid var(--accent); }
+
+main { padding: 1.5rem; max-width: 68rem; margin: 0 auto; }
+
+.centred { display: grid; place-items: center; min-height: 100vh; padding: 1rem; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 1.25rem;
+}
+
+.page-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+h1 { font-size: 1.4rem; margin: 0; }
+h2 { font-size: 1.15rem; margin: 0 0 0.5rem; }
+
+label { display: block; margin-bottom: 0.75rem; font-size: 0.85rem; color: var(--muted); }
+label.checkbox { display: flex; align-items: center; gap: 0.5rem; }
+input[type="text"], input[type="password"], input:not([type]) {
+  display: block;
+  width: 100%;
+  margin-top: 0.25rem;
+  padding: 0.5rem 0.6rem;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--text);
+  font: inherit;
+}
+input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+
+button {
+  padding: 0.45rem 0.9rem;
+  background: var(--accent);
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: #08101f;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.5; cursor: default; }
+button.link { background: none; color: var(--accent); font-weight: 400; padding: 0.25rem 0.4rem; }
+button.link.danger { color: var(--err); }
+
+.actions { display: flex; gap: 0.5rem; align-items: center; justify-content: flex-end; }
+
+.auth-form { width: min(24rem, 100%); }
+.auth-form h1 { margin-bottom: 0.75rem; }
+
+.muted { color: var(--muted); }
+.hint { color: var(--muted); font-size: 0.8rem; font-weight: 400; margin: 0.25rem 0 0; }
+.error { color: var(--err); font-size: 0.9rem; }
+.ok { color: var(--ok); font-size: 0.9rem; }
+
+.target-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.75rem; }
+.target-head { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.5rem; flex-wrap: wrap; }
+
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+.dot.healthy { background: var(--ok); }
+.dot.unhealthy { background: var(--err); }
+.dot.unknown { background: var(--muted); }
+
+.badge {
+  font-size: 0.75rem;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.05rem 0.5rem;
+}
+
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+}
+.modal { width: min(34rem, 100%); max-height: 90vh; overflow: auto; }
+
+details { margin-bottom: 0.75rem; }
+summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; margin-bottom: 0.5rem; }
+
+.feed { display: flex; align-items: center; gap: 0.4rem; font-size: 0.8rem; color: var(--muted); }
+.feed .dot { background: var(--muted); }
+.feed.live .dot { background: var(--ok); }
+.feed.polling .dot { background: var(--warn); }
+
+fieldset.types {
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0.5rem 0.75rem;
+  margin: 0 0 0.75rem;
+  display: flex;
+  gap: 1.25rem;
+}
+fieldset.types legend { font-size: 0.8rem; color: var(--muted); padding: 0 0.35rem; }
+fieldset.types label { margin: 0; }
+input[type="radio"] { width: auto; display: inline; margin: 0; }
+
+.warn { color: var(--warn); font-size: 0.85rem; }

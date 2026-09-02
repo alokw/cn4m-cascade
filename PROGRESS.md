@@ -2,7 +2,12 @@
 
 Living handoff doc. Update at the end of every session (CLAUDE.md → Workflow).
 
-**Current phase:** Phase 4b — the React SPA (SPEC.md §9). **Start in plan mode.**
+**Current phase:** Phase 4b-2 — dashboard, job editor, run detail, logs. **Start in plan mode.**
+**Phase 4b-1:** ✅ **Complete.** All four exit criteria pass — the two HTTP-layer ones by test, the
+two screen ones by a manual browser pass the user confirmed on 2026-09-02. The fresh-context review
+is done (§5e; eight findings fixed, including a `.gitignore` regression I introduced). Vite/React/TS
+project, embed + serving, the auth-boundary move, API client, WS hook with polling fallback, the
+Targets screen with SMB **and local** targets, and no admin password policy. See §0-4b.
 **Phase 4a:** ✅ **Complete.** All exit criteria pass — now recorded in SPEC.md §11 rather than only
 here — the fresh-context review is done (§5d), and both decisions it escalated are resolved (D-59,
 D-60). Session auth, preview/confirm, the interactive prompt policy, the WebSocket feed,
@@ -13,7 +18,76 @@ fresh-context review is done (it found five more paths to data loss, all filter-
 **Phase 2:** ✅ Complete — all exit criteria met, the fresh-context review is done (it found seven
 data-loss bugs, all fixed with regression tests — §5b), and the bounded-I/O hard rule is satisfied.
 **Phase 1:** ✅ Complete (record retained below).
-**Last updated:** 2026-09-01 (Phase 4a complete: review done, D-59/D-60 resolved)
+**Last updated:** 2026-09-02 (Phase 4b-1 complete: review done, manual pass done)
+
+---
+
+## 0-4b. Phase 4b-1 status — SPA shell, serving and targets
+
+Phase 4b is split: **4b-1** is the shell and the infrastructure that can go quietly wrong; **4b-2**
+is the dashboard, job editor, run detail and logs. §9's screen list spans three phases, so the
+scope was settled first — see D-61.
+
+### Built
+| Area | Contents |
+|---|---|
+| `web/` (new) | Vite + React 19 + TypeScript. Deps: react, react-dom, react-router-dom. No data-fetching or UI library |
+| `web/embed.go` (new) | `//go:embed all:dist` + `Build()`. Sits beside the Vite output because the directive cannot reach outside its own package |
+| `internal/api/spa.go` (new) | `spaHandler`/`spaFrom`: asset serving, deep-link fallback, cache headers, and a legible 503 when no build is embedded |
+| `web/src/components/TargetModal.tsx` | SMB **and local** targets, with a type selector (D-64) |
+| `internal/api/api.go` | **`Handler()` restructured** — the session guard is now mounted on `/api/` instead of wrapping everything |
+| `web/src/api/` | hand-written types mirroring the frozen Go structs, and one `fetch` client with a typed `ApiError` carrying `status`/`code`/`kind` |
+| `web/src/hooks/useEvents.ts` | one WS connection, capped backoff reconnect, `GET /api/runs` polling whenever the socket is down |
+| `web/src/auth.tsx` | session bootstrap, first-run setup vs login, and a global 401 handler |
+| `web/src/screens/Targets.tsx` | list with health dots, add/edit modal, delete, and a test button that renders `kind`-specific mount-error hints |
+| `Dockerfile.dev`, `Makefile` | Node 22 as a build-time dependency; `web-install`/`web-build`/`web-lint`/`web-dev`; `build` and `test-integration` now depend on `web-build` |
+
+### The one change worth reading carefully
+`requireSession` used to wrap the whole mux, with `publicPath` listing the exceptions. That cannot
+work once the server returns HTML: the login screen **is** the SPA, so a browser with no cookie has
+to be served the shell. Rather than adding the static paths to `publicPath` — which makes "is this
+public?" a question about a list someone must remember to update — the guard is now mounted on
+`/api/` and the static handler sits outside it. Public by construction.
+
+`TestStaticShellIsPublicButAPIIsNot` pins both halves: `/` returns the shell anonymously, and
+`/api/targets`, `/api/jobs`, `/api/runs`, `/api/logs`, `/api/browse` and `/api/ws` all still return
+401 `unauthenticated` without a cookie.
+
+### Exit criteria (SPEC.md §11, added with this phase)
+| Criterion | Status |
+|---|---|
+| Shell loads without a session; `/api/*` still refuses one | ✅ `TestStaticShellIsPublicButAPIIsNot` |
+| Deep link returns the shell; a missing asset returns 404 | ✅ `TestSPADeepLinksAndMissingAssets`, `TestSPARouting` |
+| The embedded build is the real SPA, not the placeholder | ✅ `TestEmbeddedBuildIsTheRealSPA` |
+| Setup, login, reload, logout in a browser | ✅ Manual pass, confirmed by the user 2026-09-02: setup → login → targets, reload stays signed in, logout works |
+| Targets: create, edit, delete, health dots, real mount error | ✅ Manual pass, confirmed by the user 2026-09-02: create, edit and delete all work, and a failing "test connection" reports the error |
+
+### Verification (CLAUDE.md → Definition of done)
+| Gate | Result |
+|---|---|
+| `go vet -tags=integration ./...` | ✅ clean |
+| `golangci-lint run` | ✅ `0 issues.` |
+| `npm run lint` (`tsc -b --noEmit`) | ✅ clean |
+| `npm run build` | ✅ 48 modules, 242 kB / 78 kB gzipped |
+| Unit tests under `-race` | ✅ all `ok`, including 4 new `internal/api` SPA cases |
+| Integration under `-race` | ✅ **49 PASS / 0 FAIL, `ok ... 342.655s`** (43 before this phase, 6 new; 1 SKIP is `TestScaleMirror`). Re-run clean through `make` after the §5e fixes, the D-64 local-target work and the D-66 password change |
+| Fresh-context subagent review | ✅ Done — see §5e. Six findings fixed, including one I introduced |
+| Manual browser pass | ✅ Done by the user 2026-09-02 — both screens, all five flows |
+
+### Open items
+1. ~~The manual browser pass has not been done.~~ **Done 2026-09-02.** The user walked setup, login,
+   reload, logout, and target create/edit/delete plus a failing connection test. All four 4b-1 exit
+   criteria now pass. The automated tests cover the HTTP layer; this covered the screens.
+2. **No CSP or security headers anywhere.** Irrelevant while the server only spoke JSON; now that it
+   serves HTML, a `Content-Security-Policy`, `X-Content-Type-Options` and `X-Frame-Options` belong
+   on the shell response. Not done in 4b-1 — flagged rather than skipped silently.
+3. `useEvents` keeps every run it has ever seen in a Map with no eviction. Fine for a session or
+   two; the dashboard in 4b-2 should bound it.
+4. The dev container wedged mid-phase and the work was finished in an ad-hoc replacement — see §7a.
+5. ~~`local` targets cannot be created or edited from the UI.~~ **Done 2026-09-02** at the user's
+   request — see D-64. §9's "test connection" button still sits on the target *list* rather than
+   inside the modal, because the frozen API only tests targets that have already been saved. That
+   one is a deliberate §9 deviation, still open.
 
 ---
 
@@ -434,6 +508,13 @@ D-1…D-13 were approved 2026-08-31 before implementation; D-14…D-17 came out 
 | D-57 | `Run.Terminal()` enumerates terminal statuses instead of `!= running`, and `Active()` was added | `awaiting_confirmation` is neither running nor finished. The old form would have called a parked run done |
 | D-58 | A confirmed preview executes the **held** plan, not a fresh diff | The user agreed to a specific set of changes; re-diffing could execute something they never saw. The cost is that the plan is a snapshot, which the executor already tolerates (a file that vanished is a normal event). **Amended by the §5d review:** that reasoning covers copies but not deletes, which are not undoable — see §6 Phase 4a item 8. The trade-off stands; the exposure is now documented in the README and needs a shorter hold or a re-check on confirm |
 | D-59 | **Preview mode moved from Phase 6 to Phase 4, in SPEC.md §11** | §11 assigned it to Phase 6 by name while §6.1/§8/§9 all specified it as part of the run pipeline and job editor — a contradiction in the spec. Resolved toward Phase 4 because the preview gate's only interface is the run-detail screen; building it apart from that screen means building it twice. Recorded in the spec, not just here, so the contradiction cannot be rediscovered. §11 Phase 4 also gained the exit criteria it never had |
+| D-66 | **The admin password has no policy at all — any length, including empty** | Requested by the user 2026-09-02: the service usually runs on a closed network where a long password is friction rather than protection. The 8-character minimum in `store.SetAdminPassword` is gone. Three things were kept deliberately: a blank password is still a **credential** (the wrong one is still a 401, the rate limiter still applies — it is not an "auth off" switch), first-run setup still closes after first use, and the hashing is unchanged (fresh salt, 600k PBKDF2 iterations) so raising the bar later costs nothing. `TestAdminPasswordHasNoMinimumLength` and `TestBlankAndShortAdminPasswordsWork` cover it, the latter through the real setup → login → authenticated-request flow with a fresh cookie jar, because a blank password that could be set but not used would be worse than refusing it. **`weak_password` is gone from `/api/auth/setup`**: with no policy left, any error there is the database or the hash failing, so it is a 500 `setup_failed` rather than a 400 blaming the caller. The README explains when a blank password is and is not appropriate |
+| D-67 | **An empty `SMBSYNC_ADMIN_PASSWORD` still means "not configured", not "no password"** | The asymmetry with D-66 is intentional. SPEC.md §10's compose file passes `ADMIN_PASSWORD=${ADMIN_PASSWORD}`, which expands to an empty string when the variable is unset on the host; treating that as a deliberate blank would turn a forgotten variable into a server anyone can sign into. Choosing no password has to be an explicit act, so it is only reachable through first-run setup |
+| D-64 | **The target modal gained a type selector, so a local folder can be a source (or destination)** | Requested by the user 2026-09-02. The backend already supported it end to end — `store` validated `TargetLocal`, `storage.Provider.For` returned `LocalStorage`, and `Target.UNCPath`/`Describe` handled it — but **nothing exercised the path**: no integration test, and the UI hardcoded `type: "smb"`, so the combination had never run. Verified manually first (a local source mirrored to an SMB share, `success`, correct bytes on the share), then pinned by `TestLocalSourceMirrorsToSMB` and `TestTargetCanBeSwitchedBetweenSMBAndLocal`. **The modal sends the other type's fields as `""` rather than omitting them**, because the server validates the two as mutually exclusive and an omitted field keeps its stored value — without that, switching an existing SMB target to local is rejected with a validation error that reads as user error |
+| D-65 | **`docker-compose.test.yml` publishes 8384 and 5173** | Neither was published, so the app was unreachable from a host browser and `make web-dev` could not have served anyone even once the container was healthy. The manual pass that 4b-1 depends on was impossible until this |
+| D-61 | **§9's screen list scoped to what the frozen API supports; the deferred items marked in the spec** | §9 describes the finished UI across three phases — schedule picker, bandwidth limit, Webhooks/API tab, "next scheduled run", throughput graph, two-way conflict UI and retention settings all need a Phase 5 or 6 backend. §11's Phase 4 line even named the Webhooks tab, whose endpoints are Phase 5. Same shape as D-59, resolved the same way: each item now carries its owning phase in §9, and §11 moves the Webhooks tab to Phase 5. Building UI against endpoints that do not exist is building ahead |
+| D-62 | **The session guard is mounted on `/api/` rather than wrapping everything** | Serving the SPA means serving HTML to a browser with no cookie — the login screen is part of the SPA. The alternative, adding the static paths to `publicPath`, makes "is this public?" depend on a list someone has to remember to update; a mount point makes it structural. `TestStaticShellIsPublicButAPIIsNot` pins both directions |
+| D-63 | **Node is a build-time-only dependency, copied into `Dockerfile.dev` from `node:22-bookworm`** | The binary embeds compiled assets, so the production image ships no JavaScript toolchain (SPEC.md §10). Copying from the official image rather than apt/nodesource pins the version without adding a repository |
 | D-60 | **A `prompt` parks one destination, never the run — fixed in code rather than documented away** | The 4a plan-all → park → execute-all restructure put the availability gate in the planning pass, so a prompt on a down destination stalled every healthy one for up to `prompt_timeout_sec`. Documenting that was rejected: fan-out exists so one dead server does not stop the others, and D-53, the README and the exit criterion all already promised it. `planDestinations` now executes each destination inline as it is planned; the plan/execute split is kept *only* for preview, which is the one gate that legitimately holds the whole run |
 | D-59 | `PATCH /api/jobs/{id}` replaces destinations and filters wholesale, and is refused while the job runs | §8 lists only `POST /api/jobs` for "create/update"; a REST update of a job with nested children is a different operation, so this is recorded as an extension rather than a silent deviation. Children are positional and job-owned, so replace beats diff. Editing under a live diff is not something the engine is built to survive |
 | D-60 | The WS hub reads the **most recent** runs each tick, not only the live ones | A short run can start and finish inside one tick. A feed watching only live runs would never mention it, so a dashboard would show a job that quietly never reported anything |
@@ -556,6 +637,52 @@ phase placement, fixed in SPEC.md §11) and D-60 (a prompt stalling every destin
 `planDestinations` with a non-vacuous test). See §0-4a.
 
 **Tracked but not fixed** — §6 Phase 4a items 7–14.
+
+## 5e. Phase 4b-1 review — findings and resolution
+
+A fresh-context subagent reviewed the (uncommitted) 4b-1 diff against SPEC.md §3/§8/§9/§10/§11, the
+CLAUDE.md hard rules and the 4b-1 exit criteria.
+
+**The auth boundary — the change this phase existed to get right — was verified clean.** The
+reviewer built a standalone probe replicating the root/inner mux structure and ran 24 adversarial
+paths against it under Go 1.25.14. Every path whose decoded form is under `/api/` reaches
+`requireSession`, including `/api/`, `/api/bogus`, `/api/ws`, the percent-encoded `/%61pi/targets`,
+and `CONNECT /api/targets`. `GET /api` 301s to `/api/` and then 401s rather than falling through to
+the SPA. `//api/targets`, `/api//targets`, `/./api/targets` and `/api/auth/../targets` all redirect
+to canonical and then 401. **No `/api`-prefixed request routes to the SPA handler, and no static
+path hits the guard.** The `publicPath` bypass shape was chased specifically: `/api/auth/%2e%2e/targets`
+does skip the guard because `publicPath` sees a decoded Path, but the inner mux matches per-segment
+literals and no guarded pattern has `auth` as its second segment, so it 404s inside the mux. Not
+exploitable, and unchanged from 4a. Path traversal in `spa.go` and the fresh-clone embed were also
+verified clean, the latter by reproducing a clone with only `dist/.gitkeep` and compiling it.
+
+### Fixed
+
+| # | Finding | Fix |
+|---|---|---|
+| P0-1 | **I destroyed `.gitignore`.** I wrote the frontend rules with `cat >` instead of appending, dropping the whole original file — including `/data/` and `.env`. `DATA_DIR` defaults to `/data`, but a developer running `DATA_DIR=./data` produces `data/smbsync.db`, which holds every target's encrypted password, the PBKDF2 admin hash and live session token hashes; `.env` is where `ENCRYPTION_KEY` lives. `git add -A` would have staged both. **The key and the database together are the entire credential store** | original restored from `HEAD` and the frontend rules appended. Verified `.env` and `data/` are ignored again and `web/dist/.gitkeep` is still committable |
+| P1-2 | **`useEvents` leaked a socket per remount under StrictMode.** `closedRef` was a component-lifetime ref, so the second mount reset it to false; the *first* socket's late `onclose` then saw itself as live, nulled `socketRef` — clobbering the reference to the still-open second socket — and opened a third that nothing could close. The backoff `setTimeout` was also never stored, so unmounting mid-backoff left a timer that would reconnect on any later mount | cancellation flag is now local to the effect run; the retry timer is stored and cleared; handlers are detached before `close()` |
+| P1-3 | **The polling fallback did not advance `progress`.** It polled `GET /api/runs`, which returns bare `store.Run` — `progress` exists only on `GET /api/runs/{id}`. Phase, throughput, ETA, in-flight files and **a prompt's countdown deadline** would all sit frozen at the last WS frame while the socket was down. That is two 4b-2 exit criteria pre-broken | the poll now also fetches each non-terminal run individually |
+| P1-4 | **`omitempty` does nothing for `time.Time`**, so `prompt_deadline`, `confirm_deadline` and `checked_at` are *always* serialised, as `"0001-01-01T00:00:00Z"`. The TS types marked them optional, which invites `if (d.prompt_deadline)` — true for every destination in every frame, giving a countdown from year 1. Verified directly: `{"prompt_deadline":"0001-01-01T00:00:00Z"}` | typed as required `string` with an `isZeroTime()` helper and comments at each site. The Go side is left alone: the API is frozen and `*time.Time` would be a breaking change |
+| P1-5 | **`JobPayload.filters` was optional against a full-replace PATCH.** A 4b-2 editor that never opened the Filters tab, and so omitted `filters`, would silently delete every rule on the job — and a vanished exclude rule is a subtree that gets copied, or in mirror mode **deleted**, on the next run | `filters` is required in `JobPayload`, with the reasoning in the type's doc comment |
+| P1-6 | `in_flight` and `TestResult.entries` are built by `append` from nil with no `omitempty`, so they arrive as `null`, not absent. Typed as optional, `in_flight!.map(...)` or an `in` check would throw | typed `T[] \| null` |
+| P2-7 | **`TestSPARefusesTraversal` was near-vacuous** — it asserted only that the body lacked `root:`, never the status, so it would pass even if every missing asset fell through to the shell, which is the exact bug the asset branch exists to prevent | asserts status per case. Writing it surfaced that `%2f` is decoded into Path *before* cleaning, so that case lands outside the asset directory and correctly takes the shell fallback rather than 404ing — my first expectation was wrong and the test caught it |
+| P2-8 | `make web-dev` had an **unterminated shell quote** and could never have run, while PROGRESS listed it as delivered | quote closed; `make -n` verified |
+
+Also from the review: `make web-build` ran `npm ci` unconditionally on every integration run — now
+conditional on `node_modules` being absent. And `useEvents` was **unreferenced** — 4b-1 scope per the
+approved plan, but entirely unexercised — so the app shell now renders a live/polling feed indicator
+that uses it.
+
+### Tracked, not fixed
+- No CSP / `X-Content-Type-Options` / `X-Frame-Options` on the shell — §0-4b open item 2.
+- `TargetModal` hardcodes `type: 'smb'`, so `local` targets cannot be created from the UI, and the
+  "test connection" button lives on the list rather than in the modal as §9 describes (the frozen
+  API only tests *saved* targets). Recorded here as a deliberate §9 deviation rather than left
+  silent — §0-4b open item 5.
+- `FreeBytes` uses `omitempty` on a `uint64`, so a genuinely full share reports nothing rather than
+  "0 free". Go-side, low stakes, not in a frozen-API-breaking position.
+- `client.ts` does not `encodeURIComponent` ids; they are server-generated UUIDs.
 
 ## 6. Open items for the next session
 
@@ -765,6 +892,45 @@ integration test asserts the guarantee (ends cleanly within 90s) and logs the ti
 asserting it. Only `echo_interval=1` reliably lands under 30s, at the cost of the kernel being
 quickest to declare a merely slow server dead; it stays available as a per-target
 `mount_opts_override` for anyone who wants it.
+
+## 7a. The dev container wedged mid-4b-1 (2026-09-01)
+
+Recorded because it cost hours twice in one day and the recovery in §6 Phase 3 item 7 turned out to
+be incomplete.
+
+**Sequence.** A `TestDestinationDisappearsMidRun` hang left its iptables blackhole installed and CIFS
+threads parked in uninterruptible `D` state. `make harness-clean` cleared the rule and the mounts,
+and a *new* `go test` ran fine — the parked threads belong to the dead process and hold nothing a
+new run needs. **But the container could no longer be replaced.** `docker compose up -d --build`
+failed with *"tried to kill container, but did not receive an exit event"*, and every later `exec`
+died in `setns`. `docker rm -f` could not kill it either. The D-state threads outlive the process
+that made them, and only a Docker daemon restart clears them.
+
+**Diagnosis in one line:** `docker exec <c> echo hi` returns instantly while `docker exec <c> ps`
+hangs — `ps` walks `/proc` and blocks on the D-state entries.
+
+**Recovery used.** A daemon restart was not available (unrelated containers were running), so the
+phase was finished in an ad-hoc container from the same image:
+
+```
+docker run -d --name smbsync-dev-tmp \
+  --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH --cap-add NET_ADMIN \
+  --security-opt apparmor:unconfined \
+  -e SMBSYNC_TEST_SAMBA_A=172.28.0.10 -e SMBSYNC_TEST_SAMBA_B=172.28.0.11 \
+  -e SMBSYNC_TEST_OFFLINE=172.28.0.99 \
+  -e ENCRYPTION_KEY=test-encryption-key-not-for-production \
+  -v "$PWD":/src -v cn4m-cascade_gomodcache:/go/pkg/mod \
+  -v cn4m-cascade_gobuildcache:/root/.cache/go-build \
+  -w /src --network cn4m-cascade_smbnet cn4m-cascade-dev sleep infinity
+```
+
+The dev container holds no state — source is bind-mounted, caches are named volumes, test databases
+are disposable — so a second one costs nothing. `make` still targets `smbsync-dev`, so the ad-hoc
+container needs `docker exec` directly.
+
+**Two corrections to §6 Phase 3 item 7:** clearing the blackhole is enough to unblock *new* work but
+not to unwedge the container, and `docker restart` is not a recovery — the container cannot be
+killed at all. **Restart the Docker daemon, or run a replacement container.**
 
 ## 7. Environment notes
 

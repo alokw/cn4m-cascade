@@ -22,9 +22,6 @@ func TestAdminPassword(t *testing.T) {
 		t.Fatal("verifying against an unset password should report that it is unset")
 	}
 
-	if err := db.SetAdminPassword(ctx, "short"); err == nil {
-		t.Fatal("an 8-character minimum should reject \"short\"")
-	}
 	if err := db.SetAdminPassword(ctx, "correct horse battery"); err != nil {
 		t.Fatalf("SetAdminPassword: %v", err)
 	}
@@ -166,5 +163,59 @@ func TestDeleteAllSessions(t *testing.T) {
 		if ok, _ := db.LookupSession(ctx, token); ok {
 			t.Fatal("a session survived DeleteAllSessions")
 		}
+	}
+}
+
+// There is deliberately no password policy: this service is normally deployed
+// on a closed network where the password is friction rather than protection.
+// A one-character password, and the empty string, both have to work — and the
+// empty one has to be a real credential, not a disabled check.
+func TestAdminPasswordHasNoMinimumLength(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name     string
+		password string
+		wrong    string
+	}{
+		{"single character", "x", "y"},
+		{"two characters", "ab", "ba"},
+		{"empty", "", "x"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := newTestDB(t)
+
+			if err := db.SetAdminPassword(ctx, tc.password); err != nil {
+				t.Fatalf("SetAdminPassword(%q): %v", tc.password, err)
+			}
+
+			// Setup must still close afterwards, or POST /api/auth/setup would
+			// stay open and anyone could claim the instance.
+			set, err := db.AdminPasswordSet(ctx)
+			if err != nil {
+				t.Fatalf("AdminPasswordSet: %v", err)
+			}
+			if !set {
+				t.Fatalf("after setting %q the instance still reports setup_required", tc.password)
+			}
+
+			ok, err := db.VerifyAdminPassword(ctx, tc.password)
+			if err != nil {
+				t.Fatalf("VerifyAdminPassword: %v", err)
+			}
+			if !ok {
+				t.Fatalf("%q does not verify against itself", tc.password)
+			}
+
+			// Still a real check: the wrong password is still refused, and an
+			// empty password is not a wildcard that accepts anything.
+			ok, err = db.VerifyAdminPassword(ctx, tc.wrong)
+			if err != nil {
+				t.Fatalf("VerifyAdminPassword(wrong): %v", err)
+			}
+			if ok {
+				t.Fatalf("%q was accepted against stored password %q", tc.wrong, tc.password)
+			}
+		})
 	}
 }

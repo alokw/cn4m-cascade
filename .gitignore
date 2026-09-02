@@ -26,3 +26,10 @@ go.work.sum
 
 # Project
 /data/
+
+# Frontend. Only web/dist/.gitkeep is tracked: it exists so that web/embed.go's
+# //go:embed directive resolves on a fresh checkout, before anyone has run
+# `make web-build`.
+web/node_modules/
+web/dist/*
+!web/dist/.gitkeep

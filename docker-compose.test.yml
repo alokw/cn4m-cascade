@@ -35,6 +35,12 @@ services:
       - .:/src
       - gomodcache:/go/pkg/mod
       - gobuildcache:/root/.cache/go-build
+    # Reachable from the host browser for the manual pass: 8384 is the Go
+    # server (`make run`), 5173 is the Vite dev server (`make web-dev`), which
+    # proxies /api to 8384 inside the container.
+    ports:
+      - "8384:8384"
+      - "5173:5173"
     working_dir: /src
     networks: [smbnet]
     depends_on: [samba-a, samba-b]

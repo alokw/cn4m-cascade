@@ -271,13 +271,19 @@ Optionally, per job (or globally), the user configures webhook URLs that the bac
 ## 9. Frontend (React SPA)
 
 Pages:
-1. **Dashboard** — job cards with last-run status, next scheduled run, live progress bars for running jobs (via WS) showing per-destination and total progress + ETA, aggregate throughput graph for active runs.
-2. **Targets** — list with health dots; add/edit modal (name, IP, share, subpath, credentials, advanced mount options, "test connection" button that shows real mount errors).
-3. **Job editor** — pick source target + subpath and **one or more destinations** (each with its own subpath), mode, compare method, workers, bandwidth limit, schedule, preview-before-run toggle, unavailable-destination policy, and a **Filters tab**: add/edit filter rules of all three source types (inline patterns, list file, JSON file + key), scoped to the job or to a specific destination, with a "Test filters" button (calls `/api/jobs/{id}/filter-test`) showing a live included/excluded sample. Also a **Webhooks/API tab**: view/regenerate the trigger token (with copy-paste `curl` examples), configure outbound callback URLs and event subscriptions.
-4. **Run detail** — live or historical: per-destination panels (status, progress bar, ETA, throughput), currently-copying files with per-file progress, action plan, paged task log with level/destination filters and an errors-only toggle, conflict resolution UI for two-way jobs. When a `target_unavailable` prompt is active, a blocking modal with Skip / Retry / Abort and a visible countdown to the fallback action.
-5. **Logs** — global view across all runs (`/api/logs`), filter by level/job/date, and a persistent error log view; retention configurable in settings.
+1. **Dashboard** — job cards with last-run status, next scheduled run *(Phase 5)*, live progress bars for running jobs (via WS) showing per-destination and total progress + ETA, aggregate throughput graph for active runs *(Phase 6)*.
+2. **Targets** — list with health dots; add/edit modal with a **type selector**: an *SMB share* (name, IP, share, subpath, credentials, advanced mount options) or a *local folder* (name, absolute path inside the container, subpath — no credentials, no mount). Either type may be a job's source or a destination. A "test connection" button shows real mount errors; it acts on a saved target, so it sits on the target list rather than inside the modal.
+3. **Job editor** — pick source target + subpath and **one or more destinations** (each with its own subpath), mode, compare method, workers, bandwidth limit *(Phase 6)*, schedule *(Phase 5)*, preview-before-run toggle, unavailable-destination policy, and a **Filters tab**: add/edit filter rules of all three source types (inline patterns, list file, JSON file + key), scoped to the job or to a specific destination, with a "Test filters" button (calls `/api/jobs/{id}/filter-test`) showing a live included/excluded sample. Also a **Webhooks/API tab** *(Phase 5)*: view/regenerate the trigger token (with copy-paste `curl` examples), configure outbound callback URLs and event subscriptions.
+4. **Run detail** — live or historical: per-destination panels (status, progress bar, ETA, throughput), currently-copying files with per-file progress, action plan, paged task log with level/destination filters and an errors-only toggle, conflict resolution UI for two-way jobs *(Phase 5)*. When a `target_unavailable` prompt is active, a blocking modal with Skip / Retry / Abort and a visible countdown to the fallback action.
+5. **Logs** — global view across all runs (`/api/logs`), filter by level/job/date, and a persistent error log view; retention configurable in settings *(Phase 6)*.
 
 Keep the UI dependency-light; polling fallback if WS drops.
+
+> **This section describes the finished UI, which spans three phases.** Items marked with a phase in
+> italics need a backend that does not exist in Phase 4 — the scheduler and webhooks arrive in
+> Phase 5, bandwidth limiting and the throughput graph in Phase 6. Phase 4 builds everything else.
+> The parenthetical markers exist so that the difference is visible here rather than rediscovered
+> against §11.
 
 ---
 
@@ -315,13 +321,15 @@ services:
 
 **Phase 3 — Filtering + multi-destination.** Filter chain (§6.5) with all three rule sources and per-target scoping, `filter-test` endpoint, job_destinations fan-out, availability gate with `skip`/`abort` policies (the interactive `prompt` policy lands with the UI in Phase 4), per-destination progress/ETA. *Exit criteria: a job with two destinations where one is offline completes as `partial` under `skip`; a JSON-file exclude rule with a dot-path key demonstrably prunes a subtree, and a malformed key fails the run with a clear error.*
 
-**Phase 4 — API + UI.** Session auth, dashboard, targets page, job editor (incl. Filters and Webhooks/API tabs), run detail with live WS progress/ETA panels, target-unavailable prompt modal (completing the `prompt` policy), **the preview gate (§6.1 step 6) and its confirm endpoint**, logs page.
+**Phase 4 — API + UI.** Session auth, dashboard, targets page, job editor (incl. the Filters tab), run detail with live WS progress/ETA panels, target-unavailable prompt modal (completing the `prompt` policy), **the preview gate (§6.1 step 6) and its confirm endpoint**, logs page. The job editor's **Webhooks/API tab moves to Phase 5** with the trigger-token and callback endpoints it drives: there is nothing for it to talk to before then.
 
 Phase 4 is split in two: **4a is the API**, verifiable in the Samba harness with no UI; **4b is the SPA (§9)**, built against a then-frozen API.
 
 *Exit criteria (4a): `/api/*` is closed to unauthenticated callers, login works, logout invalidates the token server-side and a forged cookie is refused; a preview parks with a visible plan and copies nothing, and confirming executes it; an unconfirmed preview cancels and still copies nothing; a `prompt` on an unavailable destination parks that destination while a healthy one completes, with `skip` → `partial` and `abort` → `failed`; an unanswered prompt falls back and says so in the log; a WS client sees progress and completion, and a stalled client is dropped without delaying the run; `/api/browse` lists a share and refuses path escapes; `/api/logs` reads across runs.*
 
-*Exit criteria (4b): every screen in §9 is reachable and driven only through the documented API.*
+*Exit criteria (4b-1): the SPA shell loads without a session while `/api/*` still refuses one; a deep link returns the shell on a cold load and a missing asset returns 404; first-run setup, login, reload and logout all work in a browser; the targets screen creates, edits, deletes and tests a target, showing a real mount error for a failing one.*
+
+*Exit criteria (4b-2): a job is created, edited and run entirely from the UI and mirrors correctly; a preview parks and its confirm view names the files it will delete before executing; a `prompt` on an unavailable destination shows a counting-down modal while a healthy destination completes; killing the WebSocket mid-run leaves progress advancing via the polling fallback; the logs page filters by level and job across more than one run.*
 
 > **Preview mode was moved here from Phase 6.** §11 originally listed it under Phase 6 while §6.1 step 6, §8 (`POST /api/jobs/{id}/confirm`) and §9 (the "preview-before-run toggle") all specified it as part of the run pipeline and the job editor. That was a contradiction in this document, not a choice available to the implementer. It is resolved in favour of Phase 4: the preview gate is a *run-pipeline* feature whose only interface is the run-detail screen, so building it apart from that screen would mean building it twice. Phase 6 keeps the polish items that genuinely are polish.
 

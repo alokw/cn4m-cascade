@@ -105,6 +105,14 @@ func run(log *slog.Logger) error {
 	// already configured (SPEC.md §8). It never overwrites an existing
 	// password: an env var left in a compose file must not silently reset
 	// the credential every restart.
+	//
+	// An *empty* value means "not configured", not "no password" — even though
+	// a blank password is otherwise a supported choice. SPEC.md §10's compose
+	// file passes `ADMIN_PASSWORD=${ADMIN_PASSWORD}`, which expands to the
+	// empty string when the variable is unset on the host, so treating empty
+	// as a deliberate blank would turn a forgotten variable into a server
+	// anyone can sign into. Choosing no password has to be an explicit act, so
+	// it is only available through the first-run setup form.
 	if pw := os.Getenv("SMBSYNC_ADMIN_PASSWORD"); pw != "" {
 		set, err := db.AdminPasswordSet(ctx)
 		if err != nil {

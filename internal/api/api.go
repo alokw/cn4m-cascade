@@ -76,14 +76,21 @@ func (s *Server) Stop() { s.hub.stop() }
 
 // Handler returns the routed, middleware-wrapped handler.
 //
-// Session authentication (SPEC.md §8) wraps everything here except the auth
-// endpoints and the liveness probe — see requireSession. The webhook
-// endpoints of §8, which use bearer tokens rather than sessions, arrive in
-// Phase 5 and will bypass this middleware rather than extend it.
+// The session guard (SPEC.md §8) covers exactly one thing: `/api/`. It is
+// mounted on that prefix rather than wrapped around everything, because the
+// SPA shell has to be reachable without a session — the login screen *is* the
+// SPA, so a browser with no cookie must still be served index.html and its
+// assets. Scoping the guard by mount point makes the static files public by
+// construction; the alternative, adding them to publicPath, makes "is this
+// public?" a question about a list someone has to remember to update.
+//
+// The data stays behind the guard either way. TestStaticShellIsPublicButAPIIsNot
+// pins both directions.
+//
+// The webhook endpoints of §8, which use bearer tokens rather than sessions,
+// arrive in Phase 5 and will mount alongside rather than extend this.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-
-	mux.HandleFunc("GET /healthz", s.handleLiveness)
 
 	mux.HandleFunc("POST /api/targets", s.handleCreateTarget)
 	mux.HandleFunc("GET /api/targets", s.handleListTargets)
@@ -117,7 +124,12 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/ws", s.handleWS)
 
-	return s.withLogging(s.requireSession(mux))
+	root := http.NewServeMux()
+	root.Handle("/api/", s.requireSession(mux))
+	root.HandleFunc("GET /healthz", s.handleLiveness)
+	root.Handle("/", s.spaHandler())
+
+	return s.withLogging(root)
 }
 
 // withLogging records one line per request. It never logs request bodies,

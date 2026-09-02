@@ -88,6 +88,39 @@ func (s *syncBuffer) String() string {
 func newHarness(t *testing.T, tune func(*mountmgr.Config)) *harness {
 	t.Helper()
 
+	h := buildHarness(t, tune)
+	h.signIn()
+	return h
+}
+
+// newHarnessNoSignIn is newHarness without first-run setup, for the tests that
+// need to drive setup and login themselves.
+func newHarnessNoSignIn(t *testing.T) *harness {
+	t.Helper()
+	return buildHarness(t, nil)
+}
+
+// anonJar returns a second client against the same server with its own empty
+// cookie jar, so a test can prove a login works rather than riding the session
+// an earlier call already established.
+func (h *harness) anonJar(t *testing.T) *harness {
+	t.Helper()
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatalf("building a cookie jar: %v", err)
+	}
+	client := h.server.Client()
+	client.Jar = jar
+
+	fresh := *h
+	fresh.client = client
+	return &fresh
+}
+
+func buildHarness(t *testing.T, tune func(*mountmgr.Config)) *harness {
+	t.Helper()
+
 	dir := t.TempDir()
 	mountRoot := filepath.Join(dir, "mnt")
 	if err := os.MkdirAll(mountRoot, 0o755); err != nil {
@@ -149,7 +182,6 @@ func newHarness(t *testing.T, tune func(*mountmgr.Config)) *harness {
 		db: db, mounts: mounts, runner: runs, api: apiSrv,
 		logs: logs, mountRoot: mountRoot,
 	}
-	h.signIn()
 
 	t.Cleanup(func() {
 		stopAPI()

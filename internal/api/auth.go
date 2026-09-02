@@ -118,11 +118,15 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 	})
 }
 
-// publicPath lists what is reachable without a session: the auth endpoints
-// (you cannot log in through a gate that requires being logged in) and the
-// liveness probe (a container health check has no cookie).
+// publicPath lists what is reachable without a session *within the guarded
+// mount*: the auth endpoints, because you cannot log in through a gate that
+// requires being logged in.
+//
+// The liveness probe and the SPA's static files are not listed here — they are
+// mounted outside the guard entirely (see Handler), so this function only ever
+// sees paths under /api/.
 func (s *Server) publicPath(path string) bool {
-	return path == "/healthz" || strings.HasPrefix(path, "/api/auth/")
+	return strings.HasPrefix(path, "/api/auth/")
 }
 
 // sessionCookie builds the cookie, set or cleared.
@@ -194,8 +198,13 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_json", "The request body is not valid JSON.", err.Error())
 		return
 	}
+	// There is no password policy to fail (see store.SetAdminPassword), so
+	// anything coming back here is the database or the hash failing, not the
+	// user's input — a 400 would blame the wrong party.
 	if err := s.db.SetAdminPassword(r.Context(), req.Password); err != nil {
-		writeError(w, http.StatusBadRequest, "weak_password", err.Error(), "")
+		s.log.Error("could not set the admin password", "error", err)
+		writeError(w, http.StatusInternalServerError, "setup_failed",
+			"Could not store the admin password.", err.Error())
 		return
 	}
 

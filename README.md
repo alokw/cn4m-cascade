@@ -171,7 +171,7 @@ Every `/api/*` route needs a session, except `/api/auth/*` and `/healthz`.
 On a fresh database there is no password yet. Either set one at first run:
 
 ```bash
-curl -sX POST localhost:8080/api/auth/setup \
+curl -sX POST localhost:8384/api/auth/setup \
   -H 'content-type: application/json' \
   -d '{"password":"a good long password"}' -c cookies.txt
 ```
@@ -186,14 +186,42 @@ environment:
 `SMBSYNC_ADMIN_PASSWORD` only ever *sets* an unset password — it never overwrites an existing one,
 so leaving it in a compose file cannot silently reset the credential on every restart.
 
+### There is no password policy
+
+Any password is accepted: one character, two, or **none at all**. This is deliberate. The service
+is designed to run on a closed network alongside the NAS boxes it syncs, where a long password is
+friction on every sign-in and protects against nobody who is not already inside the network.
+
+Understand what a blank password means before choosing it: **anyone who can reach this port can
+sign in.** There is no second factor and no lockout that helps, because there is nothing to guess.
+That is fine on a segregated VLAN or a home LAN behind a router. It is not fine if the machine has
+a public interface, sits on shared office Wi-Fi, or is reachable through a VPN that other people
+also use. **If the network is open, or you are unsure, set a real password** — the storage is the
+same either way (a fresh salt and 600k PBKDF2-HMAC-SHA256 iterations), so a strong password costs
+nothing but typing it.
+
+Two things stay true no matter how short the password is:
+
+- **A blank password is still a credential, not a disabled check.** `POST /api/auth/login` with the
+  wrong password is still a 401, and the rate limiter still applies. It is not an "auth off" switch.
+- **First-run setup still closes after the first use**, so nobody else can claim a configured
+  instance by racing you to `/api/auth/setup`.
+
+One asymmetry worth knowing: an **empty** `SMBSYNC_ADMIN_PASSWORD` means "not configured", not "no
+password". SPEC.md §10's compose file passes `ADMIN_PASSWORD=${ADMIN_PASSWORD}`, which expands to an
+empty string whenever the variable is unset on the host — treating that as a deliberate blank would
+turn a forgotten variable into a server anyone can sign into. Choosing no password has to be an
+explicit act, so it is only available through the first-run setup form (or an empty `password` in
+the `/api/auth/setup` body).
+
 Then sign in and keep the cookie:
 
 ```bash
-curl -sX POST localhost:8080/api/auth/login \
+curl -sX POST localhost:8384/api/auth/login \
   -H 'content-type: application/json' \
   -d '{"password":"a good long password"}' -c cookies.txt
 
-curl -s localhost:8080/api/targets -b cookies.txt
+curl -s localhost:8384/api/targets -b cookies.txt
 ```
 
 `GET /api/auth/session` reports `{"setup_required":true}` before first-run setup, which is how the
@@ -208,14 +236,14 @@ visible to explain it. Put it behind a TLS proxy and the flag turns itself on.
 
 ```bash
 # Plan the work and hold it — nothing is copied or deleted
-curl -sX POST localhost:8080/api/jobs/$JOB/run -b cookies.txt \
+curl -sX POST localhost:8384/api/jobs/$JOB/run -b cookies.txt \
   -H 'content-type: application/json' -d '{"preview":true}'
 
 # Inspect what it intends to do
-curl -s localhost:8080/api/runs/$RUN -b cookies.txt | jq '.progress.plans'
+curl -s localhost:8384/api/runs/$RUN -b cookies.txt | jq '.progress.plans'
 
 # Go ahead
-curl -sX POST localhost:8080/api/jobs/$JOB/confirm -b cookies.txt
+curl -sX POST localhost:8384/api/jobs/$JOB/confirm -b cookies.txt
 ```
 
 A previewed run holds its mounts while it waits. If nobody confirms within the job's
@@ -250,7 +278,7 @@ The preview gate is the one thing that holds an entire run. An unreachable desti
 Answer a prompt with:
 
 ```bash
-curl -sX POST localhost:8080/api/runs/$RUN/prompt -b cookies.txt \
+curl -sX POST localhost:8384/api/runs/$RUN/prompt -b cookies.txt \
   -H 'content-type: application/json' \
   -d '{"dest_target_id":"'$DEST'","action":"skip"}'   # skip | retry | abort
 ```

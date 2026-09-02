@@ -33,6 +33,32 @@ verify-cifs: ## PROGRESS.md B-4: prove the host kernel can do CIFS mounts
 tidy: ## Resolve dependencies (writes go.sum)
 	$(DEV) go mod tidy
 
+# The SPA (SPEC.md §9). Node lives in the dev image as a build-time dependency
+# only: the binary embeds the compiled assets and the production image ships no
+# JavaScript toolchain.
+.PHONY: web-install
+web-install: ## Install frontend dependencies (npm ci)
+	$(DEV) sh -c 'cd /src/web && npm ci --no-audit --no-fund'
+
+.PHONY: web-build
+web-build: ## Build the SPA into web/dist, which web/embed.go embeds
+	$(DEV) sh -c 'cd /src/web && { [ -d node_modules ] || npm ci --no-audit --no-fund; } && npm run build'
+
+.PHONY: web-lint
+web-lint: ## Type-check the SPA
+	$(DEV) sh -c 'cd /src/web && npm run lint'
+
+# Unlike every other target these run in the foreground and want a terminal,
+# so they use `exec` rather than `exec -T`: without a TTY, ^C never reaches the
+# process and the only way to stop it is to kill the container.
+.PHONY: web-dev
+web-dev: ## Vite dev server on http://localhost:5173 (proxies /api to the Go server)
+	$(COMPOSE) exec dev sh -c 'cd /src/web && { [ -d node_modules ] || npm ci --no-audit --no-fund; } && npm run dev -- --host 0.0.0.0'
+
+.PHONY: run
+run: ## Run the server on http://localhost:8384 with the SPA embedded
+	$(COMPOSE) exec dev sh -c 'cd /src && go run ./cmd/smbsync'
+
 .PHONY: lint
 lint: ## golangci-lint
 	$(DEV) golangci-lint run
@@ -61,7 +87,7 @@ harness-clean: ## Clear leftover mounts and blackholes from a killed test run
 # rather than dumping stacks. 15m is comfortably above the ~5.5m the suite
 # takes; the point is a stack dump instead of an indefinite park.
 .PHONY: test-integration
-test-integration: harness-clean ## Integration tests against the Samba harness
+test-integration: harness-clean web-build ## Integration tests against the Samba harness
 	$(DEV) env CGO_ENABLED=1 go test -race -tags=integration -count=1 -timeout 15m -v ./test/...
 
 .PHONY: test-scale
@@ -73,7 +99,7 @@ test-scale: ## The 100k-file mirror exit criterion (slow: several minutes)
 test: test-unit test-integration ## All tests (excludes test-scale)
 
 .PHONY: build
-build: ## Compile the server binary
+build: web-build ## Compile the server binary with the SPA embedded
 	$(DEV) go build -o /tmp/smbsync ./cmd/smbsync
 
 .PHONY: demo

@@ -12,6 +12,15 @@ RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/ins
       | sh -s -- -b /usr/local/bin latest \
  && golangci-lint --version
 
+# Node builds the SPA (SPEC.md §9, §10). It is a build-time dependency only:
+# the production image embeds the compiled assets in the Go binary and ships no
+# JavaScript toolchain. Pinned to a major version rather than "latest" so a
+# frontend build is reproducible.
+COPY --from=node:22-bookworm /usr/local/bin/node /usr/local/bin/node
+COPY --from=node:22-bookworm /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+ && node --version && npm --version
+
 ENV CGO_ENABLED=0
 WORKDIR /src
 CMD ["bash"]

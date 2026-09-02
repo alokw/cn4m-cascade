@@ -70,11 +70,16 @@ func (d *DB) AdminPasswordSet(ctx context.Context) (bool, error) {
 //
 // It does not invalidate existing sessions — see DeleteAllSessions, which the
 // password-change path calls so a changed password logs everyone out.
+// There is deliberately no minimum length, and the empty string is accepted.
+// This service is normally deployed on a closed network where the password is
+// friction rather than protection, and the operator is trusted to judge that.
+// An empty password means anyone who can reach the port can sign in by
+// submitting the form — the README says so in as many words.
+//
+// The hashing is unchanged either way: a one-character password still gets a
+// fresh salt and 600k PBKDF2 iterations, so the stored form gives away nothing
+// about the length, and raising the requirement later costs nothing.
 func (d *DB) SetAdminPassword(ctx context.Context, password string) error {
-	if len(password) < 8 {
-		return errors.New("the admin password must be at least 8 characters")
-	}
-
 	salt := make([]byte, saltLen)
 	if _, err := rand.Read(salt); err != nil {
 		return fmt.Errorf("generating a password salt: %w", err)
