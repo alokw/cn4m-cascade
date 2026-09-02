@@ -114,18 +114,20 @@ Edge cases the implementation MUST handle:
 
 ### 6.1 Pipeline
 
-A job has **one source and one or more destinations**. A run proceeds in stages, all cancellable via context:
+A job has **one source and one or more destinations**. A run proceeds in stages, all cancellable via context.
+
+**Stages 1 and 3–4 are per *run*; stages 2 and 5–7 are per *destination*, and one destination never waits on another.** The source is resolved and scanned once and the listing is shared. Everything after that — availability gate, diff, preview hold, execute — belongs to a single destination, and a destination that is blocked (unreachable, or parked on a `prompt`) blocks only itself: the others plan and execute past it. The numbered order below describes the stages one destination passes through, not a set of barriers the whole run crosses together. The one exception is the preview gate (stage 6), which by its nature holds every destination, because a human is being asked to approve the whole run before any of it happens.
 
 1. **Resolve** the source and every destination target (mount if needed).
 2. **Availability gate:** if any destination fails to resolve, emit a `target_unavailable` event and behave per the job's `unavailable_policy`:
-   - `prompt` (default for manual runs): pause, push a prompt over WS/UI ("Destination 'NAS-B (192.168.1.51)' is unreachable — Skip and continue / Retry / Abort run"), wait up to `prompt_timeout_sec` (default 300), then fall back to `prompt_fallback` (`skip` or `abort`).
+   - `prompt` (default for manual runs): pause **that destination**, push a prompt over WS/UI ("Destination 'NAS-B (192.168.1.51)' is unreachable — Skip and continue / Retry / Abort run"), wait up to `prompt_timeout_sec` (default 600, floor 5, ceiling 86400), then fall back to `prompt_fallback` (`skip` or `abort`). The run itself stays `running` and its other destinations carry on to completion — which is the point of fan-out when one server is down. A prompt must never stall a healthy destination.
    - `skip` (sensible default for scheduled/webhook runs): log it, mark that destination's result as `skipped_unavailable`, continue with the rest.
    - `abort`: fail the whole run immediately.
    A run that completes with ≥1 skipped/failed destination finishes with status `partial`.
 3. **Scan** the source tree once and each available destination tree **concurrently** (bounded parallel directory walkers — e.g., 8–16 workers per tree, since SMB metadata ops are latency-bound, not bandwidth-bound). Produce trees (or sorted flat lists) of `{relpath, size, mtime, isDir, symlink info}`.
 4. **Filter** the source listing through the resolved filter chain (see §6.5). Filtering happens after scan but before diff so the plan and byte totals reflect only in-scope files. Directory exclusions prune the walk itself where possible (skip descending) for speed.
 5. **Diff** source vs each destination according to sync mode → one ordered action plan per destination: `[]Action{Copy, Delete, MkDir, RmDir, ConflictSkip...}` with byte totals for progress/ETA reporting.
-6. **(Optional) Preview gate:** if the job is run manually with "preview" enabled, send the plans to the UI and wait for confirmation.
+6. **(Optional) Preview gate:** if the job is run manually with "preview" enabled, plan every destination, then send the plans to the UI and wait for confirmation before executing any of them. This is the one stage that holds the whole run. The run's status is `awaiting_confirmation` while it waits; it holds its mounts so that what is confirmed executes against what was planned, and an unconfirmed plan expires after `prompt_timeout_sec` and changes nothing.
 7. **Execute** per destination with a worker pool (default 4 concurrent copy workers per destination, configurable 1–16; destinations run sequentially by default with a per-job `parallel_destinations` toggle — parallel fan-out multiplies read load on the source share). Directories created first (top-down, sequential-ish), file copies in parallel, deletions last (bottom-up).
 8. **Finalize:** write per-destination and overall run summaries to DB, update two-way state DB if applicable, fire outbound status callbacks (§8.2), emit completion event.
 
@@ -313,11 +315,19 @@ services:
 
 **Phase 3 — Filtering + multi-destination.** Filter chain (§6.5) with all three rule sources and per-target scoping, `filter-test` endpoint, job_destinations fan-out, availability gate with `skip`/`abort` policies (the interactive `prompt` policy lands with the UI in Phase 4), per-destination progress/ETA. *Exit criteria: a job with two destinations where one is offline completes as `partial` under `skip`; a JSON-file exclude rule with a dot-path key demonstrably prunes a subtree, and a malformed key fails the run with a clear error.*
 
-**Phase 4 — API + UI.** Dashboard, targets page, job editor (incl. Filters and Webhooks/API tabs), run detail with live WS progress/ETA panels, target-unavailable prompt modal (completing the `prompt` policy), logs page.
+**Phase 4 — API + UI.** Session auth, dashboard, targets page, job editor (incl. Filters and Webhooks/API tabs), run detail with live WS progress/ETA panels, target-unavailable prompt modal (completing the `prompt` policy), **the preview gate (§6.1 step 6) and its confirm endpoint**, logs page.
+
+Phase 4 is split in two: **4a is the API**, verifiable in the Samba harness with no UI; **4b is the SPA (§9)**, built against a then-frozen API.
+
+*Exit criteria (4a): `/api/*` is closed to unauthenticated callers, login works, logout invalidates the token server-side and a forged cookie is refused; a preview parks with a visible plan and copies nothing, and confirming executes it; an unconfirmed preview cancels and still copies nothing; a `prompt` on an unavailable destination parks that destination while a healthy one completes, with `skip` → `partial` and `abort` → `failed`; an unanswered prompt falls back and says so in the log; a WS client sees progress and completion, and a stalled client is dropped without delaying the run; `/api/browse` lists a share and refuses path escapes; `/api/logs` reads across runs.*
+
+*Exit criteria (4b): every screen in §9 is reachable and driven only through the documented API.*
+
+> **Preview mode was moved here from Phase 6.** §11 originally listed it under Phase 6 while §6.1 step 6, §8 (`POST /api/jobs/{id}/confirm`) and §9 (the "preview-before-run toggle") all specified it as part of the run pipeline and the job editor. That was a contradiction in this document, not a choice available to the implementer. It is resolved in favour of Phase 4: the preview gate is a *run-pipeline* feature whose only interface is the run-detail screen, so building it apart from that screen would mean building it twice. Phase 6 keeps the polish items that genuinely are polish.
 
 **Phase 5 — Scheduler, webhooks, two-way sync.** Cron scheduling (robfig/cron), inbound trigger tokens + status endpoints, outbound signed callbacks, sync_state DB, deletion propagation, conflict surfacing/resolution UI.
 
-**Phase 6 — Polish.** Preview mode, bandwidth limiting, throughput graph, multichannel toggle, log retention/pruning, docs.
+**Phase 6 — Polish.** Bandwidth limiting, throughput graph, multichannel toggle, log retention/pruning, docs. (Preview mode moved to Phase 4 — see the note there.)
 
 ---
 

@@ -222,6 +222,21 @@ A previewed run holds its mounts while it waits. If nobody confirms within the j
 `prompt_timeout_sec` (default 600), it **cancels itself and changes nothing** — an unconfirmed plan
 must never execute.
 
+Two things to know about the hold:
+
+- **A confirmed preview executes the plan it showed you, not a freshly computed one.** That is
+  deliberate: confirming a plan should carry out the plan you approved. But it means the plan can be
+  stale by however long you took to confirm. If something else writes to the destination in that
+  window, a `delete` in the plan still applies to that path. Keep `prompt_timeout_sec` short on
+  mirror jobs, where the plan can contain deletions.
+- **The job cannot be edited while one of its runs is parked.** A `PATCH /api/jobs/{id}` returns
+  `409 job_running`. Editing the job would not change the plan already being held, so an edit that
+  looked like it had taken effect would not have — adding an exclude rule and then confirming would
+  still run the old plan.
+
+The preview gate is the one thing that holds an entire run. An unreachable destination under
+`prompt` does not — see below.
+
 ## When a destination is unreachable
 
 `unavailable_policy` decides what happens when a destination cannot be reached:

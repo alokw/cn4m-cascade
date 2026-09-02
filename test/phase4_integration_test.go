@@ -65,6 +65,21 @@ func (h *harness) awaitDestStatus(t *testing.T, runID, destTargetID string, time
 	t.Fatalf("destination %s of run %s never reached %q within %v", destTargetID, runID, want, timeout)
 }
 
+// destStatus reads one destination's current status without waiting for it.
+func (h *harness) destStatus(t *testing.T, runID, destTargetID string) string {
+	t.Helper()
+
+	_, body := h.do(http.MethodGet, "/api/runs/"+runID, nil)
+	for _, d := range decodeDestinations(body) {
+		if d["dest_target_id"] == destTargetID {
+			s, _ := d["status"].(string)
+			return s
+		}
+	}
+	t.Fatalf("run %s has no destination %s", runID, destTargetID)
+	return ""
+}
+
 func decodeDestinations(body map[string]any) []map[string]any {
 	raw, _ := body["destinations"].([]any)
 	out := make([]map[string]any, 0, len(raw))
@@ -262,6 +277,54 @@ func TestUnconfirmedPreviewCancelsAndChangesNothing(t *testing.T) {
 	}
 }
 
+// A job holding a parked preview cannot be edited. The plan is already made:
+// editing the job does not change what a later confirm executes, so an admin
+// who adds an exclude rule and then confirms would watch the *old* plan delete
+// the files the new rule existed to protect. The guard has to be keyed by job
+// — Progress is keyed by run ID and never matches a job ID, which is how this
+// went unnoticed — and it has to cover awaiting_confirmation, not just running.
+func TestJobCannotBeEditedWhileAPreviewIsParked(t *testing.T) {
+	h := newHarness(t, nil)
+	srcID, dstID, scope, srcRoot := previewFixture(t, h)
+	seedTree(t, srcRoot, map[string]int{"keep.txt": 10})
+
+	body := map[string]any{
+		"name":               uniqueName("parked-edit"),
+		"source_target_id":   srcID,
+		"source_subpath":     scope,
+		"mode":               string(store.ModeMirror),
+		"prompt_timeout_sec": 5, // the floor, so the parked run cleans itself up
+		"destinations":       []map[string]any{{"dest_target_id": dstID, "dest_subpath": scope}},
+	}
+	jobID := h.createJob(t, body)
+
+	_, run := h.do(http.MethodPost, "/api/jobs/"+jobID+"/run", map[string]any{"preview": true})
+	runID, _ := run["id"].(string)
+	h.awaitRunStatus(t, runID, 30*time.Second, string(store.RunAwaitingConfirmation))
+
+	edit := map[string]any{}
+	for k, v := range body {
+		edit[k] = v
+	}
+	edit["filters"] = []map[string]any{{
+		"direction": "exclude", "source": "inline", "patterns": []string{"*.tmp"},
+	}}
+	status, resp := h.do(http.MethodPatch, "/api/jobs/"+jobID, edit)
+	if status != http.StatusConflict {
+		t.Fatalf("PATCH while a preview is parked = %d, want 409: %v", status, resp)
+	}
+	errObj, _ := resp["error"].(map[string]any)
+	if code, _ := errObj["code"].(string); code != "job_running" {
+		t.Fatalf("error code = %v, want job_running: %v", errObj["code"], resp)
+	}
+
+	// Once the park lapses the job is editable again, so the guard releases.
+	h.awaitRun(t, runID, 30*time.Second)
+	if status, resp := h.do(http.MethodPatch, "/api/jobs/"+jobID, edit); status != http.StatusOK {
+		t.Fatalf("PATCH after the park ended = %d, want 200: %v", status, resp)
+	}
+}
+
 // Confirming a job with no parked run is a clear 409 rather than a silent
 // no-op, so a stale browser tab cannot look like it worked.
 func TestConfirmWithoutAPreviewIsRejected(t *testing.T) {
@@ -321,6 +384,32 @@ func TestPromptPolicyParksAndAnswersSkip(t *testing.T) {
 	}
 	if !sawDeadline {
 		t.Fatalf("a waiting destination reports no prompt deadline: %v", progress["destinations"])
+	}
+
+	// The exit criterion is that B parks *while A completes*, and this is the
+	// assertion that makes it non-vacuous: A's files must already be at the
+	// destination while B is still waiting for an answer. Checking A only
+	// after the run ends passes whether A copied concurrently or ten minutes
+	// later, which is exactly how a regression that stalled every destination
+	// behind one prompt went unnoticed.
+	dstARoot := filepath.Join(h.mountFor(t, dstAID), scope)
+	deadline := time.Now().Add(60 * time.Second)
+	var aDone bool
+	for time.Now().Before(deadline) {
+		if countFiles(t, dstARoot) > 0 {
+			aDone = true
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if !aDone {
+		t.Fatal("the healthy destination copied nothing while the unavailable one was parked: " +
+			"a prompt on one destination is stalling the others")
+	}
+	// And B really is still parked — otherwise the check above proves nothing.
+	if st := h.destStatus(t, runID, dstBID); st != string(store.DestAwaitingPrompt) {
+		t.Fatalf("the unavailable destination is %q, want still awaiting_prompt; "+
+			"the concurrency assertion above is only meaningful while it waits", st)
 	}
 
 	status, resp := h.do(http.MethodPost, "/api/runs/"+runID+"/prompt",

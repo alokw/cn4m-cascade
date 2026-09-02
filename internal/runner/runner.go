@@ -181,6 +181,17 @@ func (r *Runner) Progress(runID string) (RunSnapshot, bool) {
 	return h.progress.snapshot(time.Now()), true
 }
 
+// ActiveForJob reports whether a job currently holds a run in this process,
+// whether that run is working or parked awaiting confirmation. It is keyed by
+// job ID: Progress is keyed by run ID and silently never matches a job ID,
+// which is what let an edit race a live run.
+func (r *Runner) ActiveForJob(jobID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.byJob[jobID]
+	return ok
+}
+
 // destTargetIDs lists a job's destinations in order.
 func destTargetIDs(job *store.Job) []string {
 	out := make([]string, 0, len(job.Destinations))
@@ -282,10 +293,25 @@ func (r *Runner) execute(ctx context.Context, h *handle, job *store.Job, run *st
 		log.Error("could not record scan totals", "error", err)
 	}
 
-	// 4. Plan every destination. Nothing is written yet: planning holds the
-	//    mounts so a confirmed preview executes against what it planned.
+	// 4. Plan the destinations — and, unless this is a preview, execute each
+	//    one as soon as it is planned.
+	//
+	//    The plan→park→execute split exists *for preview*: a preview has to
+	//    plan everything before it can show a human what it intends to do. A
+	//    normal run has no such need, and deferring execution until every
+	//    destination is planned is actively harmful, because the availability
+	//    gate lives in the planning pass. Planning all destinations first
+	//    means a `prompt` on one unavailable destination parks *every* other
+	//    destination behind it for up to prompt_timeout_sec — a healthy
+	//    destination copying nothing for ten minutes because an unrelated
+	//    server is down. Executing inline restores what Phase 3 did and what
+	//    D-53 and §6.1 describe: the destination parks, not the run.
 	stopFlusher := r.startFlusher(finalCtx, h, run.ID)
-	planned := r.planDestinations(ctx, h, job, run, srcRoot, srcScan, chains, events, log)
+	var execInline func(*plannedDest)
+	if !h.preview {
+		execInline = func(p *plannedDest) { r.executeInto(ctx, h, job, run, srcRoot, p, log) }
+	}
+	planned := r.planDestinations(ctx, h, job, run, srcRoot, srcScan, chains, events, log, execInline)
 	defer releaseAll(planned)
 
 	// 5. If this is a preview, hold the plan until a human confirms it.
@@ -307,8 +333,12 @@ func (r *Runner) execute(ctx context.Context, h *handle, job *store.Job, run *st
 		}
 	}
 
-	// 6. Execute.
-	outcomes := r.executePlanned(ctx, h, job, run, srcRoot, planned, log)
+	// 6. Execute. A non-preview run already executed inline in step 4; only a
+	//    confirmed preview still has work held here.
+	if h.preview {
+		r.executePlanned(ctx, h, job, run, srcRoot, planned, log)
+	}
+	outcomes := outcomesOf(planned)
 	stopFlusher()
 
 	h.progress.setPhase(engine.PhaseDone)
@@ -386,13 +416,23 @@ func outcomesOf(planned []*plannedDest) []destOutcome {
 	return out
 }
 
-// planDestinations resolves, scans and diffs every destination without writing
-// anything. Sequential by default, matching execution.
-func (r *Runner) planDestinations(ctx context.Context, h *handle, job *store.Job, run *store.Run, srcRoot string, srcScan *engine.ScanResult, chains map[string]*filter.Chain, events *eventBuffer, log *slog.Logger) []*plannedDest {
+// planDestinations plans every destination — resolve, availability gate, scan,
+// diff. Sequential by default; parallel fan-out is opt-in.
+//
+// When execInline is non-nil each destination is also executed as soon as it is
+// planned — sequentially, before the next destination is planned; in parallel,
+// within that destination's own goroutine. Either way no destination waits on
+// another destination's availability gate. execInline is nil only for a
+// preview, which must plan everything before a human can confirm any of it.
+func (r *Runner) planDestinations(ctx context.Context, h *handle, job *store.Job, run *store.Run, srcRoot string, srcScan *engine.ScanResult, chains map[string]*filter.Chain, events *eventBuffer, log *slog.Logger, execInline func(*plannedDest)) []*plannedDest {
 	planned := make([]*plannedDest, len(job.Destinations))
 
 	work := func(i int, dest store.JobDestination) {
-		planned[i] = r.planOneDestination(ctx, h, job, run, srcRoot, srcScan, chains[dest.DestTargetID], dest, events, log)
+		p := r.planOneDestination(ctx, h, job, run, srcRoot, srcScan, chains[dest.DestTargetID], dest, events, log)
+		planned[i] = p
+		if execInline != nil {
+			execInline(p)
+		}
 	}
 
 	if !job.ParallelDestinations {
@@ -618,14 +658,22 @@ func (r *Runner) askAboutDestination(ctx context.Context, h *handle, job *store.
 	return action, answered
 }
 
-// executePlanned carries out the plans that planning produced.
+// executeInto runs one planned destination and records its outcome on it.
+// Planning may already have short-circuited the destination (unavailable,
+// failed, cancelled), in which case there is nothing left to execute.
+func (r *Runner) executeInto(ctx context.Context, h *handle, job *store.Job, run *store.Run, srcRoot string, p *plannedDest, log *slog.Logger) {
+	if p.outcome != nil {
+		return
+	}
+	outcome := r.executeOneDestination(ctx, h, job, run, srcRoot, p, log)
+	p.outcome = &outcome
+}
+
+// executePlanned carries out plans that were held rather than executed inline,
+// which today means a confirmed preview.
 func (r *Runner) executePlanned(ctx context.Context, h *handle, job *store.Job, run *store.Run, srcRoot string, planned []*plannedDest, log *slog.Logger) []destOutcome {
 	work := func(p *plannedDest) {
-		if p.outcome != nil {
-			return
-		}
-		outcome := r.executeOneDestination(ctx, h, job, run, srcRoot, p, log)
-		p.outcome = &outcome
+		r.executeInto(ctx, h, job, run, srcRoot, p, log)
 	}
 
 	if !job.ParallelDestinations {

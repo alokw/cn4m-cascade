@@ -241,8 +241,10 @@ func (s *Server) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 
 	// A job whose destinations or filters change under a live diff is not
 	// something the engine is built to survive, so editing is refused while
-	// it runs rather than raced.
-	if _, running := s.runner.Progress(id); running {
+	// it runs rather than raced. This must be keyed by job, not run: a
+	// previewed run parked at awaiting_confirmation still holds a plan that
+	// will execute, and editing the job does not change that held plan.
+	if s.runner.ActiveForJob(id) {
 		writeError(w, http.StatusConflict, "job_running",
 			"This job is running. Wait for it to finish, or cancel it, before editing.", "")
 		return

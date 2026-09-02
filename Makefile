@@ -55,9 +55,14 @@ harness-clean: ## Clear leftover mounts and blackholes from a killed test run
 	    while iptables -D OUTPUT -d $$ip -j DROP 2>/dev/null; do echo "removed blackhole on $$ip"; done; \
 	  done; true'
 
+# -timeout is explicit because the default one has been observed not to fire:
+# a run wedged in TestDestinationDisappearsMidRun with a leftover blackhole
+# parked below the point where Go's watchdog can act, and simply sat there
+# rather than dumping stacks. 15m is comfortably above the ~5.5m the suite
+# takes; the point is a stack dump instead of an indefinite park.
 .PHONY: test-integration
 test-integration: harness-clean ## Integration tests against the Samba harness
-	$(DEV) env CGO_ENABLED=1 go test -race -tags=integration -count=1 -v ./test/...
+	$(DEV) env CGO_ENABLED=1 go test -race -tags=integration -count=1 -timeout 15m -v ./test/...
 
 .PHONY: test-scale
 test-scale: ## The 100k-file mirror exit criterion (slow: several minutes)

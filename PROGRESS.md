@@ -3,15 +3,17 @@
 Living handoff doc. Update at the end of every session (CLAUDE.md → Workflow).
 
 **Current phase:** Phase 4b — the React SPA (SPEC.md §9). **Start in plan mode.**
-**Phase 4a:** ✅ Code complete, all exit criteria pass — **pending the fresh-context review** (§6 Phase 4a item 0). Session auth, preview/confirm, the interactive prompt policy, the
-WebSocket feed, `/api/logs`, `/api/browse` and job update. See §0-4a.
+**Phase 4a:** ✅ **Complete.** All exit criteria pass — now recorded in SPEC.md §11 rather than only
+here — the fresh-context review is done (§5d), and both decisions it escalated are resolved (D-59,
+D-60). Session auth, preview/confirm, the interactive prompt policy, the WebSocket feed,
+`/api/logs`, `/api/browse` and job update. See §0-4a.
 **Phase 3:** ✅ Complete — Filtering + multi-destination. All three exit criteria pass, the
 fresh-context review is done (it found five more paths to data loss, all filter-related, all fixed
 — §5c), and vet, lint, unit and integration are all green under `-race` in a single clean run.
 **Phase 2:** ✅ Complete — all exit criteria met, the fresh-context review is done (it found seven
 data-loss bugs, all fixed with regression tests — §5b), and the bounded-I/O hard rule is satisfied.
 **Phase 1:** ✅ Complete (record retained below).
-**Last updated:** 2026-09-01 (Phase 3 complete)
+**Last updated:** 2026-09-01 (Phase 4a complete: review done, D-59/D-60 resolved)
 
 ---
 
@@ -30,7 +32,7 @@ phase that does not — so a set was proposed and agreed before implementation.
 | `internal/api/browse.go` (new) | `GET /api/browse` path picker, bounded I/O, `..` rejected |
 | `internal/api/logs.go` (new) | `GET /api/logs` across every run, filtered by level/job/run/time, newest first |
 | `internal/runner/gate.go` (new) | the availability prompt and the preview park, both bounded |
-| `internal/runner` | destination pipeline split into plan → (park) → execute, so a preview can hold between them |
+| `internal/runner` | destination pipeline split into plan → (park) → execute **for previews only**; a normal run executes each destination inline as it is planned, so one destination's availability prompt never stalls another (D-60) |
 | `internal/store` (migration `0004`) | `sessions`, `prompt_timeout_sec`, `prompt_fallback`, `(level, ts)` event index |
 | `internal/api/jobs.go` | `PATCH /api/jobs/{id}`, `POST /api/jobs/{id}/confirm`, `preview` on run |
 | `internal/api/runs.go` | `POST /api/runs/{id}/prompt` |
@@ -38,10 +40,10 @@ phase that does not — so a set was proposed and agreed before implementation.
 ### Exit criteria (proposed and agreed — §11 states none)
 | Criterion | Status |
 |---|---|
-| `/api/*` closed to strangers; login works; logout invalidates; forged cookies rejected | ✅ `TestSessionAuthGuardsTheAPI`, `TestForgedSessionCookieIsRejected` |
+| `/api/*` closed to strangers; login works; logout invalidates; forged cookies rejected | ⚠️ `TestSessionAuthGuardsTheAPI`, `TestForgedSessionCookieIsRejected` — closure, login and forgery are genuine; **logout is only proven at the store layer** (`store.TestSessions`). The API test's follow-up 401 is explained by the cookie jar dropping the cookie; it never replays the logged-out *token*. §6 Phase 4a item 7 |
 | A preview parks with a plan and copies nothing; confirming executes it | ✅ `TestPreviewHoldsUntilConfirmed` |
 | An unconfirmed preview cancels and still copies nothing | ✅ `TestUnconfirmedPreviewCancelsAndChangesNothing` |
-| `prompt` parks the destination while the healthy one completes; skip → partial, abort → failed | ✅ `TestPromptPolicyParksAndAnswersSkip`, `TestPromptPolicyAnswersAbort` |
+| `prompt` parks the destination while the healthy one completes; skip → partial, abort → failed | ✅ `TestPromptPolicyParksAndAnswersSkip`, `TestPromptPolicyAnswersAbort`. The review found the "while the healthy one completes" clause neither asserted nor true; **both are now fixed** (D-60). The test asserts the healthy destination's files exist *while the other is still parked*, and was verified to fail against the old pipeline |
 | No answer falls back and **says so** in the log | ✅ `TestUnansweredPromptFallsBackToSkip` |
 | A WS client sees progress and completion; a stalled client is dropped without delaying the run | ✅ `TestWebSocketStreamsRunProgress`, `TestStalledWebSocketClientDoesNotDelayARun` |
 | `/api/browse` lists a share and refuses escapes; `/api/logs` reads across runs | ✅ `TestBrowseListsAShareAndRefusesEscapes`, `TestLogsReadAcrossRuns` |
@@ -52,8 +54,30 @@ phase that does not — so a set was proposed and agreed before implementation.
 | `go vet -tags=integration ./...` | ✅ clean |
 | `golangci-lint run` | ✅ `0 issues.` |
 | Unit tests under `-race` | ✅ config, engine, filter, mountmgr, secrets, store all `ok` |
-| Integration under `-race` | ✅ **43/43, `ok ... 320.890s`** (29 before this phase, 14 new) |
-| Fresh-context subagent review | ⛔ **not yet run** — see §6 Phase 4a |
+| Integration under `-race` | ✅ **43 PASS / 0 FAIL, `ok ... 326.789s`** (1 SKIP: `TestScaleMirror`, which only runs under `make test-scale`) |
+| Fresh-context subagent review | ✅ Done — see §5d. Three findings fixed with regression tests; the rest tracked in §6 |
+
+Re-verified after the §5d fixes **and** the D-59/D-60 changes: vet clean, lint `0 issues.`, unit
+green under `-race` (now including `internal/api`, which had no test files before), integration
+**43 PASS / 0 FAIL / 1 SKIP** in a single clean run, `ok ... 326.789s`.
+
+One caveat on how that run was reached, because it cost four hours of wall time and will happen
+again. **The preceding run wedged**, and it is the §6 Phase 3 item 7 failure mode exactly:
+`TestDestinationDisappearsMidRun` hung with its iptables blackhole on 172.28.0.11 still installed,
+so the CIFS mounts retried forever and threads parked in uninterruptible `D` state. Diagnosis:
+`docker exec … echo` returns instantly while `ps` hangs, because `ps` walks `/proc` and blocks on
+the D-state threads. `make harness-clean` cleared it (dropped the blackhole, lazily unmounted two
+leftover mounts); `ps` still hangs afterwards because a lazy unmount cannot recall a thread already
+in a syscall, but that is inert — those threads belong to the dead process, and the harness accepts
+new work immediately (verified with a single-test probe before re-running). **No container rebuild
+was needed**, contrary to the recovery recorded in §6 Phase 3 item 7 — clearing the rule was enough
+this time. On the re-run `TestDestinationDisappearsMidRun` passed in 44.1s, so this is a flake in
+that test, not a regression.
+
+**`make test-integration` now passes `-timeout 15m`.** Go's default 10m timeout should have fired
+on the hang and did not — the process was wedged below the point where its watchdog can act — so
+the run parked indefinitely and produced no diagnostics at all. An explicit timeout at least yields
+a goroutine dump next time. The flake itself is unfixed: §6 Phase 4a item 15.
 
 ```
 --- PASS: TestSessionAuthGuardsTheAPI (3.83s)
@@ -77,15 +101,66 @@ Adding auth touched every existing integration test: the harness now completes f
 holds a session cookie (`newHarness` → `signIn`), with `doAnon` for the cases that must be refused.
 The diff was wide but shallow, as expected.
 
+### D-59 / D-60 — the two decisions the §5d review escalated, and how they were resolved
+
+Both were raised to the user rather than decided in-flight, per CLAUDE.md's first hard rule
+(ambiguity in SPEC.md is raised, not silently resolved). The user delegated both back with
+"update SPEC.md as you recommend… same with the README and how best to handle the prompt."
+
+**D-59 — Preview mode belonged to Phase 6 in §11, and Phase 4a built it. Resolved: moved to
+Phase 4, in SPEC.md.**
+§11 listed *"Preview mode"* by name under Phase 6, while §6.1 step 6, §8
+(`POST /api/jobs/{id}/confirm`) and §9 (the "preview-before-run toggle") all specified it as part of
+the run pipeline and the job editor. That was a contradiction *in the spec*, not a choice available
+to the implementer — and it should have been raised before implementation, not after. **SPEC.md §11
+now resolves it in favour of Phase 4** and says why: the preview gate is a run-pipeline feature
+whose only interface is the run-detail screen, so building it apart from that screen would mean
+building it twice. Phase 6 keeps the items that genuinely are polish. The note is in the spec, so
+the next reader sees the resolution rather than rediscovering the contradiction.
+
+**Also fixed while there: §11 Phase 4 had no exit criteria** — the only phase without them, which is
+why 4a's had to be invented and agreed ad hoc. The agreed set is now written into SPEC.md §11 as
+Phase 4a's criteria, with a one-line set for 4b, so they are part of the source of truth.
+
+**D-60 — A `prompt` on one destination stalled every destination. Resolved: fixed the code, not the
+docs.**
+The 4a restructure made the pipeline plan-all → park → execute-all, with the availability gate
+inside the planning pass — so a `prompt` on a down destination blocked every healthy destination
+behind it for up to `prompt_timeout_sec`. The alternative was to document the regression; that was
+rejected. Fan-out exists precisely so that one dead server does not stop the others, D-53 and the
+README already promised that behaviour, and Phase 3 had it.
+
+**The fix inverts which case is special.** The plan→park→execute split exists *for preview*: a
+preview must plan everything before a human can approve any of it. A normal run has no such need, so
+`planDestinations` now takes an `execInline` callback and executes each destination the moment it is
+planned — sequentially, before the next is planned; in parallel, inside that destination's own
+goroutine. `execInline` is nil only for a preview, which still parks globally. Net effect: the gate
+is per-destination again, and the preview hold is the one thing that stops the whole run.
+
+**The exit-criterion test was vacuous and is now not.** `TestPromptPolicyParksAndAnswersSkip` only
+checked the healthy destination *after the whole run ended*, so it passed whether that destination
+copied concurrently or ten minutes later — which is how the regression got in. It now asserts A's
+files are present **while B is still parked**, and re-reads B's status afterwards so the assertion
+cannot pass by B having quietly resolved. **Verified against the old pipeline:** restoring
+plan-all → execute-all fails it with "the healthy destination copied nothing while the unavailable
+one was parked".
+
+SPEC.md §6.1 was the root of the confusion — its numbered stages read as barriers the whole run
+crosses together. It now states up front that stages 1 and 3–4 are per *run* while 2 and 5–7 are per
+*destination*, that a blocked destination blocks only itself, and that the preview gate is the
+single exception. §6.1 step 2's `prompt` bullet and step 6 say the same thing locally.
+
 ### Two bugs this phase found in existing code
 - **The logging middleware silently broke WebSockets.** `statusRecorder` wrapped the
   `ResponseWriter` without forwarding `Hijack`, so the upgrade failed with `501` — a middleware
   breaking a protocol two layers away, with nothing in the logs to say so. It now forwards `Hijack`
   and `Flush`.
 - **`Run.Terminal()` was `Status != RunRunning`.** With `awaiting_confirmation` added, a parked run
-  would have been read as finished. It now enumerates the terminal statuses, and `Active()` was
-  added for the "still holds resources" question, which is the one Shutdown actually asks. The
-  integration harness had the same bug in `awaitRun` and was fixed with it.
+  would have been read as finished. It now enumerates the terminal statuses. The integration harness
+  had the same bug in `awaitRun` and was fixed with it. **Correction (§5d):** `Active()` was added
+  alongside, and this entry claimed it answers "the question Shutdown actually asks". It does not —
+  `Runner.Shutdown` asks nothing of the sort, it just cancels everything in `r.active`. `Active()`
+  has no callers and is dead code (§6 Phase 4a item 14).
 
 ---
 
@@ -351,13 +426,15 @@ D-1…D-13 were approved 2026-08-31 before implementation; D-14…D-17 came out 
 | D-49 | **§9's "Webhooks/API tab" and the two-way conflict UI are deferred to Phase 5** | §9 describes the finished product; §11 is the ordering authority, and it puts trigger tokens, outbound callbacks and two-way sync in Phase 5. Building those tabs now would mean UI in front of endpoints that do not exist |
 | D-50 | **Phase 4a exit criteria were proposed and agreed**, since §11 states none | CLAUDE.md defines done as "exit criteria pass in the test harness". With none written, the phase had no definition of done at all. Listed in §0-4a |
 | D-51 | An unanswered **prompt** falls back (default `skip`, per-job `prompt_fallback`); an unconfirmed **preview** cancels | Both choose the option that does less. A skipped destination is corrected by the next run; an unconfirmed plan must never execute. The asymmetry is deliberate |
-| D-52 | `prompt_timeout_sec` defaults to 600, floor 5, ceiling 86400 | A run may be unattended — from Phase 5 it may be started by cron with nobody watching — so "wait for a human" can never mean "wait forever" |
+| D-52 | `prompt_timeout_sec` defaults to 600, floor 5, ceiling 86400 — **SPEC.md §6.1 said 300 and now says 600** (synced 2026-09-01; the deviation was decided here but never reflected back into the spec, which is exactly the drift the "SPEC is the source of truth" rule exists to prevent) | A run may be unattended — from Phase 5 it may be started by cron with nobody watching — so "wait for a human" can never mean "wait forever" |
 | D-53 | The **destination** parks on a prompt, not the run | The run stays `running` and its other destinations keep working, which is what makes fan-out useful when one server is down. A new `DestAwaitingPrompt` status carries it |
 | D-54 | Password hashing is **stdlib `crypto/pbkdf2`** (SHA-256, 600k iterations), not bcrypt or argon2 | Either would add `golang.org/x/crypto` for one function; the cgo-free, dependency-light build is a stated goal (§3.1). The iteration count is stored with the hash so it can be raised later |
 | D-55 | Sessions store a **SHA-256 of the token**, not the token | A stolen database must not yield live sessions — the same reasoning that encrypts target passwords (§5). A plain hash is right here where it would be wrong for a password: the token is 256 bits from `crypto/rand`, so there is no dictionary to attack |
 | D-56 | The session cookie sets `Secure` **only when the request arrived over TLS** | The container is normally reached over plain HTTP on a LAN (§3 host networking, no TLS terminator). An unconditional `Secure` would make the browser discard the cookie and login would fail with nothing to see |
 | D-57 | `Run.Terminal()` enumerates terminal statuses instead of `!= running`, and `Active()` was added | `awaiting_confirmation` is neither running nor finished. The old form would have called a parked run done |
-| D-58 | A confirmed preview executes the **held** plan, not a fresh diff | The user agreed to a specific set of changes; re-diffing could execute something they never saw. The cost is that the plan is a snapshot, which the executor already tolerates (a file that vanished is a normal event) |
+| D-58 | A confirmed preview executes the **held** plan, not a fresh diff | The user agreed to a specific set of changes; re-diffing could execute something they never saw. The cost is that the plan is a snapshot, which the executor already tolerates (a file that vanished is a normal event). **Amended by the §5d review:** that reasoning covers copies but not deletes, which are not undoable — see §6 Phase 4a item 8. The trade-off stands; the exposure is now documented in the README and needs a shorter hold or a re-check on confirm |
+| D-59 | **Preview mode moved from Phase 6 to Phase 4, in SPEC.md §11** | §11 assigned it to Phase 6 by name while §6.1/§8/§9 all specified it as part of the run pipeline and job editor — a contradiction in the spec. Resolved toward Phase 4 because the preview gate's only interface is the run-detail screen; building it apart from that screen means building it twice. Recorded in the spec, not just here, so the contradiction cannot be rediscovered. §11 Phase 4 also gained the exit criteria it never had |
+| D-60 | **A `prompt` parks one destination, never the run — fixed in code rather than documented away** | The 4a plan-all → park → execute-all restructure put the availability gate in the planning pass, so a prompt on a down destination stalled every healthy one for up to `prompt_timeout_sec`. Documenting that was rejected: fan-out exists so one dead server does not stop the others, and D-53, the README and the exit criterion all already promised it. `planDestinations` now executes each destination inline as it is planned; the plan/execute split is kept *only* for preview, which is the one gate that legitimately holds the whole run |
 | D-59 | `PATCH /api/jobs/{id}` replaces destinations and filters wholesale, and is refused while the job runs | §8 lists only `POST /api/jobs` for "create/update"; a REST update of a job with nested children is a different operation, so this is recorded as an extension rather than a silent deviation. Children are positional and job-owned, so replace beats diff. Editing under a live diff is not something the engine is built to survive |
 | D-60 | The WS hub reads the **most recent** runs each tick, not only the live ones | A short run can start and finish inside one tick. A feed watching only live runs would never mention it, so a dashboard would show a job that quietly never reported anything |
 | D-61 | `github.com/coder/websocket` is the only new dependency | §3 decision 6 specifies WebSocket for live progress, so SSE was not an option despite being zero-dependency. coder/websocket is pure Go and cgo-free |
@@ -442,14 +519,51 @@ mechanism is always **something that widens scope without anyone noticing**.
 
 **Tracked but not fixed** — see §6.
 
+## 5d. Phase 4a review — findings and resolution
+
+A fresh-context subagent reviewed the Phase 4a diff (`git diff a39a232..39d50ec`) against SPEC.md
+§5/§6/§8/§9/§11, the CLAUDE.md hard rules and the agreed exit criteria.
+
+**It broke the Phase 2/3 pattern: no finding deletes, overwrites or relocates data on its own.**
+Explicitly clean, each verified rather than assumed: the deletion guards (`DeletionsBlocked`,
+empty-source-vs-non-empty-dest, degraded chain, incomplete scan) are unchanged and still reach the
+executor; **no new unbounded share I/O in production code** — `browse.go` uses
+`ReadDirBounded`/`InfoBounded` and `gate.go` blocks only on channels and timers, never on a syscall
+(the only `os.*` calls added anywhere in the diff are in `_test.go` against already-mounted
+fixtures); no credential on a command line or in a log; temp-file + fsync + rename and `os.Chtimes`
+untouched; no metadata-identity inference; no Phase 5 scheduler/webhook/`sync_state` code; and the
+WS hub is free of deadlocks and goroutine leaks (`h.mu` is never held across a channel send or a DB
+call, `client.close` is `sync.Once`-guarded, and `main.go` sequences shutdown so hijacked
+connections close before the runs they watch). Auth crypto passed: PBKDF2-HMAC-SHA256 at 600k with
+a stored iteration count, `subtle.ConstantTimeCompare`, 256-bit tokens stored as SHA-256, expiry
+enforced at lookup, and CSRF covered by `SameSite=Lax` plus `websocket.Accept` pinning
+`OriginPatterns` to `r.Host`.
+
+The two most serious findings are **not code bugs but process/design ones**, and are recorded as
+D-59 and D-60 in §0-4a and the decisions log rather than here.
+
+### Fixed this session, each with a regression test
+
+| # | Finding | Fix |
+|---|---|---|
+| P0-1 | **A job holding a parked preview could be edited, and the edit did not apply to the plan that then ran.** `handleUpdateJob`'s guard called `s.runner.Progress(id)` with a **job** ID, but `Progress` is keyed by **run** ID (`r.active[runID]`) — a job ID never appears in that map, so the branch was unreachable and the guard was a no-op. The DB backstop only matched `RunRunning`, and a parked preview is the distinct status `awaiting_confirmation`, so it did not catch it either. `UpdateJob` deletes and reinserts all `job_destinations` and `filter_rules`. **Scenario:** a preview parks a mirror plan showing "500 to delete"; the admin realises an exclude rule is missing, PATCHes the job to add `cache/`, then confirms believing the edit applies. It does not — the held plan runs and deletes the 500 files the new rule existed to protect. The `run_destinations` rows also then reference destination targets the job no longer has | new job-keyed `Runner.ActiveForJob` (`runner.go`), which covers running **and** parked runs because `byJob` is populated for a run's whole lifetime. `TestJobCannotBeEditedWhileAPreviewIsParked` — **verified to fail against the old code** (PATCH returned 200 and the edit landed), and it also asserts the guard *releases* once the park lapses |
+| P1-2 | **`loginLimiter.attempts` grew without bound, pre-auth.** `blocked()` pruned an address's expired timestamps and wrote the (possibly empty) slice back, never deleting the key; `clear()` only fires on a *successful* login. An unauthenticated caller rotating source addresses leaked an entry per address forever | `delete` the key when nothing recent remains (`api/auth.go`). `internal/api/auth_test.go` (new — the package had **no test files** at all) covers the leak, the block-and-clear path, and that stale failures do not count |
+| P1-3 | **The admin password write was not atomic**, so a crash mid-write locked the instance out permanently. `SetAdminPassword` issued three independent `SetSetting` calls — salt, iterations, hash. A crash after the salt write pairs the **new salt** with the **old hash**, so neither the old nor the new password verifies; `AdminPasswordSet` still returns true, so `POST /api/auth/setup` stays closed at 409, and with no password-change endpoint (§6 Phase 4a item 1) the only recovery is editing SQLite by hand | one transaction (`store/auth.go`). **No regression test:** the crash window is between two writes inside one function and is not reachable from a test without fault injection into the DB layer. Flagged rather than faked |
+
+**Resolved after escalation** — the review's two most serious findings were process/design rather
+than code, and were raised to the user before being acted on. Both are now closed: D-59 (preview's
+phase placement, fixed in SPEC.md §11) and D-60 (a prompt stalling every destination, fixed in
+`planDestinations` with a non-vacuous test). See §0-4a.
+
+**Tracked but not fixed** — §6 Phase 4a items 7–14.
+
 ## 6. Open items for the next session
 
 ### Phase 4a
 
-0. **The fresh-context review has not been run.** CLAUDE.md requires it before a phase is declared
-   complete, and it has found real data-loss bugs in each of the last two phases. Everything else
-   for 4a is done and green; this is the remaining gate. Not run because this session was told not
-   to spawn agents unless asked.
+0. ~~The fresh-context review has not been run.~~ **Done — see §5d.** Three findings fixed with
+   regression tests; two escalated to the blocking decisions in §0-4a; the rest are items 7–13
+   below. The review found **no self-contained data-loss bug**, breaking the Phase 2/3 pattern.
 1. **Password change has no endpoint.** `store.SetAdminPassword` and `DeleteAllSessions` exist and
    are tested, but nothing calls them after first-run setup, so a password can only be changed by
    deleting the row. Needs a `POST /api/auth/password` that requires the current password and then
@@ -468,6 +582,73 @@ mechanism is always **something that widens scope without anyone noticing**.
    is a single race on a brand-new instance, but it is the one auth endpoint without a limiter.
 6. `sessionResponse` does not report *when* a session expires, so the UI cannot warn before it
    lapses. Cosmetic until 4b.
+
+### Phase 4a — from the §5d review, tracked not fixed
+
+7. **The logout exit criterion is proven at the wrong layer.** `handleLogout` sets `MaxAge:-1`, the
+   harness cookie jar drops the cookie, and the follow-up 401 is fully explained by the *missing*
+   cookie — the test never replays the logged-out **token**. Server-side invalidation is genuinely
+   covered by `store.TestSessions`, so the behaviour is right; the claiming test is weak. The
+   anonymous-access sweep also samples 6 read routes and omits `/api/ws`, `/run`, `/confirm` and
+   `/prompt`. Cheap to close: keep the raw token and replay it with an explicit header.
+8. **A confirmed preview executes a delete plan up to 24h stale, with no re-verification.** D-58
+   chose to execute the *held* plan rather than re-diff, justified as "a file that vanished is a
+   normal event". That reasoning covers copies; it does not cover deletes. `runDeletes` does a bare
+   `boundedRemove(dstRoot/relpath)` — no re-stat, no mtime check, no comparison against current
+   state — and every deletion guard was evaluated at plan time and is never re-checked. **Scenario:**
+   09:00 a preview parks with `delete reports/2025.xlsx`; 09:30 a colleague writes a *new, wanted*
+   file at that path; 10:00 the admin confirms and the held plan removes it. It was in no listing
+   the admin reviewed, and a re-run cannot undo it. Fixes, cheapest first: cap the preview hold well
+   below `prompt_timeout_sec`'s 86400 ceiling; re-scan the destination on confirm and re-prompt if
+   the delete set changed. The exposure is now documented in the README under "Previewing a run".
+   Preview stays in Phase 4 (D-59), so this item is live, not moot.
+9. **`DestPlan` carries only counts, so a confirm gate over deletions shows no paths.**
+   `progress.go:60-77` exposes `mkdirs / copies / deletes / rmdirs / copy_bytes` and conflict
+   strings. A user confirming "412 to delete" cannot see *which* 412. SPEC.md §9 asks run detail to
+   show "the action plan", and CLAUDE.md is explicit that removing data "is logged individually,
+   never summarised". Needs the delete paths in the payload before 4b builds the modal.
+10. **`/api/browse` has no entry cap and no aggregate bound.** Each `InfoBounded` call is
+    individually bounded at 15s — the hard rule is satisfied *per call* — but the loop is not.
+    **Scenario:** an admin opens the picker on a 200k-entry directory, `ReadDir` succeeds from
+    `cache=loose`, then the server dies → 200k × 15s, each spawning a goroutine that holds an OS
+    thread until the kernel releases it. `r.Context()` unwinds it if the browser gives up, nothing
+    else does. Even healthy, the response is an uncapped 200k-element JSON array. Wants a `limit`
+    (default a few thousand) plus one `context.WithTimeout` over the whole listing.
+11. **An aborted preview is recorded as `cancelled`, not `failed`.** `resolveDestination`'s abort
+    branch calls `h.cancel()` without setting `h.cancelled`, so `awaitConfirmation` takes
+    `<-ctx.Done()`, `wasCancelled` is false, and `abandonPreview` writes `RunCancelled` with "the
+    previewed plan was not confirmed". The user aborted; the record blames nobody confirming.
+12. **Two gate races report success for an answer that had no effect.** (a) `waitForPrompt` returns
+    on `timer.C` but `g.close(destID)` only runs after it returns; in that window `answer()` finds a
+    live entry and replies `{"status":"accepted"}` — so a user answering `retry` is told it was
+    accepted while the destination is being skipped. Should be the same 409 `no_such_prompt` the
+    stale-modal case gets. (b) if `markConfirmed` closes the channel as the timer fires, Go picks a
+    ready case at random and `abandonPreview` may run after the API already replied `200 confirmed`.
+    (b) fails safe — nothing executes — but the reply is wrong.
+13. **The progress flusher runs for the whole preview park.** `runner.go:287` starts it *before* the
+    park at `:292`, so it ticks every second writing one `UPDATE run_destinations` per destination —
+    up to 86,400 writes per destination at the maximum timeout, for counters that cannot change.
+    The destinations also report `DestRunning` (set in `planOneDestination`) while the run is
+    `awaiting_confirmation`, so 4b would draw a parked preview's destinations as running.
+14. Nits from the review, none defects: `Run.Active()` is **dead code** — nothing calls it, and the
+    §0-4a claim that it answers "the question Shutdown actually asks" is wrong (`Shutdown` just
+    cancels everything in `r.active`); `startFlusher`'s doc comment says "and buffered events" but
+    it only flushes progress (pre-existing); `hub.tick` issues 1+N queries per second while any
+    client is connected, changed or not; `statusRecorder` forwards `Hijack`/`Flush` but has no
+    `Unwrap()`, so other `http.ResponseController` users stay blocked; `handleBrowse` returns 502
+    `mount_failed` when the *subpath* merely does not exist (404 would read better — same shape as
+    the Phase 3 item 3 already tracked); and D-18 promised Phase 4 would add `delete_policy: prompt`
+    reusing the availability modal, which was not added — conservative and fine, but the decision
+    log now says something the code does not.
+
+15. **`TestDestinationDisappearsMidRun` intermittently hangs instead of failing.** Seen once on
+    2026-09-01: the test wedged with its blackhole still installed, the suite never completed, and
+    nothing was logged. It passed in the three other full runs that day (44.1s, 42.4s, ~42s), so the
+    rate is low, but the failure is expensive — it parks the harness until someone runs
+    `make harness-clean` by hand, and until now it produced no diagnostics. `-timeout 15m` on the
+    make target is a mitigation, not a fix; the next occurrence should dump goroutines and those
+    stacks are the thing to read. Suspicion, unverified: the test's own cleanup races the blackhole
+    it installed, so the drain loop never runs when the run wedges at the wrong moment.
 
 ### Phase 3
 

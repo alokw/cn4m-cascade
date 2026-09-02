@@ -50,6 +50,13 @@ func (l *loginLimiter) blocked(addr string) bool {
 			kept = append(kept, t)
 		}
 	}
+	// Drop the key outright when nothing recent remains: an unauthenticated
+	// caller rotating source addresses would otherwise grow this map without
+	// bound, and clear() only fires on a *successful* login.
+	if len(kept) == 0 {
+		delete(l.attempts, addr)
+		return false
+	}
 	l.attempts[addr] = kept
 	return len(kept) >= maxLoginAttempts
 }

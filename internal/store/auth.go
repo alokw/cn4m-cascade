@@ -84,13 +84,32 @@ func (d *DB) SetAdminPassword(ctx context.Context, password string) error {
 		return fmt.Errorf("hashing the admin password: %w", err)
 	}
 
-	if err := d.SetSetting(ctx, settingPasswordSalt, base64.StdEncoding.EncodeToString(salt)); err != nil {
-		return err
+	// All three land together or none do. A crash between the salt write and
+	// the hash write would otherwise pair a new salt with the old hash, so
+	// neither the old nor the new password verifies — and since
+	// AdminPasswordSet still reports true, first-run setup stays closed and
+	// the instance can only be recovered by editing SQLite by hand.
+	tx, err := d.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("storing the admin password: %w", err)
 	}
-	if err := d.SetSetting(ctx, settingPasswordIter, fmt.Sprint(pbkdf2Iterations)); err != nil {
-		return err
+	defer func() { _ = tx.Rollback() }()
+
+	const upsert = `INSERT INTO settings (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+	for _, kv := range [][2]string{
+		{settingPasswordSalt, base64.StdEncoding.EncodeToString(salt)},
+		{settingPasswordIter, fmt.Sprint(pbkdf2Iterations)},
+		{settingPasswordHash, base64.StdEncoding.EncodeToString(key)},
+	} {
+		if _, err := tx.ExecContext(ctx, upsert, kv[0], kv[1]); err != nil {
+			return fmt.Errorf("writing setting %q: %w", kv[0], err)
+		}
 	}
-	return d.SetSetting(ctx, settingPasswordHash, base64.StdEncoding.EncodeToString(key))
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("storing the admin password: %w", err)
+	}
+	return nil
 }
 
 // VerifyAdminPassword reports whether a password matches. A wrong password is
