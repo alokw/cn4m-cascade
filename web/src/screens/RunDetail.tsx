@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
 import { ApiError, api } from '../api/client'
 import type {
   DestSnapshot,
@@ -8,6 +8,7 @@ import type {
   LogLevel,
   RunDetail as RunDetailPayload,
   RunEvent,
+  RunStatus,
   Target,
 } from '../api/types'
 import { isTerminal } from '../api/types'
@@ -18,11 +19,13 @@ import { useEvents } from '../hooks/useEvents'
 
 export function RunDetail() {
   const { id = '' } = useParams()
+  const navigate = useNavigate()
   const feed = useEvents()
 
   const [run, setRun] = useState<RunDetailPayload | null>(null)
   const [targets, setTargets] = useState<Target[]>([])
   const [error, setError] = useState<string | null>(null)
+  const [rerunning, setRerunning] = useState(false)
 
   const load = useCallback(async () => {
     try {
@@ -38,6 +41,14 @@ export function RunDetail() {
     void api.targets.list().then(setTargets).catch(() => {})
   }, [load])
 
+  // Re-running navigates to the new run, but this is the same route with a
+  // different param, so the component is reused and `rerunning` would stay
+  // true — leaving both buttons greyed out for good on the run you just
+  // landed on.
+  useEffect(() => {
+    setRerunning(false)
+  }, [id])
+
   // The WS feed is authoritative while the run is live: the DB rows it would
   // otherwise be read from lag about a second behind.
   const live = feed.runs.get(id)
@@ -49,6 +60,26 @@ export function RunDetail() {
   useEffect(() => {
     if (status && isTerminal(status)) void load()
   }, [status, load])
+
+  // Starts the same job again and follows the new run, so a failed run does
+  // not have to be chased back through the jobs list.
+  const rerun = useCallback(
+    async (preview: boolean) => {
+      if (!run) return
+      setRerunning(true)
+      setError(null)
+      try {
+        const next = await api.jobs.run(run.job_id, preview)
+        navigate(`/runs/${next.id}`)
+      } catch (err) {
+        setError(
+          err instanceof ApiError ? err.message : 'Could not start the run again.',
+        )
+        setRerunning(false)
+      }
+    },
+    [run, navigate],
+  )
 
   const nameFor = useCallback(
     (targetID: string) => targets.find((t) => t.id === targetID)?.name ?? targetID,
@@ -111,11 +142,23 @@ export function RunDetail() {
     <section>
       <div className="page-head">
         <h1>Run</h1>
-        {status && !isTerminal(status) && (
-          <button className="link danger" onClick={() => void api.runs.cancel(id).catch(() => {})}>
-            Cancel run
-          </button>
-        )}
+        <div className="actions">
+          {status && isTerminal(status) && (
+            <>
+              <button className="link" disabled={rerunning} onClick={() => void rerun(true)}>
+                Preview again
+              </button>
+              <button disabled={rerunning} onClick={() => void rerun(false)}>
+                {rerunning ? 'Starting…' : 'Run again'}
+              </button>
+            </>
+          )}
+          {status && !isTerminal(status) && (
+            <button className="link danger" onClick={() => void api.runs.cancel(id).catch(() => {})}>
+              Cancel run
+            </button>
+          )}
+        </div>
       </div>
 
       <p className="muted">
@@ -123,7 +166,9 @@ export function RunDetail() {
         {run.finished_at ? ` · finished ${timestamp(run.finished_at)}` : ''}
         {progress ? ` · ${duration(progress.elapsed_sec)} elapsed` : ''}
       </p>
-      {run.error_summary && <p className="error">{run.error_summary}</p>}
+      {run.error_summary && (
+        <p className={summaryClass(status)}>{run.error_summary}</p>
+      )}
 
       {status === 'awaiting_confirmation' && progress?.plans && (
         <ConfirmPlan
@@ -319,4 +364,21 @@ function EventLog({
       </ul>
     </div>
   )
+}
+
+/** The run summary is written for every outcome, not only failures, so it must
+ *  not always be red — a successful run reading "1 succeeded, 0 failed" in
+ *  error styling looks like something went wrong. */
+function summaryClass(status: RunStatus | undefined): string {
+  switch (status) {
+    case 'success':
+      return 'ok'
+    case 'failed':
+      return 'error'
+    case 'partial':
+    case 'cancelled':
+      return 'warn'
+    default:
+      return 'muted'
+  }
 }

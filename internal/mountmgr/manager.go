@@ -558,7 +558,19 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	}
 	m.mu.Unlock()
 
-	for _, id := range ids {
+	for i, id := range ids {
+		// Per-command bounds are not enough on their own. Each unmount is
+		// capped at UnmountTimeout, but N targets in series can still exceed
+		// the whole shutdown budget and get the process SIGKILLed mid-cleanup
+		// — the same SPEC.md §10 promise the per-command bound exists to keep,
+		// just one level up. Whatever is left is the kernel's problem, which
+		// is what a lazy detach hands it anyway.
+		if ctx.Err() != nil {
+			m.log.Warn("shutdown deadline reached; leaving the rest to the kernel",
+				"detached", i, "remaining", len(ids)-i)
+			break
+		}
+
 		dir := filepath.Join(m.cfg.MountRoot, id)
 
 		// Take the entry lock if it is free, but never wait on it: a mount

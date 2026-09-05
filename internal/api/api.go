@@ -115,6 +115,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/runs/{id}/cancel", s.handleCancelRun)
 	mux.HandleFunc("POST /api/runs/{id}/prompt", s.handlePrompt)
 
+	mux.HandleFunc("POST /api/filters/check-file", s.handleCheckFilterFile)
+
+	mux.HandleFunc("GET /api/settings/filters", s.handleGetGlobalFilters)
+	mux.HandleFunc("PUT /api/settings/filters", s.handleReplaceGlobalFilters)
+
 	mux.HandleFunc("GET /api/logs", s.handleLogs)
 	mux.HandleFunc("GET /api/browse", s.handleBrowse)
 

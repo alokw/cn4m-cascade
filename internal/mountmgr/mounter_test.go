@@ -1,8 +1,12 @@
 package mountmgr
 
 import (
+	"context"
+	"errors"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseMountInfo(t *testing.T) {
@@ -67,4 +71,57 @@ func TestUnescapeMountField(t *testing.T) {
 			t.Errorf("unescapeMountField(%q) = %q, want %q", tt.in, got, tt.want)
 		}
 	}
+}
+
+// The mounter must honour its context deadline even when the command it runs
+// never returns.
+//
+// exec.CommandContext alone does not give this: its watchdog arms only after
+// Start returns, and the stall that actually bit was inside forkExec — a
+// goroutine dump showed Manager.Shutdown parked nine minutes deep in
+// syscall.forkExec while unmounting a share whose server had gone away. A
+// `sleep` stub cannot reproduce a wedged fork, but it does pin the property
+// that matters: the call returns on the deadline rather than on the command.
+func TestExecMounterHonoursItsDeadline(t *testing.T) {
+	if _, err := exec.LookPath("sleep"); err != nil {
+		t.Skip("sleep is not available")
+	}
+
+	m := &ExecMounter{MountBin: "sleep", UmountBin: "sleep"}
+
+	t.Run("unmount", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+
+		started := time.Now()
+		// "60" lands as the directory argument, so the stub sleeps a minute.
+		err := m.Unmount(ctx, "60", false)
+		elapsed := time.Since(started)
+
+		if err == nil {
+			t.Fatal("a command that never returns should not report success")
+		}
+		if elapsed > 5*time.Second {
+			t.Fatalf("Unmount blocked for %v; the deadline was 200ms — it is not bounded", elapsed)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("error = %v, want it to wrap context.DeadlineExceeded", err)
+		}
+	})
+
+	t.Run("mount", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+
+		started := time.Now()
+		err := m.Mount(ctx, MountSpec{Source: "60", Dir: "/tmp/nowhere", Options: "ro"})
+		elapsed := time.Since(started)
+
+		if err == nil {
+			t.Fatal("a command that never returns should not report success")
+		}
+		if elapsed > 5*time.Second {
+			t.Fatalf("Mount blocked for %v; the deadline was 200ms — it is not bounded", elapsed)
+		}
+	})
 }

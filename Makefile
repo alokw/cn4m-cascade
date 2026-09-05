@@ -66,7 +66,7 @@ web-dev: ## Vite dev server on http://localhost:5173 (proxies /api to the Go ser
 	$(COMPOSE) exec dev sh -c 'cd /src/web && { [ -d node_modules ] || npm ci --no-audit --no-fund; } && npm run dev -- --host 0.0.0.0'
 
 .PHONY: run
-run: ## Run the server on http://localhost:8384 with the SPA embedded
+run: ## Run the server on http://localhost:2649 with the SPA embedded
 	$(COMPOSE) exec dev sh -c 'cd /src && go run ./cmd/smbsync'
 
 .PHONY: lint

@@ -2,21 +2,8 @@ import { useCallback, useEffect, useState } from 'react'
 import { ApiError, api } from '../api/client'
 import type { MountErrorKind, Target, TestResult } from '../api/types'
 import { targetRoot } from '../api/types'
-import { TargetModal } from '../components/TargetModal'
+import { MOUNT_HINTS, TargetModal } from '../components/TargetModal'
 import { bytes } from '../format'
-
-/** §9 asks for "real mount errors". The server tags every mount failure with a
- *  kind; turning that into an actionable next step is the difference between a
- *  useful error and "connection failed". */
-const HINTS: Record<MountErrorKind, string> = {
-  auth: 'Check the username, password and domain.',
-  share_missing: 'The host answered but has no share by that name.',
-  unreachable: 'No route to the host. Check the address and that the server is on.',
-  timeout: 'The host accepted the connection but never finished. It may be overloaded.',
-  dialect: 'No SMB dialect in common. The server may be too old, or SMB1 may be disabled.',
-  permission: 'The credentials are valid but lack access to this share.',
-  unknown: '',
-}
 
 type TestState = { status: 'idle' } | { status: 'testing' } | { status: 'done'; result: TestResult } | { status: 'failed'; message: string; kind?: MountErrorKind }
 
@@ -25,6 +12,7 @@ export function Targets() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [editing, setEditing] = useState<Target | null>(null)
+  const [duplicating, setDuplicating] = useState<Target | null>(null)
   const [adding, setAdding] = useState(false)
   const [tests, setTests] = useState<Record<string, TestState>>({})
 
@@ -105,6 +93,9 @@ export function Targets() {
                 <button className="link" onClick={() => setEditing(t)}>
                   Edit
                 </button>
+                <button className="link" onClick={() => setDuplicating(t)}>
+                  Duplicate
+                </button>
                 <button className="link danger" onClick={() => void remove(t)}>
                   Delete
                 </button>
@@ -123,7 +114,7 @@ export function Targets() {
               {state.status === 'failed' && (
                 <p className="error">
                   {state.message}
-                  {state.kind && HINTS[state.kind] ? ` ${HINTS[state.kind]}` : ''}
+                  {state.kind && MOUNT_HINTS[state.kind] ? ` ${MOUNT_HINTS[state.kind]}` : ''}
                 </p>
               )}
             </li>
@@ -131,18 +122,22 @@ export function Targets() {
         })}
       </ul>
 
-      {(adding || editing) && (
+      {(adding || editing || duplicating) && (
         <TargetModal
-          target={editing}
+          target={editing ?? duplicating}
+          duplicate={duplicating !== null}
           onClose={() => {
             setAdding(false)
             setEditing(null)
+            setDuplicating(null)
           }}
           onSaved={() => {
             setAdding(false)
             setEditing(null)
+            setDuplicating(null)
             void load()
           }}
+          onRefresh={() => void load()}
         />
       )}
     </section>

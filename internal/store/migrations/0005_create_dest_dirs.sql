@@ -1,0 +1,20 @@
+-- Phase 4b-2b-i: whether a run may create a destination folder that does not
+-- exist yet.
+--
+-- This is deliberately NOT part of unavailable_policy. "The destination is
+-- unreachable" and "the destination folder has not been made yet" are
+-- different questions with different right answers: the first is usually
+-- transient and worth retrying, the second is either a first run or a typo.
+-- Folding them together meant a job set to skip unreachable destinations also
+-- silently created folders, which is the opposite of the caution that setting
+-- expresses.
+--
+-- 'ask' is the default, including for existing jobs: creating a folder is
+-- cheap to confirm and expensive to get wrong, because a mistyped subpath is
+-- created and synced into and looks exactly like success. An unanswered prompt
+-- falls back to skipping the destination, so an unattended run never invents
+-- one.
+--
+-- No CHECK constraint, matching 0004: SQLite cannot alter one without
+-- rebuilding the table, and validation lives in Go.
+ALTER TABLE jobs ADD COLUMN create_dest_dirs TEXT NOT NULL DEFAULT 'ask';  -- ask | always | never

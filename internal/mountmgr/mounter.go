@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // MountSpec is one attempt to mount one share.
@@ -81,6 +82,66 @@ func (m *ExecMounter) umountBin() string {
 	return "umount"
 }
 
+// defaultCommandTimeout backstops a caller that forgot to set a deadline.
+const defaultCommandTimeout = 60 * time.Second
+
+// runBounded runs cmd and gives up on it when ctx expires.
+//
+// exec.CommandContext is NOT enough on its own, and that is the whole reason
+// this exists. Its watchdog only arms *after* Start returns, but the stall we
+// actually hit is inside forkExec: fork/exec can block outright in a process
+// whose threads are parked in uninterruptible CIFS syscalls, which is exactly
+// the state a dead share puts this process in. A goroutine dump from a wedged
+// harness run showed Manager.Shutdown stuck nine minutes deep in
+// syscall.forkExec, under a comment promising it "never blocks on a dead
+// server".
+//
+// So the bound has to be on the *caller*: run the command on its own goroutine
+// and select on ctx, the same shape engine.bounded uses. The channel is
+// buffered so the abandoned goroutine always completes and never leaks beyond
+// the syscall itself — it does hold an OS thread until the kernel releases it,
+// which is the accepted cost of not hanging (CLAUDE.md).
+func runBounded(ctx context.Context, cmd *exec.Cmd, what string) error {
+	// A caller whose context carries no deadline would otherwise get exactly
+	// the unbounded behaviour this function exists to prevent. CLAUDE.md asks
+	// for bounds that are impossible to forget, so one is supplied.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultCommandTimeout)
+		defer cancel()
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Run() }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		// Deliberately no Kill, and callers must not read the command's
+		// output buffers after this. Both would race with the abandoned
+		// goroutine: cmd.Process is being written by Start, and stdout/stderr
+		// are being written by the running command. The race detector catches
+		// both. Killing is not this function's job either — CommandContext
+		// reaps the process once Start returns, and if fork itself stalled
+		// there is no process yet. All this does is stop *waiting*.
+		return fmt.Errorf("%s: %w", what, errTimedOut{ctx.Err()})
+	}
+}
+
+// errTimedOut marks a command abandoned on its deadline, so callers know its
+// output buffers are still being written to and must not be read.
+type errTimedOut struct{ err error }
+
+func (e errTimedOut) Error() string { return "did not complete in time: " + e.err.Error() }
+func (e errTimedOut) Unwrap() error { return e.err }
+
+// abandoned reports whether err came from a command we stopped waiting for.
+func abandoned(err error) bool {
+	var t errTimedOut
+	return errors.As(err, &t)
+}
+
 // Mount execs mount.cifs. Credentials are passed as a path to a 0600 file
 // (credentials=), never as an option value, so they never appear in the
 // process table (SPEC.md §5).
@@ -95,9 +156,14 @@ func (m *ExecMounter) Mount(ctx context.Context, spec MountSpec) error {
 	cmd.Stderr = &stderr
 	cmd.Stdout = &stdout
 
-	err := cmd.Run()
+	err := runBounded(ctx, cmd, "mounting "+spec.Source)
 	if err == nil {
 		return nil
+	}
+	if abandoned(err) {
+		// The command is still running and still writing to stdout/stderr;
+		// reading them here would be a data race.
+		return classifyMountFailure(spec.Source, -1, "", ctx.Err())
 	}
 
 	exitCode := -1
@@ -124,7 +190,14 @@ func (m *ExecMounter) Unmount(ctx context.Context, dir string, lazy bool) error 
 	cmd := exec.CommandContext(ctx, m.umountBin(), args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	// Bounded at the caller: this is the exact call that wedged Shutdown for
+	// nine minutes inside forkExec. See runBounded.
+	if err := runBounded(ctx, cmd, "unmounting "+dir); err != nil {
+		if abandoned(err) {
+			// runBounded already names the operation; wrapping again reads as
+			// "unmounting X: unmounting X: ...".
+			return err
+		}
 		detail := strings.TrimSpace(stderr.String())
 		// Already gone is success as far as callers are concerned.
 		if strings.Contains(detail, "not mounted") || strings.Contains(detail, "not found") {

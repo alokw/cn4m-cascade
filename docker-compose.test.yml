@@ -52,11 +52,11 @@ services:
       # Linux, USERPROFILE on Windows. Docker Desktop accepts forward slashes
       # in a Windows path, so C:\Users\you/cn4m resolves correctly.
       - ${CN4M_LOCAL_DIR:-${HOME:-${USERPROFILE:-/tmp}}/cn4m}:/mnt/local
-    # Reachable from the host browser for the manual pass: 8384 is the Go
+    # Reachable from the host browser for the manual pass: 2649 is the Go
     # server (`make run`), 5173 is the Vite dev server (`make web-dev`), which
-    # proxies /api to 8384 inside the container.
+    # proxies /api to 2649 inside the container.
     ports:
-      - "8384:8384"
+      - "2649:2649"
       - "5173:5173"
     working_dir: /src
     networks: [smbnet]

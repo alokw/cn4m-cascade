@@ -2,7 +2,7 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 // The Go server's default listen address (internal/config/config.go).
-const API = 'http://localhost:8384'
+const API = 'http://localhost:2649'
 
 export default defineConfig({
   plugins: [react()],

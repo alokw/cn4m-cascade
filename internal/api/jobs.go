@@ -29,6 +29,7 @@ type jobPayload struct {
 	UnavailablePolicy    string `json:"unavailable_policy"`
 	PromptTimeoutSec     int    `json:"prompt_timeout_sec"`
 	PromptFallback       string `json:"prompt_fallback"`
+	CreateDestDirs       string `json:"create_dest_dirs"`
 	ParallelDestinations bool   `json:"parallel_destinations"`
 
 	Destinations []destPayload   `json:"destinations"`
@@ -62,6 +63,7 @@ func (p *jobPayload) toJob() *store.Job {
 		UnavailablePolicy:    store.UnavailablePolicy(p.UnavailablePolicy),
 		PromptTimeoutSec:     p.PromptTimeoutSec,
 		PromptFallback:       store.PromptFallback(p.PromptFallback),
+		CreateDestDirs:       store.CreateDestDirs(p.CreateDestDirs),
 		ParallelDestinations: p.ParallelDestinations,
 		Compare:              store.CompareMethod(p.Compare),
 		IgnoreDSTHour:        p.IgnoreDSTHour,
@@ -131,11 +133,27 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
-	if err := s.db.DeleteJob(r.Context(), r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+
+	// Same guard as editing: a run holds the job in memory, so deleting the
+	// row underneath it leaves a run writing history for a job that no longer
+	// exists — and that history is about to be deleted too.
+	if s.runner.ActiveForJob(id) {
+		writeError(w, http.StatusConflict, "job_running",
+			"This job is running. Wait for it to finish, or cancel it, before deleting.", "")
+		return
+	}
+
+	runs, err := s.db.CountRuns(r.Context(), id)
+	if err != nil {
+		s.log.Error("could not count a job's runs before deleting it", "job_id", id, "error", err)
+	}
+
+	if err := s.db.DeleteJob(r.Context(), id); err != nil {
 		s.writeJobError(w, err)
 		return
 	}
-	s.log.Info("job deleted", "job_id", r.PathValue("id"))
+	s.log.Info("job deleted", "job_id", id, "runs_deleted", runs)
 	w.WriteHeader(http.StatusNoContent)
 }
 

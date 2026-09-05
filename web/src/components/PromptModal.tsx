@@ -30,6 +30,7 @@ export function PromptModal({ runID, dest, targetName, onAnswered }: Props) {
   // prompt_deadline is always present in the payload — Go's omitempty does
   // nothing for time.Time — so a truthiness check would count down from the
   // year 1. isZeroTime is the guard.
+  const canCreate = dest.prompt_can_create === true
   const deadline = isZeroTime(dest.prompt_deadline) ? null : new Date(dest.prompt_deadline).getTime()
   const remaining = deadline === null ? null : Math.max(0, (deadline - now) / 1000)
 
@@ -56,11 +57,18 @@ export function PromptModal({ runID, dest, targetName, onAnswered }: Props) {
   return (
     <div className="backdrop">
       <div className="card modal prompt">
-        <h2>Destination unavailable</h2>
+        <h2>{canCreate ? 'Destination folder does not exist' : 'Destination unavailable'}</h2>
         <p>
-          <strong>{targetName}</strong> could not be reached.
+          <strong>{targetName}</strong>{' '}
+          {canCreate ? 'resolved, but the folder this job writes to is not there.' : 'could not be reached.'}
         </p>
         {dest.prompt_reason && <p className="muted">{dest.prompt_reason}</p>}
+        {canCreate && (
+          <p className="warn">
+            Check the path before creating it. A mistyped folder will be created and synced into,
+            which looks like success — the files simply go somewhere you did not mean.
+          </p>
+        )}
 
         {remaining !== null && (
           <p className={remaining < 30 ? 'warn' : 'muted'}>
@@ -71,9 +79,15 @@ export function PromptModal({ runID, dest, targetName, onAnswered }: Props) {
         {error && <p className="error">{error}</p>}
 
         <div className="actions">
-          <button className="link" disabled={busy !== null} onClick={() => void answer('retry')}>
-            {busy === 'retry' ? 'Retrying…' : 'Retry'}
-          </button>
+          {canCreate ? (
+            <button disabled={busy !== null} onClick={() => void answer('create')}>
+              {busy === 'create' ? 'Creating…' : 'Create the folder'}
+            </button>
+          ) : (
+            <button className="link" disabled={busy !== null} onClick={() => void answer('retry')}>
+              {busy === 'retry' ? 'Retrying…' : 'Retry'}
+            </button>
+          )}
           <button className="link" disabled={busy !== null} onClick={() => void answer('skip')}>
             {busy === 'skip' ? 'Skipping…' : 'Skip and continue'}
           </button>

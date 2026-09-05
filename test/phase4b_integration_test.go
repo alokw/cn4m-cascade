@@ -492,3 +492,604 @@ func pathsOf(t *testing.T, raw any) []string {
 	}
 	return out
 }
+
+// A job fetched from the API cannot be fed straight back into PATCH: decodeJSON
+// sets DisallowUnknownFields, and the response carries server-owned fields
+// (id, created_at, position, job_id) that jobPayload does not accept — on the
+// job itself and on every nested destination and filter rule.
+//
+// This pins the contract the frontend's toJobPayload() exists to satisfy. It
+// asserts both directions, because only asserting the happy path would let
+// someone "fix" a future 400 by loosening DisallowUnknownFields, which is what
+// stops a typo in a field name from silently not being applied.
+func TestJobFetchMustBeProjectedBeforePatching(t *testing.T) {
+	h := newHarness(t, nil)
+	srcID, dstID, scope, _ := previewFixture(t, h)
+
+	jobID := h.createJob(t, map[string]any{
+		"name":             uniqueName("roundtrip"),
+		"source_target_id": srcID,
+		"source_subpath":   scope,
+		"mode":             string(store.ModeMirror),
+		"destinations":     []map[string]any{{"dest_target_id": dstID, "dest_subpath": scope}},
+		"filters": []map[string]any{{
+			"direction": "exclude", "source": "inline", "patterns": []string{"*.tmp"},
+		}},
+	})
+
+	_, fetched := h.do(http.MethodGet, "/api/jobs/"+jobID, nil)
+
+	// Verbatim: refused, because of the fields the server owns.
+	status, body := h.do(http.MethodPatch, "/api/jobs/"+jobID, fetched)
+	if status != http.StatusBadRequest {
+		t.Fatalf("PATCH of a verbatim fetched job = %d, want 400 — if this now succeeds, "+
+			"DisallowUnknownFields was removed and a misspelled field would be silently dropped: %v",
+			status, body)
+	}
+
+	// Projected to exactly what jobPayload accepts: succeeds, and the filter
+	// rule survives.
+	payload := projectJobPayload(fetched)
+	status, body = h.do(http.MethodPatch, "/api/jobs/"+jobID, payload)
+	if status != http.StatusOK {
+		t.Fatalf("PATCH of a projected job = %d, want 200: %v", status, body)
+	}
+	filters, _ := body["filters"].([]any)
+	if len(filters) != 1 {
+		t.Fatalf("the filter rule did not survive the round trip: %v", body["filters"])
+	}
+}
+
+// projectJobPayload mirrors the frontend's toJobPayload(): keep exactly the
+// fields jobPayload declares, on the job and on each nested row.
+func projectJobPayload(job map[string]any) map[string]any {
+	keep := []string{
+		"name", "source_target_id", "source_subpath", "mode", "compare",
+		"compare_tolerance_sec", "ignore_dst_hour", "workers", "log_every_file",
+		"on_error", "delete_policy", "unavailable_policy", "prompt_timeout_sec",
+		"prompt_fallback", "parallel_destinations",
+	}
+	out := map[string]any{}
+	for _, k := range keep {
+		if v, ok := job[k]; ok {
+			out[k] = v
+		}
+	}
+
+	dests := []map[string]any{}
+	for _, raw := range asSlice(job["destinations"]) {
+		d, _ := raw.(map[string]any)
+		dests = append(dests, map[string]any{
+			"dest_target_id": d["dest_target_id"], "dest_subpath": d["dest_subpath"],
+		})
+	}
+	out["destinations"] = dests
+
+	rules := []map[string]any{}
+	for _, raw := range asSlice(job["filters"]) {
+		f, _ := raw.(map[string]any)
+		rule := map[string]any{
+			"scope": f["scope"], "direction": f["direction"], "source": f["source"],
+			"case_sensitive": f["case_sensitive"], "on_error": f["on_error"],
+		}
+		for _, k := range []string{"scope_target_id", "patterns", "file_path", "json_key"} {
+			if v, ok := f[k]; ok {
+				rule[k] = v
+			}
+		}
+		rules = append(rules, rule)
+	}
+	out["filters"] = rules
+	return out
+}
+
+func asSlice(v any) []any {
+	s, _ := v.([]any)
+	return s
+}
+
+// Deleting a job that has run history used to fail with a raw
+// "FOREIGN KEY constraint failed (787)" shown verbatim to the user: runs.job_id
+// references jobs(id) without ON DELETE CASCADE, unlike every other child
+// table. The feature was broken for every job that had ever run — which is
+// every job anyone would want to delete.
+func TestDeletingAJobRemovesItsRunHistory(t *testing.T) {
+	h := newHarness(t, nil)
+	srcID, dstID, scope, srcRoot := previewFixture(t, h)
+	seedTree(t, srcRoot, map[string]int{"a.txt": 10})
+
+	jobID := h.createJob(t, map[string]any{
+		"name":             uniqueName("deletable"),
+		"source_target_id": srcID,
+		"source_subpath":   scope,
+		"mode":             string(store.ModeUpdate),
+		"destinations":     []map[string]any{{"dest_target_id": dstID, "dest_subpath": scope}},
+	})
+
+	runID := h.runJob(t, jobID)
+	h.awaitRun(t, runID, 60*time.Second)
+
+	if status, body := h.do(http.MethodDelete, "/api/jobs/"+jobID, nil); status != http.StatusNoContent {
+		t.Fatalf("deleting a job with run history = %d, want 204: %v", status, body)
+	}
+
+	if status, _ := h.do(http.MethodGet, "/api/jobs/"+jobID, nil); status != http.StatusNotFound {
+		t.Fatalf("the job survived deletion: %d", status)
+	}
+	// The history goes with it — an orphaned run would point at a job that no
+	// longer exists.
+	if status, _ := h.do(http.MethodGet, "/api/runs/"+runID, nil); status != http.StatusNotFound {
+		t.Fatalf("the run survived its job's deletion: %d", status)
+	}
+	if events := h.eventsOf(t, jobID); len(events) != 0 {
+		t.Fatalf("run events survived: %d", len(events))
+	}
+}
+
+// A job cannot be deleted while it is running: the runner holds it in memory,
+// and the history the delete would remove is still being written.
+func TestJobCannotBeDeletedWhileRunning(t *testing.T) {
+	requireIptables(t)
+
+	h := newHarness(t, nil)
+	srcID, dstID, scope, srcRoot := previewFixture(t, h)
+	seedTree(t, srcRoot, map[string]int{"a.txt": 10})
+
+	jobID := h.createJob(t, map[string]any{
+		"name":               uniqueName("busy"),
+		"source_target_id":   srcID,
+		"source_subpath":     scope,
+		"prompt_timeout_sec": 30,
+		"destinations":       []map[string]any{{"dest_target_id": dstID, "dest_subpath": scope}},
+	})
+
+	// A preview parks, which is the easiest way to hold a job open long enough
+	// to attempt the delete deterministically.
+	_, body := h.do(http.MethodPost, "/api/jobs/"+jobID+"/run", map[string]any{"preview": true})
+	runID, _ := body["id"].(string)
+	h.awaitRunStatus(t, runID, 30*time.Second, string(store.RunAwaitingConfirmation))
+
+	status, resp := h.do(http.MethodDelete, "/api/jobs/"+jobID, nil)
+	if status != http.StatusConflict {
+		t.Fatalf("deleting a running job = %d, want 409: %v", status, resp)
+	}
+	errObj, _ := resp["error"].(map[string]any)
+	if code, _ := errObj["code"].(string); code != "job_running" {
+		t.Fatalf("error code = %v, want job_running", errObj["code"])
+	}
+
+	// And once it is over, the delete goes through.
+	h.awaitRun(t, runID, 60*time.Second)
+	if status, body := h.do(http.MethodDelete, "/api/jobs/"+jobID, nil); status != http.StatusNoContent {
+		t.Fatalf("deleting after the run ended = %d, want 204: %v", status, body)
+	}
+}
+
+// eventsOf returns every log event recorded for a job.
+func (h *harness) eventsOf(t *testing.T, jobID string) []any {
+	t.Helper()
+	_, body := h.do(http.MethodGet, "/api/logs?job_id="+jobID, nil)
+	events, _ := body["events"].([]any)
+	return events
+}
+
+// Under the `prompt` policy a missing destination folder is a question, not a
+// silent creation: a mistyped subpath would otherwise be brought into
+// existence and synced into, which looks exactly like success. Answering
+// "create" makes it and the run proceeds.
+func TestMissingDestinationFolderIsPromptedAndCreatedOnAnswer(t *testing.T) {
+	h := newHarness(t, nil)
+	srcID, dstID, scope, srcRoot := previewFixture(t, h)
+	seedTree(t, srcRoot, map[string]int{"a.txt": 9})
+
+	fresh := scope + "/ask-first"
+	dstRoot := filepath.Join(h.mountFor(t, dstID), fresh)
+	t.Cleanup(func() { _ = os.RemoveAll(dstRoot) })
+
+	jobID := h.createJob(t, map[string]any{
+		"name":             uniqueName("ask-create"),
+		"source_target_id": srcID,
+		"source_subpath":   scope,
+		// Deliberately NOT unavailable_policy: prompt. A missing folder asks
+		// on its own terms, which is the whole point of the separate setting.
+		"create_dest_dirs":   string(store.CreateDirsAsk),
+		"prompt_timeout_sec": 120,
+		"destinations":       []map[string]any{{"dest_target_id": dstID, "dest_subpath": fresh}},
+	})
+
+	runID := h.runJob(t, jobID)
+	h.awaitDestStatus(t, runID, dstID, 60*time.Second, string(store.DestAwaitingPrompt))
+
+	// Nothing may have been created merely by asking.
+	if _, err := os.Stat(dstRoot); !os.IsNotExist(err) {
+		t.Fatalf("the folder was created before anyone answered (stat err: %v)", err)
+	}
+
+	// The prompt must say creating is an option, so the UI can offer it
+	// without guessing from the message text.
+	_, detail := h.do(http.MethodGet, "/api/runs/"+runID, nil)
+	progress, _ := detail["progress"].(map[string]any)
+	var canCreate bool
+	for _, raw := range progress["destinations"].([]any) {
+		d, _ := raw.(map[string]any)
+		if d["dest_target_id"] == dstID {
+			canCreate, _ = d["prompt_can_create"].(bool)
+		}
+	}
+	if !canCreate {
+		t.Fatalf("the prompt does not offer creation: %v", progress["destinations"])
+	}
+
+	status, resp := h.do(http.MethodPost, "/api/runs/"+runID+"/prompt",
+		map[string]any{"action": "create", "dest_target_id": dstID})
+	if status != http.StatusOK {
+		t.Fatalf("answering create = %d, want 200: %v", status, resp)
+	}
+
+	if run := h.awaitRun(t, runID, 60*time.Second); run["status"] != string(store.RunSuccess) {
+		t.Fatalf("run after creating the folder = %v: %v", run["status"], run)
+	}
+	assertSMBTreesMatch(t, srcRoot, dstRoot)
+}
+
+// With nobody to answer, the fallback must not create anything: an unattended
+// run is exactly where a typo would go unnoticed.
+func TestUnansweredMissingFolderPromptCreatesNothing(t *testing.T) {
+	h := newHarness(t, nil)
+	srcID, dstID, scope, srcRoot := previewFixture(t, h)
+	seedTree(t, srcRoot, map[string]int{"a.txt": 9})
+
+	fresh := scope + "/never-answered"
+	dstRoot := filepath.Join(h.mountFor(t, dstID), fresh)
+
+	jobID := h.createJob(t, map[string]any{
+		"name":               uniqueName("no-answer-create"),
+		"source_target_id":   srcID,
+		"source_subpath":     scope,
+		"create_dest_dirs":   string(store.CreateDirsAsk),
+		"prompt_timeout_sec": 5, // the floor
+		"prompt_fallback":    string(store.FallbackSkip),
+		"destinations":       []map[string]any{{"dest_target_id": dstID, "dest_subpath": fresh}},
+	})
+
+	runID := h.runJob(t, jobID)
+	run := h.awaitRun(t, runID, 90*time.Second)
+	if run["status"] != string(store.RunFailed) && run["status"] != string(store.RunPartial) {
+		t.Fatalf("unanswered prompt ended %v, want failed or partial: %v", run["status"], run)
+	}
+	if _, err := os.Stat(dstRoot); !os.IsNotExist(err) {
+		t.Fatalf("an unanswered prompt created the folder anyway (stat err: %v)", err)
+	}
+}
+
+// create_dest_dirs=always is the opted-out path: no question, just make it.
+func TestDestinationSubpathIsCreatedOnFirstRun(t *testing.T) {
+	h := newHarness(t, nil)
+	srcID, dstID, scope, srcRoot := previewFixture(t, h)
+	seedTree(t, srcRoot, map[string]int{"a.txt": 12, "nested/b.txt": 8})
+
+	// Deliberately NOT created: the point of the test.
+	fresh := scope + "/never-made/deeper"
+	dstRoot := filepath.Join(h.mountFor(t, dstID), fresh)
+	t.Cleanup(func() { _ = os.RemoveAll(filepath.Join(h.mountFor(t, dstID), scope+"/never-made")) })
+
+	jobID := h.createJob(t, map[string]any{
+		"name":             uniqueName("autocreate"),
+		"source_target_id": srcID,
+		"source_subpath":   scope,
+		"mode":             string(store.ModeMirror),
+		"create_dest_dirs": string(store.CreateDirsAlways),
+		"destinations":     []map[string]any{{"dest_target_id": dstID, "dest_subpath": fresh}},
+	})
+
+	runID := h.runJob(t, jobID)
+	if run := h.awaitRun(t, runID, 60*time.Second); run["status"] != string(store.RunSuccess) {
+		t.Fatalf("first run into a missing destination folder = %v: %v", run["status"], run)
+	}
+	assertSMBTreesMatch(t, srcRoot, dstRoot)
+}
+
+// The source is never created. A missing source is a misconfiguration, and
+// inventing one would turn a typo into a run that copies nothing and calls
+// itself a success.
+func TestMissingSourceSubpathIsNotCreated(t *testing.T) {
+	h := newHarness(t, nil)
+	srcID, dstID, scope, _ := previewFixture(t, h)
+
+	jobID := h.createJob(t, map[string]any{
+		"name":             uniqueName("nosrc"),
+		"source_target_id": srcID,
+		"source_subpath":   scope + "/does-not-exist",
+		"destinations":     []map[string]any{{"dest_target_id": dstID, "dest_subpath": scope}},
+	})
+
+	runID := h.runJob(t, jobID)
+	run := h.awaitRun(t, runID, 60*time.Second)
+	if run["status"] != string(store.RunFailed) {
+		t.Fatalf("a run with a missing source = %v, want failed: %v", run["status"], run)
+	}
+
+	// And it must not have been quietly brought into existence.
+	if _, err := os.Stat(filepath.Join(h.mountFor(t, srcID), scope, "does-not-exist")); !os.IsNotExist(err) {
+		t.Fatalf("the missing source subpath was created (stat err: %v)", err)
+	}
+}
+
+// A preview creates nothing — not even a directory. Planning must leave the
+// destination exactly as it found it, or "nothing has been written yet" on the
+// confirm screen is a lie. This is the guarantee that broke when destination
+// folders started being created at resolve time.
+func TestPreviewDoesNotCreateTheDestinationFolder(t *testing.T) {
+	h := newHarness(t, nil)
+	srcID, dstID, scope, srcRoot := previewFixture(t, h)
+	seedTree(t, srcRoot, map[string]int{"a.txt": 7})
+
+	fresh := scope + "/preview-must-not-make-this"
+	dstRoot := filepath.Join(h.mountFor(t, dstID), fresh)
+	t.Cleanup(func() { _ = os.RemoveAll(dstRoot) })
+
+	// create_dest_dirs=always is the path that *does* create on a real run, so
+	// this pins that preview is the exception to it.
+	jobID := h.createJob(t, map[string]any{
+		"name":             uniqueName("preview-nocreate"),
+		"source_target_id": srcID,
+		"source_subpath":   scope,
+		// Even told to create unconditionally, a preview must not.
+		"create_dest_dirs":   string(store.CreateDirsAlways),
+		"prompt_timeout_sec": 5,
+		"destinations":       []map[string]any{{"dest_target_id": dstID, "dest_subpath": fresh}},
+	})
+
+	_, body := h.do(http.MethodPost, "/api/jobs/"+jobID+"/run", map[string]any{"preview": true})
+	runID, _ := body["id"].(string)
+	h.awaitRun(t, runID, 60*time.Second)
+
+	if _, err := os.Stat(dstRoot); !os.IsNotExist(err) {
+		t.Fatalf("a preview created the destination folder (stat err: %v)", err)
+	}
+
+	// And the real run still creates it, so the guarantee costs nothing.
+	realRun := h.runJob(t, jobID)
+	if run := h.awaitRun(t, realRun, 60*time.Second); run["status"] != string(store.RunSuccess) {
+		t.Fatalf("the real run = %v: %v", run["status"], run)
+	}
+	if _, err := os.Stat(dstRoot); err != nil {
+		t.Fatalf("the real run did not create the folder: %v", err)
+	}
+}
+
+// create_dest_dirs=never treats a missing folder as an unavailable
+// destination: nothing is created and nothing is asked.
+func TestCreateDestDirsNeverSkipsTheDestination(t *testing.T) {
+	h := newHarness(t, nil)
+	srcID, dstID, scope, srcRoot := previewFixture(t, h)
+	seedTree(t, srcRoot, map[string]int{"a.txt": 5})
+
+	fresh := scope + "/never-create-this"
+	dstRoot := filepath.Join(h.mountFor(t, dstID), fresh)
+
+	jobID := h.createJob(t, map[string]any{
+		"name":             uniqueName("never-create"),
+		"source_target_id": srcID,
+		"source_subpath":   scope,
+		"create_dest_dirs": string(store.CreateDirsNever),
+		"destinations":     []map[string]any{{"dest_target_id": dstID, "dest_subpath": fresh}},
+	})
+
+	runID := h.runJob(t, jobID)
+	run := h.awaitRun(t, runID, 60*time.Second)
+	if run["status"] == string(store.RunSuccess) {
+		t.Fatalf("a run with create_dest_dirs=never succeeded against a missing folder: %v", run)
+	}
+	if _, err := os.Stat(dstRoot); !os.IsNotExist(err) {
+		t.Fatalf("create_dest_dirs=never created the folder anyway (stat err: %v)", err)
+	}
+}
+
+// A new job defaults to asking, so the safe behaviour is the one you get
+// without choosing anything.
+func TestNewJobsDefaultToAskingBeforeCreating(t *testing.T) {
+	h := newHarness(t, nil)
+	srcID, dstID, scope, _ := previewFixture(t, h)
+
+	jobID := h.createJob(t, map[string]any{
+		"name":             uniqueName("default-ask"),
+		"source_target_id": srcID,
+		"source_subpath":   scope,
+		"destinations":     []map[string]any{{"dest_target_id": dstID, "dest_subpath": scope}},
+	})
+
+	_, body := h.do(http.MethodGet, "/api/jobs/"+jobID, nil)
+	if got := body["create_dest_dirs"]; got != string(store.CreateDirsAsk) {
+		t.Fatalf("create_dest_dirs defaulted to %v, want %q", got, store.CreateDirsAsk)
+	}
+}
+
+// setGlobalFilters replaces the global exclusion set.
+func (h *harness) setGlobalFilters(t *testing.T, rules []map[string]any) {
+	t.Helper()
+	status, body := h.do(http.MethodPut, "/api/settings/filters", map[string]any{"filters": rules})
+	if status != http.StatusOK {
+		t.Fatalf("PUT global filters = %d, want 200: %v", status, body)
+	}
+}
+
+// A global exclusion must reach a job that has **no filter rules of its own**.
+// resolveChains used to return early on len(job.Filters) == 0, which would skip
+// globals entirely — and, worse, skip the degradation a broken global rule has
+// to cause. Most jobs have no rules, so this is the common case, not an edge.
+func TestGlobalExclusionAppliesToAJobWithNoRulesOfItsOwn(t *testing.T) {
+	h := newHarness(t, nil)
+	srcID, dstID, scope, srcRoot := previewFixture(t, h)
+	seedTree(t, srcRoot, map[string]int{"keep.txt": 10, "Thumbs.db": 6, "sub/keep2.txt": 8})
+
+	h.setGlobalFilters(t, []map[string]any{{
+		"source": "inline", "patterns": []string{"Thumbs.db"},
+		"case_sensitive": false, "on_error": "fail_run",
+	}})
+
+	dstRoot := filepath.Join(h.mountFor(t, dstID), scope)
+	jobID := h.createJob(t, map[string]any{
+		"name":             uniqueName("global-norules"),
+		"source_target_id": srcID,
+		"source_subpath":   scope,
+		"mode":             string(store.ModeMirror),
+		"destinations":     []map[string]any{{"dest_target_id": dstID, "dest_subpath": scope}},
+	})
+
+	runID := h.runJob(t, jobID)
+	if run := h.awaitRun(t, runID, 60*time.Second); run["status"] != string(store.RunSuccess) {
+		t.Fatalf("run = %v: %v", run["status"], run)
+	}
+
+	if _, err := os.Stat(filepath.Join(dstRoot, "Thumbs.db")); !os.IsNotExist(err) {
+		t.Fatalf("a globally excluded file was copied (stat err: %v)", err)
+	}
+	for _, want := range []string{"keep.txt", "sub/keep2.txt"} {
+		if _, err := os.Stat(filepath.Join(dstRoot, want)); err != nil {
+			t.Fatalf("%s was not copied: %v", want, err)
+		}
+	}
+}
+
+// The deletion-safety invariant, at global scope: an excluded path must be
+// invisible on BOTH sides. If a global rule prunes the source walk but is
+// missing from a destination's diff chain, that subtree looks "missing at the
+// source" and mirror deletes it — destroying exactly what the exclusion was
+// written to protect.
+func TestGloballyExcludedDestinationFilesAreNotDeleted(t *testing.T) {
+	h := newHarness(t, nil)
+	srcID, dstID, scope, srcRoot := previewFixture(t, h)
+	seedTree(t, srcRoot, map[string]int{"a.txt": 10})
+
+	// Present at the destination, absent from the source, and globally
+	// excluded. A mirror would remove it if the exclusion did not reach the
+	// diff chain.
+	dstRoot := filepath.Join(h.mountFor(t, dstID), scope)
+	seedTree(t, dstRoot, map[string]int{"a.txt": 10, "Thumbs.db": 4, "_ARCHIVE/old.bin": 32})
+
+	h.setGlobalFilters(t, []map[string]any{{
+		"source": "inline", "patterns": []string{"Thumbs.db", "_ARCHIVE/"},
+		"case_sensitive": false, "on_error": "fail_run",
+	}})
+
+	jobID := h.createJob(t, map[string]any{
+		"name":             uniqueName("global-nodelete"),
+		"source_target_id": srcID,
+		"source_subpath":   scope,
+		"mode":             string(store.ModeMirror),
+		"destinations":     []map[string]any{{"dest_target_id": dstID, "dest_subpath": scope}},
+	})
+
+	runID := h.runJob(t, jobID)
+	if run := h.awaitRun(t, runID, 60*time.Second); run["status"] != string(store.RunSuccess) {
+		t.Fatalf("run = %v: %v", run["status"], run)
+	}
+
+	for _, kept := range []string{"Thumbs.db", "_ARCHIVE/old.bin"} {
+		if _, err := os.Stat(filepath.Join(dstRoot, kept)); err != nil {
+			t.Fatalf("mirror deleted the globally excluded %q: %v", kept, err)
+		}
+	}
+}
+
+// A global rule that cannot be loaded must disable deletions for every job —
+// including one with no rules of its own. A dropped rule widens what the job
+// sees, and in mirror mode a widened view turns protected files into
+// extraneous ones.
+func TestBrokenGlobalRuleDisablesDeletionsEverywhere(t *testing.T) {
+	h := newHarness(t, nil)
+	srcID, dstID, scope, srcRoot := previewFixture(t, h)
+	seedTree(t, srcRoot, map[string]int{"a.txt": 10})
+
+	dstRoot := filepath.Join(h.mountFor(t, dstID), scope)
+	seedTree(t, dstRoot, map[string]int{"a.txt": 10, "extraneous.bin": 20})
+
+	// A list file that does not exist, tolerated rather than fatal.
+	h.setGlobalFilters(t, []map[string]any{{
+		"source": "listfile", "file_path": "/tmp/definitely-not-here.txt",
+		"case_sensitive": false, "on_error": "ignore_rule",
+	}})
+
+	jobID := h.createJob(t, map[string]any{
+		"name":             uniqueName("global-degraded"),
+		"source_target_id": srcID,
+		"source_subpath":   scope,
+		"mode":             string(store.ModeMirror),
+		"destinations":     []map[string]any{{"dest_target_id": dstID, "dest_subpath": scope}},
+	})
+
+	runID := h.runJob(t, jobID)
+	run := h.awaitRun(t, runID, 60*time.Second)
+
+	// The extraneous file must survive: deletions are off because the filter
+	// is narrower than configured.
+	if _, err := os.Stat(filepath.Join(dstRoot, "extraneous.bin")); err != nil {
+		t.Fatalf("a degraded global filter still allowed a deletion: %v", err)
+	}
+	if got := run["status"]; got != string(store.RunPartial) {
+		t.Fatalf("run = %v, want partial when a rule was dropped: %v", got, run)
+	}
+	if summary, _ := run["error_summary"].(string); summary == "" {
+		t.Fatal("the run does not say why it was partial")
+	}
+}
+
+// With no global rules, chains must be exactly what they were before globals
+// existed — otherwise every job in the suite starts exercising a different
+// code path than it did.
+func TestNoGlobalRulesLeavesBehaviourUnchanged(t *testing.T) {
+	h := newHarness(t, nil)
+	srcID, dstID, scope, srcRoot := previewFixture(t, h)
+	seedTree(t, srcRoot, map[string]int{"a.txt": 10, "Thumbs.db": 4})
+
+	h.setGlobalFilters(t, []map[string]any{}) // explicitly none
+
+	dstRoot := filepath.Join(h.mountFor(t, dstID), scope)
+	jobID := h.createJob(t, map[string]any{
+		"name":             uniqueName("no-globals"),
+		"source_target_id": srcID,
+		"source_subpath":   scope,
+		"mode":             string(store.ModeMirror),
+		"destinations":     []map[string]any{{"dest_target_id": dstID, "dest_subpath": scope}},
+	})
+
+	runID := h.runJob(t, jobID)
+	if run := h.awaitRun(t, runID, 60*time.Second); run["status"] != string(store.RunSuccess) {
+		t.Fatalf("run = %v", run["status"])
+	}
+	// Thumbs.db is copied, because nothing excludes it any more.
+	if _, err := os.Stat(filepath.Join(dstRoot, "Thumbs.db")); err != nil {
+		t.Fatalf("with no global rules the file should have been copied: %v", err)
+	}
+	assertSMBTreesMatch(t, srcRoot, dstRoot)
+}
+
+// A fresh install ships with the seeded defaults, so the noise is excluded
+// before anyone configures anything.
+func TestGlobalFiltersAreSeededOnAFreshInstall(t *testing.T) {
+	h := newHarness(t, nil)
+
+	status, body := h.do(http.MethodGet, "/api/settings/filters", nil)
+	if status != http.StatusOK {
+		t.Fatalf("GET global filters = %d: %v", status, body)
+	}
+	rules, _ := body["filters"].([]any)
+	if len(rules) == 0 {
+		t.Fatal("a fresh install has no seeded global filters")
+	}
+
+	var patterns []string
+	for _, raw := range rules {
+		m, _ := raw.(map[string]any)
+		for _, p := range m["patterns"].([]any) {
+			s, _ := p.(string)
+			patterns = append(patterns, s)
+		}
+	}
+	for _, want := range []string{".DS_Store", "Thumbs.db", "_ARCHIVE/"} {
+		if !slices.Contains(patterns, want) {
+			t.Fatalf("the seeded defaults do not exclude %q: %v", want, patterns)
+		}
+	}
+}

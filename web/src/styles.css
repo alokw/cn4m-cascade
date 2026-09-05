@@ -199,3 +199,63 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0
 .danger-btn { background: var(--err); color: #fff; }
 
 .modal.prompt { width: min(30rem, 100%); }
+
+/* Job editor */
+.tabs { display: flex; gap: 0.25rem; }
+.tabs .active { border-bottom: 2px solid var(--accent); color: var(--text); }
+
+h3 { font-size: 0.95rem; margin: 1rem 0 0.5rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+h4 { font-size: 0.9rem; margin: 0 0 0.4rem; }
+
+.card + .card { margin-top: 0.75rem; }
+
+textarea {
+  display: block;
+  width: 100%;
+  margin-top: 0.25rem;
+  padding: 0.5rem 0.6rem;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--text);
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  resize: vertical;
+}
+textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+input[type="number"] { width: 100%; }
+select { width: 100%; margin-top: 0.25rem; }
+
+.with-button { display: flex; gap: 0.4rem; align-items: center; }
+.with-button input { flex: 1; }
+
+.filter-rule { border-left: 3px solid var(--line); }
+.filter-rule.invalid { border-left-color: var(--err); }
+.rule-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.5rem; }
+
+.actions.sticky {
+  position: sticky;
+  bottom: 0;
+  background: var(--bg);
+  padding: 0.75rem 0;
+  border-top: 1px solid var(--line);
+  margin-top: 1rem;
+}
+
+.paths.picker li { padding: 0.2rem 0; }
+.paths.picker button { text-align: left; }
+
+table.counts { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin: 0.5rem 0; }
+table.counts th, table.counts td { text-align: left; padding: 0.3rem 0.5rem; border-bottom: 1px solid var(--line); }
+table.counts th { color: var(--muted); font-weight: 500; }
+
+/* A fieldset used only to disable a whole form while it saves. */
+fieldset.bare { border: 0; margin: 0; padding: 0; min-width: 0; }
+fieldset.bare[disabled] { opacity: 0.6; }
+
+/* Path lists scroll rather than pushing the rest of the confirm screen away:
+   a copy list can be thousands of rows, and the deletions below it are the
+   part that must stay reachable. About six rows tall. */
+.paths { max-height: 9rem; }

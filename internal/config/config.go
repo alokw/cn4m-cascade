@@ -14,7 +14,7 @@ import (
 
 // Config is the fully resolved runtime configuration.
 type Config struct {
-	ListenAddr string // LISTEN_ADDR, default ":8384"
+	ListenAddr string // LISTEN_ADDR, default ":2649"
 	DataDir    string // DATA_DIR, default "/data" — holds the SQLite database
 	MountRoot  string // MOUNT_ROOT, default "/mnt/smb"
 
@@ -45,7 +45,7 @@ const minKeyLen = 16
 // Load reads configuration from the environment.
 func Load() (*Config, error) {
 	c := &Config{
-		ListenAddr:     envStr("LISTEN_ADDR", ":8384"),
+		ListenAddr:     envStr("LISTEN_ADDR", ":2649"),
 		DataDir:        envStr("DATA_DIR", "/data"),
 		MountRoot:      envStr("MOUNT_ROOT", "/mnt/smb"),
 		EncryptionKey:  os.Getenv("ENCRYPTION_KEY"),

@@ -624,8 +624,19 @@ func (r *Runner) resolveDestination(ctx context.Context, h *handle, job *store.J
 	finalCtx := context.WithoutCancel(ctx)
 	destID := dest.DestTargetID
 
+	// Whether a missing folder may be made is its own setting, not a corner of
+	// the unreachable policy: a job set to skip unreachable destinations is
+	// expressing caution, and silently creating folders is the opposite of it.
+	//
+	// A preview creates nothing, ever, whatever the setting says. Planning is
+	// supposed to leave the destination exactly as it found it, and a
+	// directory is a write like any other; the folder is made when the plan is
+	// actually executed.
+	mayCreate := !h.preview && job.CreateDestDirs == store.CreateDirsAlways
+	mayAsk := !h.preview && job.CreateDestDirs == store.CreateDirsAsk
+
 	for {
-		root, dstStorage, release, err := r.resolve(ctx, dstTarget, dest.DestSubpath)
+		root, dstStorage, release, err := r.resolveWith(ctx, dstTarget, dest.DestSubpath, mayCreate)
 		if err == nil {
 			return root, dstStorage, release, nil
 		}
@@ -633,8 +644,31 @@ func (r *Runner) resolveDestination(ctx context.Context, h *handle, job *store.J
 		message := fmt.Sprintf("destination %s is unavailable: %v", dstTarget.Describe(), err)
 		policy := job.UnavailablePolicy
 
-		if policy == store.PolicyPrompt {
-			action, answered := r.askAboutDestination(ctx, h, job, run, destID, message, sink, log)
+		// A destination that resolved but whose folder is simply absent is a
+		// different question from one that is unreachable, and gets a
+		// different prompt: creating it is an option, retrying is not.
+		missingFolder := errors.Is(err, storage.ErrPathNotExist)
+		// Creating is not on offer during a preview, or when the job says
+		// never, so the prompt must not advertise it — an answer the run will
+		// refuse to honour is worse than not offering it.
+		canCreate := missingFolder && mayAsk
+
+		// A missing folder asks even when the job would not otherwise prompt
+		// about an unreachable destination: they are different questions.
+		asking := policy == store.PolicyPrompt || canCreate
+		if missingFolder {
+			switch {
+			case h.preview:
+				message = fmt.Sprintf(
+					"the destination folder does not exist yet and a preview creates nothing; "+
+						"it will be made when the job actually runs: %v", err)
+			case canCreate:
+				message = fmt.Sprintf("the destination folder does not exist yet: %v", err)
+			}
+		}
+
+		if asking {
+			action, answered := r.askAboutDestination(ctx, h, job, run, destID, message, canCreate, sink, log)
 			if ctx.Err() != nil {
 				h.progress.setStatus(destID, store.DestCancelled)
 				return "", nil, nil, &destOutcome{targetID: destID, status: store.DestCancelled}
@@ -643,6 +677,26 @@ func (r *Runner) resolveDestination(ctx context.Context, h *handle, job *store.J
 			case PromptRetry:
 				sink(engine.Event{Level: store.LevelInfo, Message: "retrying the destination at your request"})
 				continue
+			case PromptCreate:
+				if !canCreate {
+					// Nothing to create: the destination is unreachable, not
+					// empty. Treat it as a retry rather than pretending.
+					sink(engine.Event{Level: store.LevelWarn,
+						Message: "there is no folder to create here — the destination could not be reached at all; retrying"})
+					continue
+				}
+				sink(engine.Event{Level: store.LevelInfo, Message: fmt.Sprintf(
+					"creating the destination folder at your request: %s", dest.DestSubpath)})
+				// One pass with creation allowed, then round the loop to
+				// resolve it normally.
+				root, dstStorage, release, createErr := r.resolveWith(ctx, dstTarget, dest.DestSubpath, true)
+				if createErr == nil {
+					return root, dstStorage, release, nil
+				}
+				sink(engine.Event{Level: store.LevelError, Message: fmt.Sprintf(
+					"could not create the destination folder: %v", createErr)})
+				policy = store.PolicySkip
+				message = fmt.Sprintf("the destination folder could not be created: %v", createErr)
 			case PromptAbort:
 				policy = store.PolicyAbort
 			default:
@@ -680,14 +734,14 @@ func (r *Runner) resolveDestination(ctx context.Context, h *handle, job *store.J
 // askAboutDestination parks one destination and waits for a human. The run
 // stays running and its other destinations carry on: only the one that cannot
 // be reached waits.
-func (r *Runner) askAboutDestination(ctx context.Context, h *handle, job *store.Job, run *store.Run, destID, message string, sink engine.EventSink, log *slog.Logger) (PromptAction, bool) {
+func (r *Runner) askAboutDestination(ctx context.Context, h *handle, job *store.Job, run *store.Run, destID, message string, canCreate bool, sink engine.EventSink, log *slog.Logger) (PromptAction, bool) {
 	finalCtx := context.WithoutCancel(ctx)
 	timeout := time.Duration(job.PromptTimeoutSec) * time.Second
 	deadline := time.Now().Add(timeout)
 
 	ch := h.gate.open(destID)
 	h.progress.setStatus(destID, store.DestAwaitingPrompt)
-	h.progress.setPrompt(destID, deadline, message)
+	h.progress.setPrompt(destID, deadline, message, canCreate)
 	if err := r.db.SetRunDestinationStatus(finalCtx, run.ID, destID, store.DestAwaitingPrompt); err != nil {
 		log.Error("could not record a waiting destination", "dest_target_id", destID, "error", err)
 	}
@@ -838,7 +892,14 @@ func prunedSuffix(scan *engine.ScanResult) string {
 }
 
 // resolve mounts a target and returns its root plus a release function.
+// resolve resolves the source, which is never created: a missing source is a
+// misconfiguration, and inventing one turns a typo into a run that copies
+// nothing and calls itself a success. Only resolveDestination passes create.
 func (r *Runner) resolve(ctx context.Context, target *store.Target, subpath string) (string, storage.Storage, func(), error) {
+	return r.resolveWith(ctx, target, subpath, false)
+}
+
+func (r *Runner) resolveWith(ctx context.Context, target *store.Target, subpath string, create bool) (string, storage.Storage, func(), error) {
 	// The subpath is applied per job, so a copy of the target carries it
 	// without mutating the stored record.
 	scoped := *target
@@ -847,6 +908,11 @@ func (r *Runner) resolve(ctx context.Context, target *store.Target, subpath stri
 	st, err := r.provider.For(&scoped)
 	if err != nil {
 		return "", nil, nil, err
+	}
+	if create {
+		if c, ok := st.(storage.CreateSubpath); ok {
+			c.AllowCreate()
+		}
 	}
 	root, err := st.Resolve(ctx)
 	if err != nil {

@@ -130,6 +130,11 @@ export function ConfirmPlan({ runID, jobID, plans, confirmDeadline, targets, onC
             {detail && (
               <>
                 <PathList
+                  title="Will be copied"
+                  items={detail.copies}
+                  total={plan.copies}
+                />
+                <PathList
                   title="Will be deleted"
                   items={detail.deletes}
                   total={plan.deletes}
@@ -229,6 +234,7 @@ function PathList({
           <li key={a.relpath}>
             <code>{a.relpath}</code>
             {a.size ? <span className="muted"> {bytes(a.size)}</span> : null}
+            {a.overwrite ? <span className="warn"> overwrites</span> : null}
           </li>
         ))}
       </ul>

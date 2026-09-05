@@ -1,5 +1,6 @@
 import type {
   BrowseResult,
+  FilterTestResult,
   Job,
   JobPayload,
   MountErrorKind,
@@ -9,6 +10,9 @@ import type {
   RunEvent,
   RunPlan,
   SessionState,
+  FilterFileCheck,
+  GlobalFilterPayload,
+  GlobalFilterRule,
   Target,
   TargetPayload,
   TestResult,
@@ -124,6 +128,9 @@ export const api = {
     update: (id: string, payload: JobPayload) => patch<Job>(`/api/jobs/${id}`, payload),
     remove: (id: string) => del(`/api/jobs/${id}`),
     run: (id: string, preview = false) => post<Run>(`/api/jobs/${id}/run`, { preview }),
+    /** Tests the SAVED job's rules — unsaved edits are not visible to it. */
+    filterTest: (id: string, sampleLimit?: number) =>
+      post<FilterTestResult>(`/api/jobs/${id}/filter-test`, { sample_limit: sampleLimit ?? 0 }),
     confirm: (id: string) => post<{ status: string; run_id: string }>(`/api/jobs/${id}/confirm`),
   },
 
@@ -152,6 +159,22 @@ export const api = {
     limit?: number
     offset?: number
   } = {}) => get<{ events: RunEvent[] }>(`/api/logs${query(params)}`).then((r) => r.events ?? []),
+
+  /** Advisory: does a rule's list/JSON file exist yet? Never blocks a save —
+   *  a rule file is read at run time, so configuring a job before the file
+   *  exists is legitimate. */
+  checkFilterFile: (filePath: string) =>
+    post<FilterFileCheck>('/api/filters/check-file', { file_path: filePath }),
+
+  globalFilters: {
+    list: () =>
+      get<{ filters: GlobalFilterRule[] }>('/api/settings/filters').then((r) => r.filters ?? []),
+    /** Replaces the whole set; array order is evaluation order. */
+    replace: (filters: GlobalFilterPayload[]) =>
+      request<{ filters: GlobalFilterRule[] }>('PUT', '/api/settings/filters', { filters }).then(
+        (r) => r.filters ?? [],
+      ),
+  },
 
   browse: (targetId: string, path = '') =>
     get<BrowseResult>(`/api/browse${query({ target_id: targetId, path })}`),

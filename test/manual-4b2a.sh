@@ -15,7 +15,7 @@
 # destination subpath is written to for real.
 set -uo pipefail
 
-BASE="${SMBSYNC_BASE:-http://localhost:8384}"
+BASE="${SMBSYNC_BASE:-http://localhost:2649}"
 COOKIES="$(mktemp)"
 MODE="${1:-}"
 DEST="${2:-}"

@@ -2,7 +2,10 @@ import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 import { AuthProvider, useAuth } from './auth'
 import { EventsProvider, useEvents } from './hooks/useEvents'
 import { SignIn } from './screens/SignIn'
+import { JobEditor } from './screens/JobEditor'
+import { Jobs } from './screens/Jobs'
 import { RunDetail } from './screens/RunDetail'
+import { Settings } from './screens/Settings'
 import { Runs } from './screens/Runs'
 import { Targets } from './screens/Targets'
 
@@ -30,8 +33,10 @@ function Shell() {
       <header>
         <span className="brand">SMB Sync</span>
         <nav>
+          <NavLink to="/jobs">Jobs</NavLink>
           <NavLink to="/targets">Targets</NavLink>
           <NavLink to="/runs">Runs</NavLink>
+          <NavLink to="/settings">Settings</NavLink>
         </nav>
         <FeedIndicator />
         <button className="link" onClick={() => void signOut()}>
@@ -41,11 +46,15 @@ function Shell() {
 
       <main>
         <Routes>
+          <Route path="/jobs" element={<Jobs />} />
+          <Route path="/jobs/new" element={<JobEditor />} />
+          <Route path="/jobs/:id" element={<JobEditor />} />
           <Route path="/targets" element={<Targets />} />
           <Route path="/runs" element={<Runs />} />
           <Route path="/runs/:id" element={<RunDetail />} />
-          {/* Dashboard, job editor and logs arrive in 4b-2b. */}
-          <Route path="*" element={<Navigate to="/targets" replace />} />
+          <Route path="/settings" element={<Settings />} />
+          {/* Dashboard and logs arrive in 4b-2b-ii. */}
+          <Route path="*" element={<Navigate to="/jobs" replace />} />
         </Routes>
       </main>
     </div>

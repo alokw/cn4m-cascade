@@ -2,10 +2,15 @@
 
 Living handoff doc. Update at the end of every session (CLAUDE.md → Workflow).
 
-**Current phase:** Phase 4b-2b — dashboard, job editor + Filters tab, logs. **Start in plan mode.**
-**Phase 4b-2a:** ✅ Code complete — the plan endpoint, withheld deletion counts, the browse cap, the
-filter-test status split, and run detail with the prompt modal and confirm screen. **Pending the
-fresh-context review and a manual browser pass.** See §0-4b2a.
+**Current phase:** Phase 4b-2b-ii — dashboard and logs. **Start in plan mode.**
+**Phase 4b-2b-i:** ✅ Code complete — jobs list, job editor with Settings and Filters tabs, path
+picker, filter-test rendering. Review done (§5h, ten findings). **Pending a manual browser pass.**
+See §0-4b2bi.
+**Phase 4b-2a:** ✅ **Complete.** The plan endpoint, withheld deletion counts, the browse cap, the
+filter-test status split, and run detail with the prompt modal and confirm screen. The fresh-context
+review is done (§5f, nine findings, seven fixed) and the manual browser pass is done (§5g, which
+found three more). Four of five exit criteria confirmed; the WebSocket-fallback one is honestly
+marked unverifiable by hand. See §0-4b2a.
 **Phase 4b-1:** ✅ **Complete.** All four exit criteria pass — the two HTTP-layer ones by test, the
 two screen ones by a manual browser pass the user confirmed on 2026-09-02. The fresh-context review
 is done (§5e; eight findings fixed, including a `.gitignore` regression I introduced). Vite/React/TS
@@ -21,7 +26,76 @@ fresh-context review is done (it found five more paths to data loss, all filter-
 **Phase 2:** ✅ Complete — all exit criteria met, the fresh-context review is done (it found seven
 data-loss bugs, all fixed with regression tests — §5b), and the bounded-I/O hard rule is satisfied.
 **Phase 1:** ✅ Complete (record retained below).
-**Last updated:** 2026-09-02 (Phase 4b-2a code complete; review pending)
+**Last updated:** 2026-09-02 (Phase 4b-2b-i code complete; review done, manual pass pending)
+
+---
+
+## 0-4b2bi. Phase 4b-2b-i status — jobs, the editor and filters
+
+Jobs can now be created, edited and run entirely by clicking. 4b-2b-ii is the dashboard and logs.
+
+### Built
+| Area | Contents |
+|---|---|
+| `web/src/screens/Jobs.tsx` | jobs list with run / preview / edit / delete |
+| `web/src/screens/JobEditor.tsx` | Settings and Filters tabs, client-side guards, per-rule error attribution, filter-test report |
+| `web/src/components/FilterRuleRow.tsx` | one rule: direction, scope, source and the fields each source requires |
+| `web/src/components/PathPicker.tsx` | first consumer of `/api/browse`, surfacing truncation |
+| `web/src/api/types.ts` | **`toJobPayload`** and payload-shaped nested types; filter-test types; `RunEvent.id` corrected to a number |
+| `internal/store/jobs.go`, `internal/api/jobs.go` | job deletion actually works (D-73) |
+
+### The bug this phase existed to catch (D-71)
+`decodeJSON` sets `DisallowUnknownFields`, and a `Job` from `GET /api/jobs/{id}` carries
+`id`/`created_at`/`updated_at` **plus** `id`/`job_id`/`position` on every destination and filter
+rule. `JobPayload` stripped only the three top-level fields, so **an editor that loaded a job and
+saved it unchanged would have returned 400**. `toJobPayload()` projects to exactly the accepted
+shape. `TestJobFetchMustBeProjectedBeforePatching` pins **both** directions — verbatim must 400,
+projected must 200 — because only asserting the happy path would let someone "fix" a future 400 by
+removing `DisallowUnknownFields`, which is what stops a misspelled field being silently ignored.
+
+### Exit criteria (SPEC.md §11)
+| Criterion | Status |
+|---|---|
+| A job is created, edited and run entirely from the UI | ⏳ manual pass |
+| A fetched job round-trips through save without a 400 | ✅ `TestJobFetchMustBeProjectedBeforePatching`, verified to fail against the old shape |
+| A filter rule changes what `filter-test` reports, then what a run copies | ⏳ manual pass; the data path was verified by hand against a live server |
+| A per-rule validation error highlights the offending row | ⏳ manual pass; the message format was verified (`filter rule 1: ...`) |
+| Editing a job with a parked preview is refused legibly | ✅ `TestJobCannotBeEditedWhileAPreviewIsParked` (4b-1) |
+
+### Verification (CLAUDE.md → Definition of done)
+| Gate | Result |
+|---|---|
+| `go vet -tags=integration ./...` | ✅ clean |
+| `golangci-lint run` | ✅ `0 issues.` |
+| `npm run lint` / `npm run build` | ✅ clean; 283 kB / 89 kB gzipped |
+| Unit tests under `-race` | ✅ all `ok` |
+| Integration under `-race` | ✅ **68 PASS / 0 FAIL, `ok ... 422.975s`** — re-run clean after the §5i review fixes. *Before them:* `412.886s` — after the mounter bound (D-80), global exclusions (D-82) and the rule-file check (D-85). *Earlier this phase:* **63 PASS / 0 FAIL, `ok ... 429.702s`** (53 before this phase, 10 new; 1 SKIP is `TestScaleMirror`). Includes the folder-creation work of D-75 to D-77 and migration `0005` |
+| Fresh-context subagent review | ✅ Done — §5h, ten findings, all fixed |
+| Manual browser pass | ⛔ not done — open item 1 |
+
+### Open items
+1. **No manual browser pass yet.** `test/manual-4b2a.sh` is **deliberately not deleted yet**, despite
+   §6 saying it becomes redundant when the editor lands — it is the fallback if the editor turns out
+   to be broken. Delete it once the pass succeeds.
+2. `ruleErrors` is keyed by array index and cleared only on save, so removing a row moves the red
+   border to a different rule until the next save.
+3. Clearing a number input yields `Number("") === 0`, which the server silently rewrites to a
+   default (workers → 4, prompt timeout → 600) rather than rejecting.
+4. Invalid glob patterns are not compiled at save time, so a broken pattern surfaces only on "Test
+   filters" or as a failed run.
+5. Pressing Enter in a text input submits the form. Not destructive — `localProblem()` runs first —
+   but surprising on the Filters tab.
+6. **The seeded global exclusions reach existing installs and are absolute.** 34 filename patterns
+   and 2 folder patterns are inserted by migration `0006`, including ordinary-looking names
+   (`ada.jpg`, `george.jpg`, `assets.json`, `ROBOCOPY.RCJ`, `videoin_1..16.mov`). A job syncing a
+   real file by one of those names silently stops updating it — no deletion, but a stale destination
+   copy with no signal. `TestGlobalFiltersAreSeededOnAFreshInstall` pins only 3 of the 36. Either
+   narrow the seed, pin all of it, or accept it knowingly.
+7. ~~A filter rule pointing at a nonexistent list file saves without complaint.~~ **Done** — D-85.
+   *Original:* **A filter rule pointing at a nonexistent list file saves without complaint** and only fails when
+   "Test filters" is pressed or the run fails. SPEC.md §6.5 asks for save-time validation; the agreed
+   resolution is to *warn* rather than block, so a job can still be configured before its rule file
+   exists. Not built yet — see the global-filters work.
 
 ---
 
@@ -77,17 +151,15 @@ rather than 404 — the UI closes a stale confirm tab on that, and it should not
 | `golangci-lint run` | ✅ `0 issues.` |
 | `npm run lint` / `npm run build` | ✅ clean; 257 kB / 82 kB gzipped |
 | Unit tests under `-race` | ✅ all `ok` |
-| Integration under `-race` | ✅ **53 PASS / 0 FAIL, `ok ... 345.548s`** (49 before this phase, 4 new; 1 SKIP is `TestScaleMirror`). Re-run clean after the §5f fixes. Unit tests now include `internal/runner`, which had no test files before |
+| Integration under `-race` | ✅ **53 PASS / 0 FAIL, `ok ... 349.823s`** (49 before this phase, 4 new; 1 SKIP is `TestScaleMirror`). Unit tests now include `internal/runner`, which had no test files before. One run in between hung on the `TestDestinationDisappearsMidRun` flake (§6 item 15) — harness, not product: identical Go code passed before and after, and the intervening changes were frontend-only |
+| Manual browser pass | ✅ Done by the user 2026-09-02 — found three UI bugs (§5g), all fixed |
 | Fresh-context subagent review | ✅ Done — see §5f. Nine findings, seven fixed |
-| Manual browser pass | ⛔ not done — open item 1 |
 
 ### Open items
-1. **No manual browser pass yet.** The confirm screen, prompt modal and run detail have never been
-   rendered; only their data paths are tested. **`test/manual-4b2a.sh` sets up both runs** —
-   there is no job editor until 4b-2b, so a job cannot be made by clicking. The script creates a
-   throwaway local source, points a mirror job at a scratch subpath you name, and prints the run
-   URL. Verified end to end against the harness: the preview parks, the plan endpoint names the
-   extraneous files individually, and the counts match the lists.
+1. ~~No manual browser pass yet.~~ **Done 2026-09-02** — see §5g. `test/manual-4b2a.sh` set both
+   runs up, because there is no job editor until 4b-2b and a job cannot be made by clicking. **That
+   script becomes redundant the moment 4b-2b lands and should be deleted then**, rather than left to
+   rot as a second, diverging way to create jobs.
 2. `Runs.tsx` is a placeholder front door for run detail. 4b-2b's dashboard replaces it.
 3. The confirm screen fetches the plan once when it opens. If a destination is still being planned
    at that moment the list is short by one destination; there is no refetch. Harmless for a preview
@@ -581,6 +653,21 @@ D-1…D-13 were approved 2026-08-31 before implementation; D-14…D-17 came out 
 | D-57 | `Run.Terminal()` enumerates terminal statuses instead of `!= running`, and `Active()` was added | `awaiting_confirmation` is neither running nor finished. The old form would have called a parked run done |
 | D-58 | A confirmed preview executes the **held** plan, not a fresh diff | The user agreed to a specific set of changes; re-diffing could execute something they never saw. The cost is that the plan is a snapshot, which the executor already tolerates (a file that vanished is a normal event). **Amended by the §5d review:** that reasoning covers copies but not deletes, which are not undoable — see §6 Phase 4a item 8. The trade-off stands; the exposure is now documented in the README and needs a shorter hold or a re-check on confirm |
 | D-59 | **Preview mode moved from Phase 6 to Phase 4, in SPEC.md §11** | §11 assigned it to Phase 6 by name while §6.1/§8/§9 all specified it as part of the run pipeline and job editor — a contradiction in the spec. Resolved toward Phase 4 because the preview gate's only interface is the run-detail screen; building it apart from that screen means building it twice. Recorded in the spec, not just here, so the contradiction cannot be rediscovered. §11 Phase 4 also gained the exit criteria it never had |
+| D-82 | **Global exclusions live in their own table, are exclude-only, and are absolute** | Requested 2026-09-04. SPEC.md §6.5 had no notion of a global rule, so §6.5 and §7 are amended rather than silently extended. Three constraints, each narrowing scope deliberately: **exclude-only**, because includes are OR'd and a global include would *widen* every job (global `*.txt` + job `*.jpg` admits both); **absolute**, because making a job's include beat a global exclude means rewriting `filter.Chain.decide` — the code guaranteeing `PrunesDir` and `Admits` agree, which is what stops a mirror deleting a subtree one side cannot see; and **its own table**, because `filter_rules` is wholly owned by its job (`UpdateJob` deletes every row for it) and globals must survive that. I initially told the user a job include *could* override a global, and corrected it before building on the mistake |
+| D-83 | **The `len(job.Filters) == 0` early return was the most dangerous line in the global-filters change** | A job with no rules of its own would have skipped the compile loop, and with it the degradation a broken global rule must cause — running a mirror with deletions enabled against a filter narrower than configured. Most jobs have no rules, so that was the common case, not an edge. `TestBrokenGlobalRuleDisablesDeletionsEverywhere` verified against the old code reported an actually-deleted file, not a technicality. Globals also had to reach the **prune chain** as well as each destination's diff chain: pruning the source without excluding at the destination makes a subtree look "missing at the source", which is how a mirror removes what the exclusion existed to protect |
+| D-84 | **Global rules are numbered separately from a job's own in errors** | "global filter rule N" vs "filter rule N", independently numbered. The job editor highlights a row from that number; a shared sequence would point at the wrong rule, or at one the editor cannot display |
+| D-85 | **A rule file's existence is checked advisorily, never blocking a save** | Rule files are read at the start of every run, not snapshotted (SPEC.md §6.5), so configuring a job before its file exists is legitimate. `POST /api/filters/check-file` stats rather than reads — a rule file can be large and this is an existence question — and reports `checked: false` for a `target://` path rather than mounting a share to answer a form field. "Not checked" and "checked and missing" must not look the same |
+| D-80 | **`mount.cifs`/`umount` are bounded at the caller, not by `exec.CommandContext`** | The "flaky" `TestDestinationDisappearsMidRun` was never a test problem. The `-timeout 15m` added to `make test-integration` finally produced a goroutine dump: `Manager.Shutdown` parked **nine minutes** in `syscall.forkExec`, under `forceUnmount`, unmounting a share whose server had gone. `exec.CommandContext`'s watchdog only arms *after* `Start` returns, and fork/exec itself blocks in a process whose threads are parked in uninterruptible CIFS syscalls — **which §6 Phase 3 item 7 already documented, having hit and fixed exactly this in *test* code.** The production mounter never got the same treatment. It violated CLAUDE.md ("nothing may hang forever when a share dies"), SPEC.md §10's graceful shutdown, and `manager.go:573`'s own comment promising Shutdown "never blocks on a dead server". Both `Mount` and `Unmount` now run on their own goroutine with a `select` on ctx, the `engine.bounded` shape. The deadlines already existed in `forceUnmount`; they simply were not enforceable |
+| D-81 | **A command abandoned on its deadline must not have its output buffers read** | Two data races written while fixing D-80, both caught by `-race` before they landed. First `cmd.Process.Kill()` on the timeout path, which races the `Start` writing that field — and was pointless, since `CommandContext` reaps the process once Start returns and a stalled fork has no process to kill. Then `Unmount` reading `stderr.String()` after abandoning the command, racing the command still writing into it. An `errTimedOut`/`abandoned(err)` pair now gates every buffer read. Worth recording because it is the *same class of error as the bug being fixed*: assuming something you stopped waiting for has stopped running |
+| D-78 | **The web UI listens on 2649** | Requested by the user 2026-09-04. `LISTEN_ADDR` default, the compose port mapping, the Vite dev proxy, both test scripts and the docs all moved together; PROGRESS keeps its historical references to 8384 so older entries still read correctly |
+| D-79 | **Targets and jobs can be duplicated, and a target can be tested without closing its modal** | Many targets differ only by address, and many jobs only by one destination — retyping a filter set to change an IP is the kind of friction that produces mistakes. A duplicated target does **not** copy the password (there is nothing to copy: the API never returns it), and a duplicated job is created and opened in the editor rather than saved silently, because the thing being changed is whatever makes it a different job. "Save and test" saves first by necessity — the API only tests a target it already knows about — which is safe for a flat target record in a way it would not be for a job, whose PATCH deletes and reinserts its children |
+| D-75 | **Creating a missing destination folder is its own job setting, `create_dest_dirs` (ask/always/never), defaulting to `ask`** | First built as a corner of `unavailable_policy`, which was wrong: "the destination is unreachable" and "the folder does not exist yet" are different questions, and a job set to *skip* unreachable destinations is expressing caution — silently creating folders is the opposite of it. The user hit exactly that: a run auto-created a folder with no prompt because the job's policy was the default `skip`. Migration `0005` adds the column with `DEFAULT 'ask'`, so existing jobs get the confirmation too. An unanswered prompt skips the destination, so an unattended run never invents a folder from a typo |
+| D-76 | **A preview creates nothing, whatever `create_dest_dirs` says** | Auto-creating at resolve time made `planOneDestination` — documented "It writes nothing" — write, so a preview would have created a directory before the plan was ever shown, breaking the "nothing has been written yet" promise on the confirm screen. `mayCreate` is gated on `!h.preview`, and the prompt does not offer Create during a preview either: an answer the run would refuse to honour is worse than not offering it. `TestPreviewDoesNotCreateTheDestinationFolder` was verified to fail against the broken version |
+| D-77 | **`storage.ErrPathNotExist` distinguishes absent from unreachable** | `statBounded` collapsed a missing path into a plain `errors.New("does not exist")`, discarding the sentinel, so nothing downstream could tell "the folder is not there" from "the NAS is down" — which want opposite responses. Found while wiring folder creation; the local path was also reporting a missing *subpath* using the target's own root, so a job with a wrong subpath read as a broken target that had tested green seconds earlier |
+| D-71 | **`toJobPayload()` projects a fetched job to exactly what the API accepts** | `DisallowUnknownFields` means a `Job` cannot be handed back verbatim: it carries server-owned fields on the job *and* on every nested destination and filter rule. The committed `JobPayload` stripped only the top-level three, so loading and saving a job unchanged would have 400ed. The nested payload types are separate from the response types rather than derived from them, because deriving is exactly how the nested fields were missed |
+| D-72 | **The Filters tab's Test button is disabled while anything the test reads is unsaved** | `filter-test` loads rules from the database and never reads the request body, so unsaved edits cannot be tested. Auto-saving was rejected: PATCH is a full replace that re-mints every rule ID, and mid-edit is the wrong moment for it. The dirty check covers the source and destinations too, not just the rules — `runner.FilterTest` scans the *saved* source subpath, so a changed source would produce a report on a different tree presented as validation of these rules |
+| D-73 | **Deleting a job deletes its run history, and is refused while it is running** | `runs.job_id` references `jobs(id)` **without** `ON DELETE CASCADE`, unlike every other child table, so deleting any job that had ever run failed with a raw `FOREIGN KEY constraint failed (787)` shown to the user verbatim — the feature was broken for exactly the jobs anyone would want to delete. Deleting the runs beats refusing: a job nobody can delete because it once ran is worse, and an orphaned run is a log entry pointing at a job that no longer exists. `run_destinations` and `run_events` already cascade from `runs`. Delete now also refuses while a run is active, matching PATCH — the runner holds the job in memory and the history being deleted is still being written. `TestDeletingAJobRemovesItsRunHistory` was verified to fail against the old code with the exact FK error |
+| D-74 | **A jobs index screen exists, which SPEC.md §9 does not list** | §9 puts job cards on the Dashboard and names no separate jobs page. A list is needed as the editor's entry point before the dashboard exists (4b-2b-ii), and it remains the natural home for edit/delete, which do not belong on a dashboard card. Recorded rather than left as a silent deviation; §9 should gain it if it stays |
 | D-70 | **A host folder is shared into the container as `/mnt/local` by default** | Requested by the user 2026-09-02: local folders are a common source, and telling people to find a path that exists *inside* a container is a bad first experience. `~/cn4m` (`%USERPROFILE%\cn4m` on Windows) is created by `make harness-up` and mounted at `/mnt/local`, so the answer to "what do I type?" is always the same string regardless of platform. Overridable with `CN4M_LOCAL_DIR` in the shell or a `.env`. Cross-platform via Compose's nested defaults, `${CN4M_LOCAL_DIR:-${HOME:-${USERPROFILE:-/tmp}}/cn4m}` — verified that an unset `HOME` falls through to `USERPROFILE`, which is the Windows case. **Verified end to end**: a file written on the host in `~/cn4m` synced to an SMB share with `run: success`. The production compose of SPEC.md §10 should mirror this when it is built |
 | D-68 | **The plan's per-path detail is its own endpoint, not a field on the progress payload** | `RunSnapshot.plans` is broadcast to every WebSocket client once a second, and `setPlan` runs for every destination of every run, not just previews. Inlining delete paths would have put a path list on every tick of every run. `GET /api/runs/{id}/plan` is fetched once, when the confirm screen opens. It reads live runner state — nothing persists a plan — so a finished run is **409 `no_plan`**, distinct from a 404, because a stale confirm tab hitting it is an ordinary race and must not read as a failure |
 | D-69 | **`Unblock` removals are reported separately from deletions, and withheld deletions keep their count** | Two traps found while tracing the deletion path. (1) `plan.Deletes` counts only the trailing delete pass, but the type-conflict clears appended earlier are *also* `ActionDelete`; filtering `Actions` by kind alone would list more rows than the number printed beside them, so they are surfaced as `replaces` — shown, because they destroy data, but not conflated. (2) The guard does `deletes, rmdirs = nil, nil` after setting a bool, destroying the count along with the actions; `WithheldDeletes`/`WithheldRmDirs` are now captured first, so the UI can say "refusing to delete 2 files" instead of a bare "deletions blocked". The actions themselves stay discarded — a blocked deletion must not be one bug away from executing |
@@ -811,6 +898,66 @@ what the API returns.
 None of these was reachable from the API tests: the endpoints were correct in all three cases. They
 are the argument for the manual pass being a real gate rather than a formality.
 
+## 5h. Phase 4b-2b-i review — findings and resolution
+
+A fresh-context subagent reviewed the job editor — the most destructive configuration surface in the
+product, since PATCH deletes and reinserts every destination and filter rule.
+
+**Clean, each verified rather than assumed:** the client-side overlap guard was differential-tested
+against the real Go `overlaps()` over 17 cases and has **no false positives**, so it never blocks a
+legal job; the filter-test report keys by `rule_id` and never zips arrays by index; `toJobPayload`
+emits *precisely* the 17 + 2 + 9 fields the three payload structs declare, with `compare_tolerance_sec`
+correct; no building ahead; no credentials; and the round-trip test is genuine, not vacuous.
+
+### Fixed
+
+| # | Finding | Fix |
+|---|---|---|
+| P0-1 | **Typing multi-line patterns silently concatenated them.** The textarea's value was the *parsed* array joined back, while `onChange` stripped blank lines — so pressing Enter at the end of a line produced text that parsed to the same array, React re-asserted the old DOM value, and the newline was erased as it was typed. `*.tmp` then Enter then `cache/` became the single pattern `*.tmpcache/`, which matches nothing: **both intended exclusions silently stop protecting anything, and in mirror mode their files become extraneous**. Pasting worked, so any paste-based test would have missed it | the textarea owns its raw text; patterns are derived on change. The reasoning is in a comment at the component, because the naive version looks correct |
+| P0-2 | **A failed job load left an editable blank form bound to a real job id.** `loading` went false in `finally`, so a transient GET failure rendered `BLANK` — one empty destination, no filters — under the real id. Filling in a name and saving would PATCH every destination and filter rule out of existence | the form is not rendered at all when the load failed, with an explanation and a retry |
+| P0-3 | **Deleting a job that had ever run failed with a raw FK error** — see D-73. Broken for every job worth deleting, and the message was `constraint failed: FOREIGN KEY constraint failed (787)` | history deleted with the job, in a transaction; delete refused while running; two regression tests, one verified to fail against the old code |
+| P1-4 | **The delete-policy control was mislabelled "If deletions fail"** — it governs the opposite: what happens to deletions when *copies* fail. The one setting deciding whether a partially-failed mirror still deletes described a different condition | relabelled "If some files could not be copied", options reworded, with a note on why deleting after a failed copy is dangerous |
+| P1-5 | **A target-scoped rule could display one destination and mean another.** With no placeholder option, a `scope_target_id` no longer among the destinations made the browser select the first entry without firing a change event. The server rejected it, but with a message shaped `filter rule N is scoped to...` — **no colon** — which the error parser did not match, so the row was not highlighted and the user saw a raw target id | placeholder option, an inline warning when the scope target is stale, and the parser accepts both message shapes |
+| P1-6 | **The Test button ignored source and destination changes** — see D-72 |
+| P1-7 | **Switching between job ids did not re-enter the loading state**, so `/jobs/A` → `/jobs/B` showed A's populated form under B's id, and a save in that window wrote A's settings onto B. Same for `/jobs/:id` → `/jobs/new`, which arrived pre-filled | the effect resets state per id and ignores a response that arrives after the id changed |
+| P2-8 | A save overwrote the form with the server's response, discarding anything typed while it was in flight | the form is disabled while saving |
+| P2-9 | A `targets.list()` failure was swallowed, leaving every dropdown reading "Choose…" with no explanation | surfaced |
+| P2-10 | PROGRESS had no section or decisions for this sub-phase, and the jobs index screen is not in SPEC §9 | this section, D-71 to D-74 |
+
+Three of these — P0-1, P0-2 and P1-5 — are the same shape: **a control that displays one thing and
+means another**. In a form whose save is a full replace, that is the failure mode worth hunting.
+
+## 5i. Review of the mounter bound, global filters and the rule-file check
+
+A fresh-context subagent reviewed all three. **The four properties that could destroy data were each
+traced and confirmed correct**, which is the result that mattered: globals reach both the prune chain
+and every destination's diff chain (so the two sides agree and no subtree looks "missing at the
+source"); the early return no longer skips globals; a broken global degrades every chain including
+the prune chain; and the exclude-only, job-wide projection cannot be subverted — there is no field,
+column or payload key by which a global could become an include or target-scoped.
+
+Nine further findings, eight fixed.
+
+| # | Finding | Fix |
+|---|---|---|
+| P0-1 | **My own fix was incomplete.** Every `mount`/`umount` call is bounded, but `Shutdown` loops targets serially and never checked its *own* deadline: three dead mounts × 15s exceeds the 30s shutdown budget, so the process is SIGKILLed mid-cleanup — the same SPEC.md §10 promise D-80 restored, one level up | `ctx.Err()` checked each iteration; the remainder is left to the kernel, which is what a lazy detach hands it anyway |
+| P1-2 | **`create_dest_dirs` and the Create prompt shipped with no SPEC amendment**, while global filters in the same diff got one. Same rule, inconsistent treatment | §6.1 and §7 amended |
+| P1-3 | **The rule-file check contradicted its own doc comment and D-85**, returning `checked: true, exists: false` for *any* error — a timeout or `EACCES` asserted the file was missing | non-`ErrNotExist` failures now report `checked: false` |
+| P1-4 | **The Settings screen warned about the safe direction only.** Adding an exclusion cannot delete; **removing** one can — a path that stops being excluded becomes visible, and if it is at a destination but not the source, the next mirror removes it | an explicit warning plus a confirmation naming that consequence |
+| P1-5 | **Store failures were reported as `400 invalid_filter` with a raw Go error**, so `SQLITE_BUSY` read as "your payload is wrong: database is locked" | validation moved ahead of the store; a 400 now means the payload, a 500 means us |
+| P2-6 | An empty *global* rule file disarms every job at once, but logged at warn like a single job's | error level for globals |
+| P2-8 | No unit coverage for the global-filter store | `internal/store/global_filters_test.go`, including that a rejected replace leaves the set untouched |
+| P2-9 | Doubled error text: `unmounting X: unmounting X: ...` | one wrap |
+
+Also from the nits: `runBounded` now supplies its own default deadline, so a future caller passing a
+context without one does not silently get the unbounded behaviour the function exists to prevent.
+
+**Not fixed, needs a decision:** the seeded defaults reach **existing** installs, and because global
+exclusions are absolute no job can re-admit them. Most are noise, but `ada.jpg`, `george.jpg`,
+`assets.json` and `ROBOCOPY.RCJ` are ordinary filenames — a job syncing a real one silently stops
+updating it (no deletion; a permanently stale destination copy). Disclosed in SPEC §6.5 and raised
+with the user. §6 Phase 4b item 6.
+
 ## 6. Open items for the next session
 
 ### Phase 4b-2
@@ -917,14 +1064,29 @@ are the argument for the manual pass being a real gate rather than a formality.
     reusing the availability modal, which was not added — conservative and fine, but the decision
     log now says something the code does not.
 
-15. **`TestDestinationDisappearsMidRun` intermittently hangs instead of failing.** Seen once on
-    2026-09-01: the test wedged with its blackhole still installed, the suite never completed, and
-    nothing was logged. It passed in the three other full runs that day (44.1s, 42.4s, ~42s), so the
-    rate is low, but the failure is expensive — it parks the harness until someone runs
-    `make harness-clean` by hand, and until now it produced no diagnostics. `-timeout 15m` on the
-    make target is a mitigation, not a fix; the next occurrence should dump goroutines and those
-    stacks are the thing to read. Suspicion, unverified: the test's own cleanup races the blackhole
-    it installed, so the drain loop never runs when the run wedges at the wrong moment.
+15. ~~`TestDestinationDisappearsMidRun` intermittently hangs instead of failing.~~ **Diagnosed and
+    fixed 2026-09-04 — it was a production bug, not a flake.** See D-80: `Manager.Shutdown` could
+    block forever in `forkExec`. The suspicion recorded below (that the test's own cleanup raced the
+    blackhole) was **wrong**; the goroutine dump the `-timeout` produced pointed straight at the
+    mounter. The lesson stands about the timeout being worth adding: three hangs produced no
+    diagnostics at all, and the fourth produced the stack that solved it. *Original:* Seen twice —
+    2026-09-01 and 2026-09-02 — against roughly a dozen passing runs, so the rate is order 1-in-6.
+    Each time it wedges with its blackhole still installed and leaves CIFS mounts behind, parking
+    the harness until `make harness-clean` runs.
+
+    **The 2026-09-02 occurrence proved `-timeout 15m` works**: the suite panicked with a goroutine
+    dump instead of hanging forever. The dump was then **lost to a shell filter** —
+    `grep -E "^(--- |ok |FAIL|PASS|panic)"` kept the `panic:` line and discarded every stack frame
+    under it. Next time, capture the full output and filter only for display; the stacks are the
+    whole point of the timeout.
+
+    Confirmed each time by what `harness-clean` reports: mounts under
+    `/tmp/TestDestinationDisappearsMidRun*` plus a blackhole on 172.28.0.11. Suspicion, still
+    unverified: the test's own cleanup races the blackhole it installed, so the drain never runs
+    when the run wedges at the wrong moment.
+
+    It is a **test-harness** flake, not a product defect — the last several full runs passed with
+    identical engine code, and the two hangs bracket frontend-only changes.
 
 ### Phase 3
 

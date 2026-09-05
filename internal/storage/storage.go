@@ -14,6 +14,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/alokw/cn4m-cascade/internal/engine"
 	"github.com/alokw/cn4m-cascade/internal/health"
 	"github.com/alokw/cn4m-cascade/internal/mountmgr"
 	"github.com/alokw/cn4m-cascade/internal/store"
@@ -28,6 +29,26 @@ type Storage interface {
 	Health(ctx context.Context) error
 	// Release is called when no jobs reference the target (unmount).
 	Release(ctx context.Context) error
+}
+
+// ErrPathNotExist reports that a path is absent, as opposed to unreachable.
+// Distinguishing the two is what lets a destination's missing subpath be
+// created while a share that is merely down is still an error.
+var ErrPathNotExist = errors.New("does not exist")
+
+// subpathCreateTimeout bounds creating a destination folder. A mkdir on a
+// share is a metadata round trip like any other and must not hang.
+const subpathCreateTimeout = 30 * time.Second
+
+// CreateSubpath is set on a Storage that may create its subpath if it is
+// missing. It is only ever set for a *destination*: a missing source cannot be
+// conjured into existence, and silently inventing one would turn a typo into a
+// run that copies nothing and reports success.
+//
+// Only the subpath is created, never the share or the local root — those
+// existing is what proves the target is configured correctly at all.
+type CreateSubpath interface {
+	AllowCreate()
 }
 
 // Provider builds a Storage for a target.
@@ -60,7 +81,12 @@ type SMBStorage struct {
 	healthc *health.Cache
 	root    string
 	release func()
+	// create allows Resolve to make a missing subpath. See CreateSubpath.
+	create bool
 }
+
+// AllowCreate lets Resolve create this target's subpath if it is missing.
+func (s *SMBStorage) AllowCreate() { s.create = true }
 
 // Resolve mounts the share (or joins an existing mount) and returns the root
 // path, including the target's subpath.
@@ -78,7 +104,20 @@ func (s *SMBStorage) Resolve(ctx context.Context) (string, error) {
 	if s.target.Subpath != "" {
 		// A stat on a CIFS path can block for as long as the kernel lets it,
 		// so it gets the same treatment as every other SMB metadata call.
-		if err := statBounded(ctx, s.root); err != nil {
+		err := statBounded(ctx, s.root)
+		if err != nil && s.create && errors.Is(err, ErrPathNotExist) {
+			// A destination folder that does not exist yet is a normal first
+			// run, not a failure. The share itself resolved, so this is a
+			// directory under it that has simply never been made.
+			if mkErr := engine.MkdirAllBounded(ctx, subpathCreateTimeout, s.root); mkErr != nil {
+				release()
+				s.release, s.root = nil, ""
+				return "", fmt.Errorf("creating subpath %q on %s: %w",
+					s.target.Subpath, s.target.Describe(), mkErr)
+			}
+			err = nil
+		}
+		if err != nil {
 			release()
 			s.release, s.root = nil, ""
 			return "", fmt.Errorf("subpath %q on %s: %w", s.target.Subpath, s.target.Describe(), err)
@@ -120,11 +159,30 @@ func (s *SMBStorage) Release(_ context.Context) error {
 type LocalStorage struct {
 	target  *store.Target
 	healthc *health.Cache
+	create  bool
 }
+
+// AllowCreate lets Resolve create this target's subpath if it is missing.
+func (l *LocalStorage) AllowCreate() { l.create = true }
 
 // Resolve verifies the path exists and is a directory.
 func (l *LocalStorage) Resolve(ctx context.Context) (string, error) {
 	root := withSubpath(l.target.LocalPath, l.target.Subpath)
+
+	// Same rule as SMB: a missing *subpath* on a destination is a first run,
+	// but a missing local root means the bind mount is wrong and must not be
+	// papered over by creating a directory inside the container.
+	if l.create && l.target.Subpath != "" && root != l.target.LocalPath {
+		if _, err := os.Stat(root); os.IsNotExist(err) {
+			if _, rootErr := os.Stat(l.target.LocalPath); rootErr == nil {
+				if mkErr := engine.MkdirAllBounded(ctx, subpathCreateTimeout, root); mkErr != nil {
+					return "", fmt.Errorf("creating subpath %q on %s: %w",
+						l.target.Subpath, l.target.Describe(), mkErr)
+				}
+			}
+		}
+	}
+
 	if err := l.check(root); err != nil {
 		l.healthc.SetUnhealthy(l.target.ID, err.Error())
 		return "", err
@@ -149,13 +207,20 @@ func (l *LocalStorage) Release(_ context.Context) error { return nil }
 func (l *LocalStorage) check(root string) error {
 	info, err := os.Stat(root)
 	if os.IsNotExist(err) {
+		if root != l.target.LocalPath {
+			// The target root is fine; something under it is not. Saying only
+			// "the target does not exist" here is how a job whose subpath is
+			// wrong reads as a broken target — the target tests green, and the
+			// run insists the very same path is missing.
+			return fmt.Errorf("%s: %s %w", l.target.Describe(), root, ErrPathNotExist)
+		}
 		return fmt.Errorf("%s does not exist — check that the host directory is bind-mounted into the container", l.target.Describe())
 	}
 	if err != nil {
-		return fmt.Errorf("%s is not readable: %w", l.target.Describe(), err)
+		return fmt.Errorf("%s: %s is not readable: %w", l.target.Describe(), root, err)
 	}
 	if !info.IsDir() {
-		return fmt.Errorf("%s is a file, not a directory", l.target.Describe())
+		return fmt.Errorf("%s: %s is a file, not a directory", l.target.Describe(), root)
 	}
 	return nil
 }
@@ -247,7 +312,10 @@ func statBounded(ctx context.Context, path string) error {
 	select {
 	case err := <-ch:
 		if os.IsNotExist(err) {
-			return errors.New("does not exist")
+			// A sentinel, not a fresh error: callers need to tell "absent"
+			// from "unreachable", and a plain errors.New discards that. The
+			// message is unchanged.
+			return ErrPathNotExist
 		}
 		return err
 	case <-ctx.Done():

@@ -59,6 +59,21 @@ const (
 	DeletePolicyProceed DeletePolicy = "proceed"
 )
 
+// CreateDestDirs decides what a run does when a destination's folder does not
+// exist yet. It is separate from UnavailablePolicy on purpose: an unreachable
+// share and an absent folder are different problems, and a job set to skip the
+// former should not silently create the latter.
+type CreateDestDirs string
+
+const (
+	// CreateDirsAsk prompts, and skips the destination if nobody answers.
+	CreateDirsAsk CreateDestDirs = "ask"
+	// CreateDirsAlways creates it without asking, and logs that it did.
+	CreateDirsAlways CreateDestDirs = "always"
+	// CreateDirsNever treats a missing folder as an unavailable destination.
+	CreateDirsNever CreateDestDirs = "never"
+)
+
 // UnavailablePolicy is what a run does when a destination cannot be
 // resolved (SPEC.md §6.1 step 2).
 type UnavailablePolicy string
@@ -135,6 +150,9 @@ type Job struct {
 	PromptTimeoutSec int `json:"prompt_timeout_sec"`
 	// PromptFallback is what happens when nobody answers in time.
 	PromptFallback PromptFallback `json:"prompt_fallback"`
+	// CreateDestDirs decides whether a missing destination folder is created,
+	// asked about, or treated as unavailable.
+	CreateDestDirs CreateDestDirs `json:"create_dest_dirs"`
 	// ParallelDestinations runs destinations at the same time. Off by
 	// default: fan-out multiplies read load on the source share
 	// (SPEC.md §6.1 step 7).
@@ -189,6 +207,9 @@ func (j *Job) ApplyDefaults() {
 	}
 	if j.PromptFallback == "" {
 		j.PromptFallback = FallbackSkip
+	}
+	if j.CreateDestDirs == "" {
+		j.CreateDestDirs = CreateDirsAsk
 	}
 	for i := range j.Filters {
 		j.Filters[i].ApplyDefaults()
@@ -255,6 +276,12 @@ func (j *Job) Validate() error {
 	default:
 		return fmt.Errorf("prompt_fallback must be %q or %q, got %q",
 			FallbackSkip, FallbackAbort, j.PromptFallback)
+	}
+	switch j.CreateDestDirs {
+	case CreateDirsAsk, CreateDirsAlways, CreateDirsNever:
+	default:
+		return fmt.Errorf("create_dest_dirs must be %q, %q or %q, got %q",
+			CreateDirsAsk, CreateDirsAlways, CreateDirsNever, j.CreateDestDirs)
 	}
 	if j.PromptTimeoutSec < MinPromptTimeoutSec || j.PromptTimeoutSec > MaxPromptTimeoutSec {
 		return fmt.Errorf("prompt_timeout_sec must be between %d and %d, got %d",
@@ -356,7 +383,7 @@ func ValidateSubpath(field, subpath string) error {
 const jobColumns = `id, name, source_target_id, source_subpath, mode, compare,
 	compare_tolerance_sec, ignore_dst_hour, workers, on_error, delete_policy,
 	log_every_file, unavailable_policy, parallel_destinations,
-	prompt_timeout_sec, prompt_fallback, created_at, updated_at`
+	prompt_timeout_sec, prompt_fallback, create_dest_dirs, created_at, updated_at`
 
 // CreateJob inserts a job and its destinations in one transaction.
 func (d *DB) CreateJob(ctx context.Context, j *Job) error {
@@ -379,7 +406,7 @@ func (d *DB) CreateJob(ctx context.Context, j *Job) error {
 	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs (`+jobColumns+`)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, jobInsertArgs(j)...); err != nil {
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, jobInsertArgs(j)...); err != nil {
 		if isUniqueViolation(err) {
 			return fmt.Errorf("a job named %q already exists: %w", j.Name, ErrNameTaken)
 		}
@@ -404,7 +431,7 @@ func jobInsertArgs(j *Job) []any {
 		j.CompareToleranceSec, boolToInt(j.IgnoreDSTHour), j.Workers, string(j.OnError),
 		string(j.DeletePolicy), boolToInt(j.LogEveryFile), string(j.UnavailablePolicy),
 		boolToInt(j.ParallelDestinations), j.PromptTimeoutSec, string(j.PromptFallback),
-		formatTime(j.CreatedAt), formatTime(j.UpdatedAt),
+		string(j.CreateDestDirs), formatTime(j.CreatedAt), formatTime(j.UpdatedAt),
 	}
 }
 
@@ -467,14 +494,14 @@ func (d *DB) UpdateJob(ctx context.Context, id string, j *Job) error {
 	const set = `UPDATE jobs SET name=?, source_target_id=?, source_subpath=?, mode=?, compare=?,
 		compare_tolerance_sec=?, ignore_dst_hour=?, workers=?, on_error=?, delete_policy=?,
 		log_every_file=?, unavailable_policy=?, parallel_destinations=?,
-		prompt_timeout_sec=?, prompt_fallback=?, updated_at=? WHERE id=?`
+		prompt_timeout_sec=?, prompt_fallback=?, create_dest_dirs=?, updated_at=? WHERE id=?`
 
 	if _, err := tx.ExecContext(ctx, set,
 		j.Name, j.SourceTargetID, j.SourceSubpath, string(j.Mode), string(j.Compare),
 		j.CompareToleranceSec, boolToInt(j.IgnoreDSTHour), j.Workers, string(j.OnError),
 		string(j.DeletePolicy), boolToInt(j.LogEveryFile), string(j.UnavailablePolicy),
 		boolToInt(j.ParallelDestinations), j.PromptTimeoutSec, string(j.PromptFallback),
-		formatTime(j.UpdatedAt), j.ID); err != nil {
+		string(j.CreateDestDirs), formatTime(j.UpdatedAt), j.ID); err != nil {
 		if isUniqueViolation(err) {
 			return fmt.Errorf("a job named %q already exists: %w", j.Name, ErrNameTaken)
 		}
@@ -549,12 +576,50 @@ func (d *DB) ListJobs(ctx context.Context) ([]*Job, error) {
 }
 
 // DeleteJob removes a job; its destinations cascade.
+// DeleteJob removes a job and its run history.
+//
+// The history has to go with it: runs.job_id references jobs(id) *without*
+// ON DELETE CASCADE — unlike job_destinations and filter_rules — so deleting a
+// job that has ever run otherwise fails with a raw
+// "FOREIGN KEY constraint failed (787)" that reached the user verbatim.
+//
+// Deleting the runs is the deliberate choice over refusing: a job nobody can
+// delete because it once ran is worse, and an orphaned run is a log entry
+// pointing at a job that no longer exists. run_destinations and run_events do
+// cascade from runs, so removing the runs takes their children with them. The
+// API surfaces the count first so the loss is stated before it happens.
 func (d *DB) DeleteJob(ctx context.Context, id string) error {
-	res, err := d.sql.ExecContext(ctx, `DELETE FROM jobs WHERE id = ?`, id)
+	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("deleting job %s: %w", id, err)
 	}
-	return checkAffected(res, id)
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM runs WHERE job_id = ?`, id); err != nil {
+		return fmt.Errorf("deleting the run history of job %s: %w", id, err)
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM jobs WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("deleting job %s: %w", id, err)
+	}
+	if err := checkAffected(res, id); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("deleting job %s: %w", id, err)
+	}
+	return nil
+}
+
+// CountRuns reports how many runs a job has, so a delete can say what it is
+// about to destroy rather than discovering it afterwards.
+func (d *DB) CountRuns(ctx context.Context, jobID string) (int, error) {
+	var n int
+	err := d.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE job_id = ?`, jobID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("counting the runs of job %s: %w", jobID, err)
+	}
+	return n, nil
 }
 
 func (d *DB) jobDestinations(ctx context.Context, jobID string) ([]JobDestination, error) {
@@ -585,16 +650,19 @@ func scanJob(s scanner) (*Job, error) {
 		j                                 Job
 		mode, compare, onErr, delPol      string
 		unavailable, promptFallback       string
+		createDestDirs                    string
 		created, updated                  string
 		ignoreDST, logEveryFile, parallel int
 	)
 	err := s.Scan(&j.ID, &j.Name, &j.SourceTargetID, &j.SourceSubpath, &mode, &compare,
 		&j.CompareToleranceSec, &ignoreDST, &j.Workers, &onErr, &delPol, &logEveryFile,
-		&unavailable, &parallel, &j.PromptTimeoutSec, &promptFallback, &created, &updated)
+		&unavailable, &parallel, &j.PromptTimeoutSec, &promptFallback, &createDestDirs,
+		&created, &updated)
 	if err != nil {
 		return nil, err
 	}
 	j.UnavailablePolicy = UnavailablePolicy(unavailable)
+	j.CreateDestDirs = CreateDestDirs(createDestDirs)
 	j.PromptFallback = PromptFallback(promptFallback)
 	j.ParallelDestinations = parallel != 0
 	j.Mode = SyncMode(mode)

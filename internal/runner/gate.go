@@ -23,12 +23,19 @@ const (
 	PromptRetry PromptAction = "retry"
 	// PromptAbort ends the whole run.
 	PromptAbort PromptAction = "abort"
+	// PromptCreate makes the destination folder that is missing.
+	//
+	// Only offered when the destination *resolved* but its subpath does not
+	// exist. Creating is deliberately an answer rather than something a run
+	// does on its own: a mistyped subpath would otherwise be silently brought
+	// into existence and synced into, which looks exactly like success.
+	PromptCreate PromptAction = "create"
 )
 
 // ValidPromptAction reports whether s names an action.
 func ValidPromptAction(s PromptAction) bool {
 	switch s {
-	case PromptSkip, PromptRetry, PromptAbort:
+	case PromptSkip, PromptRetry, PromptAbort, PromptCreate:
 		return true
 	}
 	return false

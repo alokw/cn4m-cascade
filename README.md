@@ -137,13 +137,13 @@ go build -o /tmp/smbsync ./cmd/smbsync
 ENCRYPTION_KEY=some-long-development-key DATA_DIR=/tmp/data MOUNT_ROOT=/mnt/smb /tmp/smbsync &
 
 # add a target by IP (172.28.0.10 is the first Samba server)
-curl -sS -X POST localhost:8384/api/targets -H 'Content-Type: application/json' -d '{
+curl -sS -X POST localhost:2649/api/targets -H 'Content-Type: application/json' -d '{
   "name": "nas-a", "type": "smb", "host": "172.28.0.10",
   "share": "private", "username": "syncuser", "password": "syncpass"
 }' | jq .
 
 # mount it, statfs it, list its root
-curl -sS -X POST localhost:8384/api/targets/<id>/test | jq .
+curl -sS -X POST localhost:2649/api/targets/<id>/test | jq .
 ```
 
 Endpoints so far:
@@ -171,7 +171,7 @@ Every `/api/*` route needs a session, except `/api/auth/*` and `/healthz`.
 On a fresh database there is no password yet. Either set one at first run:
 
 ```bash
-curl -sX POST localhost:8384/api/auth/setup \
+curl -sX POST localhost:2649/api/auth/setup \
   -H 'content-type: application/json' \
   -d '{"password":"a good long password"}' -c cookies.txt
 ```
@@ -217,11 +217,11 @@ the `/api/auth/setup` body).
 Then sign in and keep the cookie:
 
 ```bash
-curl -sX POST localhost:8384/api/auth/login \
+curl -sX POST localhost:2649/api/auth/login \
   -H 'content-type: application/json' \
   -d '{"password":"a good long password"}' -c cookies.txt
 
-curl -s localhost:8384/api/targets -b cookies.txt
+curl -s localhost:2649/api/targets -b cookies.txt
 ```
 
 `GET /api/auth/session` reports `{"setup_required":true}` before first-run setup, which is how the
@@ -236,14 +236,14 @@ visible to explain it. Put it behind a TLS proxy and the flag turns itself on.
 
 ```bash
 # Plan the work and hold it — nothing is copied or deleted
-curl -sX POST localhost:8384/api/jobs/$JOB/run -b cookies.txt \
+curl -sX POST localhost:2649/api/jobs/$JOB/run -b cookies.txt \
   -H 'content-type: application/json' -d '{"preview":true}'
 
 # Inspect what it intends to do
-curl -s localhost:8384/api/runs/$RUN -b cookies.txt | jq '.progress.plans'
+curl -s localhost:2649/api/runs/$RUN -b cookies.txt | jq '.progress.plans'
 
 # Go ahead
-curl -sX POST localhost:8384/api/jobs/$JOB/confirm -b cookies.txt
+curl -sX POST localhost:2649/api/jobs/$JOB/confirm -b cookies.txt
 ```
 
 A previewed run holds its mounts while it waits. If nobody confirms within the job's
@@ -306,7 +306,7 @@ container runs as root; `sudo chown -R "$USER" ~/cn4m` if that gets in your way.
 Answer a prompt with:
 
 ```bash
-curl -sX POST localhost:8384/api/runs/$RUN/prompt -b cookies.txt \
+curl -sX POST localhost:2649/api/runs/$RUN/prompt -b cookies.txt \
   -H 'content-type: application/json' \
   -d '{"dest_target_id":"'$DEST'","action":"skip"}'   # skip | retry | abort
 ```
@@ -320,7 +320,7 @@ wait is always bounded, because a run may be started by a schedule with nobody w
 | Variable | Default | Notes |
 |---|---|---|
 | `ENCRYPTION_KEY` | — | **Required.** Encrypts stored credentials. Minimum 16 characters; startup fails without it. Changing it makes existing credentials unreadable |
-| `LISTEN_ADDR` | `:8384` | |
+| `LISTEN_ADDR` | `:2649` | |
 | `DATA_DIR` | `/data` | SQLite database lives here |
 | `MOUNT_ROOT` | `/mnt/smb` | Shares are mounted at `<MOUNT_ROOT>/<target-id>` |
 | `MOUNT_UID` / `MOUNT_GID` | process uid/gid | Becomes `uid=`/`gid=` in the mount options |

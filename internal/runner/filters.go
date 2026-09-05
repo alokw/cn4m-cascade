@@ -21,7 +21,31 @@ import (
 func (r *Runner) resolveChains(ctx context.Context, job *store.Job, events *eventBuffer) (map[string]*filter.Chain, *filter.Chain, error) {
 	chains := map[string]*filter.Chain{}
 
-	if len(job.Filters) == 0 {
+	// Global exclusions apply to every job (SPEC.md §6.5). They are read here,
+	// in the same pass as the job's own rules, for the reason spelled out
+	// below: two reads can disagree.
+	globals, err := r.db.ListGlobalFilterRules(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("loading the global filter rules: %w", err)
+	}
+
+	// Globals first, so the run log attributes counts to them before the
+	// job's own rules. Ordering has no effect on the verdict — the chain
+	// evaluates includes then excludes regardless — but it makes the log read
+	// in the order a person would expect.
+	rules := make([]store.FilterRule, 0, len(globals)+len(job.Filters))
+	for i := range globals {
+		rules = append(rules, globals[i].AsFilterRule())
+	}
+	rules = append(rules, job.Filters...)
+
+	// The early return must account for globals, not just the job's rules.
+	// Checking len(job.Filters) here would let a job with no rules of its own
+	// skip the compile loop entirely — and with it the degradation that a
+	// broken global rule must cause. That job would then run with deletions
+	// enabled against a filter set narrower than configured, which is how a
+	// mirror removes files the global rule existed to protect.
+	if len(rules) == 0 {
 		for _, d := range job.Destinations {
 			chains[d.DestTargetID] = filter.NewChain(nil)
 		}
@@ -40,33 +64,53 @@ func (r *Runner) resolveChains(ctx context.Context, job *store.Job, events *even
 		dropped string
 	}
 
-	compiled := make([]resolved, len(job.Filters))
+	// How a rule is named in errors and the run log. Globals are numbered
+	// separately from the job's own rules: the job editor highlights a row
+	// from "filter rule N", and N has to mean the Nth rule *of that job* or it
+	// points at the wrong one — or at a rule the editor cannot show at all.
+	label := func(i int) string {
+		if i < len(globals) {
+			return fmt.Sprintf("global filter rule %d (%s)", i+1, globals[i].Describe())
+		}
+		n := i - len(globals)
+		return fmt.Sprintf("filter rule %d (%s)", n+1, job.Filters[n].Describe())
+	}
+
+	compiled := make([]resolved, len(rules))
 	var degraded string
 
-	for i := range job.Filters {
-		rule := &job.Filters[i]
+	for i := range rules {
+		rule := &rules[i]
 		compiled[i] = resolved{scope: rule.Scope, target: rule.ScopeTargetID}
 
 		built, err := r.compileRule(ctx, rule)
 		if err != nil {
 			if rule.OnError == store.FilterFailRun {
-				return nil, nil, fmt.Errorf("filter rule %d (%s): %w", i+1, rule.Describe(), err)
+				return nil, nil, fmt.Errorf("%s: %w", label(i), err)
 			}
-			reason := fmt.Sprintf("rule %d (%s): %v", i+1, rule.Describe(), err)
+			reason := fmt.Sprintf("%s: %v", label(i), err)
 			compiled[i].dropped = reason
 			if degraded == "" {
 				degraded = reason
 			}
 			events.Add(engine.Event{Level: store.LevelWarn, Message: fmt.Sprintf(
-				"ignoring filter rule %d (%s): %v — deletions are disabled for this run because the filter is now narrower than configured",
-				i+1, rule.Describe(), err)})
+				"ignoring %s: %v — deletions are disabled for this run because the filter is now narrower than configured",
+				label(i), err)})
 			continue
 		}
 
 		if built.PatternCount() == 0 {
-			events.Add(engine.Event{Level: store.LevelWarn, Message: fmt.Sprintf(
-				"filter rule %d (%s) resolved to no patterns; it matches nothing",
-				i+1, rule.Describe())})
+			// A rule that resolves to nothing is not an error — an empty list
+			// file is a legitimate "exclude nothing today". But for a *global*
+			// rule it silently removes protection from every job at once (a
+			// truncated excludes file, say), so it is reported at error level
+			// rather than buried among the warnings.
+			level := store.LevelWarn
+			if i < len(globals) {
+				level = store.LevelError
+			}
+			events.Add(engine.Event{Level: level, Message: fmt.Sprintf(
+				"%s resolved to no patterns; it matches nothing", label(i))})
 		}
 		compiled[i].rule = built
 	}

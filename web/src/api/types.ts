@@ -122,6 +122,11 @@ export type OnError = 'skip' | 'abort'
 export type DeletePolicy = 'skip_deletes' | 'proceed'
 export type UnavailablePolicy = 'skip' | 'abort' | 'prompt'
 export type PromptFallback = 'skip' | 'abort'
+/** What a run does when a destination's folder does not exist yet. Separate
+ *  from unavailable_policy: an unreachable share and an absent folder are
+ *  different problems. */
+export type CreateDestDirs = 'ask' | 'always' | 'never'
+
 
 export type FilterScope = 'job' | 'target'
 export type FilterDirection = 'include' | 'exclude'
@@ -169,11 +174,34 @@ export interface Job {
   unavailable_policy: UnavailablePolicy
   prompt_timeout_sec: number
   prompt_fallback: PromptFallback
+  create_dest_dirs: CreateDestDirs
   parallel_destinations: boolean
   destinations: JobDestination[]
   filters?: FilterRule[]
   created_at: string
   updated_at: string
+}
+
+/** A destination as the API *accepts* it. internal/api's destPayload declares
+ *  only these two fields; `id`, `job_id` and `position` are server-owned and
+ *  are rejected on the way in. */
+export interface JobDestinationPayload {
+  dest_target_id: string
+  dest_subpath?: string
+}
+
+/** A filter rule as the API *accepts* it — internal/api's filterPayload.
+ *  `id`, `job_id`, `position`, `created_at` and `updated_at` are server-owned. */
+export interface FilterRulePayload {
+  scope: FilterScope
+  scope_target_id?: string
+  direction: FilterDirection
+  source: FilterSource
+  patterns?: string[]
+  file_path?: string
+  json_key?: string
+  case_sensitive: boolean
+  on_error: FilterOnError
 }
 
 /** PATCH /api/jobs/{id} is a full replace, not a merge: store.UpdateJob
@@ -183,9 +211,17 @@ export interface Job {
  *  Job. Omitting it does not leave the existing rules alone — it deletes every
  *  one of them, and an exclude rule that vanishes is a subtree that gets
  *  copied, or in mirror mode deleted, on the next run. The type is what stops
- *  an editor that never opened the Filters tab from wiping them. */
-export type JobPayload = Omit<Job, 'id' | 'created_at' | 'updated_at' | 'filters'> & {
-  filters: FilterRule[]
+ *  an editor that never opened the Filters tab from wiping them.
+ *
+ *  The nested types are payload-shaped rather than reused from Job: the server
+ *  sets DisallowUnknownFields, so a `Job` handed back verbatim is a 400. See
+ *  toJobPayload. */
+export type JobPayload = Omit<
+  Job,
+  'id' | 'created_at' | 'updated_at' | 'filters' | 'destinations'
+> & {
+  destinations: JobDestinationPayload[]
+  filters: FilterRulePayload[]
 }
 
 export interface RunDestination {
@@ -236,6 +272,9 @@ export interface DestSnapshot {
    *  a countdown from the year 1. */
   prompt_deadline: string
   prompt_reason?: string
+  /** The destination resolved but its folder does not exist, so creating it is
+   *  one of the answers. Distinguishes "not there yet" from "unreachable". */
+  prompt_can_create?: boolean
   // engine.Snapshot, embedded and therefore flattened into this object.
   phase: Phase
   files_total: number
@@ -333,7 +372,8 @@ export interface RunSnapshot {
 export type LogLevel = 'info' | 'warn' | 'error'
 
 export interface RunEvent {
-  id: string
+  /** int64 server-side, so this arrives as a JSON number, not a string. */
+  id: number
   run_id: string
   ts: string
   level: LogLevel
@@ -372,7 +412,7 @@ export interface BrowseResult {
   total: number
 }
 
-export type PromptAction = 'skip' | 'retry' | 'abort'
+export type PromptAction = 'skip' | 'retry' | 'abort' | 'create'
 
 /** internal/api/hub.go — the three event names the WS feed emits. */
 export type WsEventName = 'run_progress' | 'run_finished' | 'target_unavailable_prompt'
@@ -400,4 +440,147 @@ export function isZeroTime(iso: string | undefined): boolean {
 export function targetRoot(t: Target): string {
   const base = t.type === 'smb' ? `//${t.host ?? ''}/${t.share ?? ''}` : (t.local_path ?? '')
   return t.subpath ? `${base}/${t.subpath}` : base
+}
+
+/**
+ * Projects a Job as fetched into exactly what PATCH/POST accept.
+ *
+ * This is not defensive tidying — it is required. `decodeJSON` sets
+ * DisallowUnknownFields, and a fetched Job carries `id`, `created_at` and
+ * `updated_at`, plus `id`/`job_id`/`position` on every destination and
+ * additionally `created_at`/`updated_at` on every filter rule. Sending any of
+ * them back is a 400, so an editor that loads a job and saves it unchanged
+ * fails without this. `TestJobFetchMustBeProjectedBeforePatching` pins both
+ * directions.
+ *
+ * Dropping the rule `id`s costs nothing: the server re-mints them on every
+ * save anyway, and `position` comes from array order — so reordering the array
+ * is how rules are reordered.
+ */
+export function toJobPayload(job: Job): JobPayload {
+  return {
+    name: job.name,
+    source_target_id: job.source_target_id,
+    source_subpath: job.source_subpath,
+    mode: job.mode,
+    compare: job.compare,
+    compare_tolerance_sec: job.compare_tolerance_sec,
+    ignore_dst_hour: job.ignore_dst_hour,
+    workers: job.workers,
+    log_every_file: job.log_every_file,
+    on_error: job.on_error,
+    delete_policy: job.delete_policy,
+    unavailable_policy: job.unavailable_policy,
+    prompt_timeout_sec: job.prompt_timeout_sec,
+    prompt_fallback: job.prompt_fallback,
+    create_dest_dirs: job.create_dest_dirs,
+    parallel_destinations: job.parallel_destinations,
+    destinations: job.destinations.map((d) => ({
+      dest_target_id: d.dest_target_id,
+      dest_subpath: d.dest_subpath,
+    })),
+    // `?? []` because POST echoes `"filters": null` when there are none while
+    // GET returns `[]` — the Go field has no omitempty.
+    filters: (job.filters ?? []).map(toFilterRulePayload),
+  }
+}
+
+export function toFilterRulePayload(rule: FilterRule): FilterRulePayload {
+  return {
+    scope: rule.scope,
+    scope_target_id: rule.scope_target_id,
+    direction: rule.direction,
+    source: rule.source,
+    patterns: rule.patterns,
+    file_path: rule.file_path,
+    json_key: rule.json_key,
+    case_sensitive: rule.case_sensitive,
+    on_error: rule.on_error,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Filter testing — POST /api/jobs/{id}/filter-test
+//
+// Runs against the *saved* job: the handler loads rules from the database and
+// never reads them from the request body, so unsaved edits cannot be tested.
+
+/** internal/filter — Counts. One row per rule that was actually compiled. */
+export interface FilterRuleCounts {
+  rule_id: string
+  description: string
+  direction: FilterDirection
+  admitted: number
+  excluded: number
+}
+
+export interface FilterSample {
+  relpath: string
+  is_dir: boolean
+  /** The rule's *description*, not its id — and descriptions are not unique.
+   *  Empty means the path matched no include rule, which is "outside the
+   *  include set" rather than "no rule was responsible". */
+  rule?: string
+}
+
+export interface FilterTestDest {
+  dest_target_id: string
+  included: FilterSample[]
+  excluded: FilterSample[]
+  /** Untruncated totals; `included`/`excluded` are capped at sample_limit. */
+  included_total: number
+  excluded_total: number
+  /** Ordered includes-then-excludes, NOT by rule position. Key by rule_id
+   *  rather than zipping against the editor's row order. A rule dropped under
+   *  on_error=ignore_rule is absent entirely — its file could not be read. */
+  rules: FilterRuleCounts[]
+}
+
+export interface FilterTestResult {
+  scanned_paths: number
+  /** The scan hit its 20k cap, so the sample describes part of the tree. */
+  truncated: boolean
+  destinations: FilterTestDest[]
+}
+
+/** An exclusion applied to every job (SPEC.md §6.5).
+ *
+ *  Narrower than a job rule on purpose: no scope, because a global rule is
+ *  job-wide by definition, and no direction, because these are exclusions only
+ *  — a global *include* would widen every job rather than narrow it.
+ *
+ *  Global excludes are absolute: a job's own include rule cannot re-admit a
+ *  path a global rule removed. */
+export interface GlobalFilterRule {
+  id?: string
+  source: FilterSource
+  patterns?: string[]
+  file_path?: string
+  json_key?: string
+  case_sensitive: boolean
+  on_error: FilterOnError
+  position?: number
+}
+
+/** What PUT accepts: server-owned fields stripped, order carries position. */
+export type GlobalFilterPayload = Omit<GlobalFilterRule, 'id' | 'position'>
+
+export function toGlobalFilterPayload(r: GlobalFilterRule): GlobalFilterPayload {
+  return {
+    source: r.source,
+    patterns: r.patterns ?? [],
+    file_path: r.file_path ?? '',
+    json_key: r.json_key ?? '',
+    case_sensitive: r.case_sensitive,
+    on_error: r.on_error,
+  }
+}
+
+/** Result of the advisory rule-file check. `checked: false` means the path was
+ *  never examined — a target:// reference, for instance — which is different
+ *  from being examined and found missing. */
+export interface FilterFileCheck {
+  checked: boolean
+  exists: boolean
+  message?: string
 }

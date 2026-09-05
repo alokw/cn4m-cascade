@@ -5,7 +5,7 @@
 # Runs inside the dev container: `make demo`.
 set -uo pipefail
 
-BASE="http://127.0.0.1:8384"
+BASE="http://127.0.0.1:2649"
 DATA_DIR="$(mktemp -d)"
 MOUNT_ROOT="/mnt/smb-demo"
 SAMBA_A="${SMBSYNC_TEST_SAMBA_A:-172.28.0.10}"
@@ -49,7 +49,7 @@ DATA_DIR="$DATA_DIR" \
 MOUNT_ROOT="$MOUNT_ROOT" \
 MOUNT_IDLE_GRACE="5s" \
 MOUNT_TIMEOUT="15s" \
-LISTEN_ADDR=":8384" \
+LISTEN_ADDR=":2649" \
     /tmp/smbsync &
 SERVER_PID=$!
 

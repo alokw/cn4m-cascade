@@ -124,6 +124,8 @@ A job has **one source and one or more destinations**. A run proceeds in stages,
    - `skip` (sensible default for scheduled/webhook runs): log it, mark that destination's result as `skipped_unavailable`, continue with the rest.
    - `abort`: fail the whole run immediately.
    A run that completes with ≥1 skipped/failed destination finishes with status `partial`.
+
+   A destination whose **folder simply does not exist yet** is a different question from one that is unreachable, and gets its own answer rather than being folded into `unavailable_policy` — a job set to *skip* unreachable destinations is expressing caution, and silently creating folders is the opposite of it. The per-job `create_dest_dirs` setting decides: `ask` (the default) prompts with **Create the folder / Skip / Abort** and a countdown, `always` creates it and logs that it did, `never` treats it as unavailable. An unanswered prompt skips the destination, so an unattended run never invents a folder from a mistyped subpath. **A preview never creates anything**, whatever the setting says — planning must leave the destination exactly as it found it, or "nothing has been written yet" on the confirm screen is untrue. Only the *subpath* is ever created, never the share or the local root, and never the **source**: a missing source is a misconfiguration, and inventing one turns a typo into a run that copies nothing and calls itself a success.
 3. **Scan** the source tree once and each available destination tree **concurrently** (bounded parallel directory walkers — e.g., 8–16 workers per tree, since SMB metadata ops are latency-bound, not bandwidth-bound). Produce trees (or sorted flat lists) of `{relpath, size, mtime, isDir, symlink info}`.
 4. **Filter** the source listing through the resolved filter chain (see §6.5). Filtering happens after scan but before diff so the plan and byte totals reflect only in-scope files. Directory exclusions prune the walk itself where possible (skip descending) for speed.
 5. **Diff** source vs each destination according to sync mode → one ordered action plan per destination: `[]Action{Copy, Delete, MkDir, RmDir, ConflictSkip...}` with byte totals for progress/ETA reporting.
@@ -163,7 +165,17 @@ Maintained by a central per-run progress tracker, updated by copy workers and pu
 
 ### 6.5 Filtering system
 
-Filters decide which files/folders are in scope. Multiple filter **rules** combine into a per-job (and optionally per-target) filter chain.
+Filters decide which files/folders are in scope. Multiple filter **rules** combine into a per-job (and optionally per-target) filter chain, on top of a set of **global exclusions** that apply to every job.
+
+**Global exclusions** are configured once, in Settings, and layered into every job's chain. They exist because the same noise — `.DS_Store`, `Thumbs.db`, `_ARCHIVE/` — has to be excluded from every job, and repeating it per job guarantees it will eventually be forgotten in one of them. Three deliberate constraints:
+
+- **Exclusions only.** A global *include* would widen every job rather than narrow it, because includes are OR'd: a global `*.txt` plus a job's `*.jpg` would admit both. There is no global include.
+- **Absolute.** A job's own include rule cannot re-admit a path a global rule excludes. This falls out of the evaluation order below, and is kept deliberately: the alternative is a layered evaluator inside the code that guarantees prune and admit agree — the guarantee that stops a mirror deleting a subtree one side cannot see.
+- **Job-wide, therefore prunable.** A global rule may prune the shared source walk exactly as a job-scoped rule may, and for the same reason: it applies identically to every destination.
+
+A fresh database is **seeded** with a default set of exclusions — editor and OS metadata (`.DS_Store`, `Thumbs.db`, `desktop.ini`), sync-tool state files, and archive folders — so the common noise is excluded before anyone configures anything. The seed runs once, at migration time, and reaches existing installs as well as new ones; because global exclusions are absolute, a seeded pattern cannot be re-admitted by a job and must be removed from Settings instead. The list is a starting point, not a fixed policy.
+
+A global rule that cannot be loaded degrades **every** job's chain, disabling deletions for those runs — the same treatment a dropped per-job rule gets, because the consequence is the same: a filter narrower than configured turns protected files into extraneous ones.
 
 **Rule sources (all produce a list of patterns):**
 
@@ -178,7 +190,7 @@ Filters decide which files/folders are in scope. Multiple filter **rules** combi
 
 - Each rule is `{source: inline|listfile|jsonfile, direction: include|exclude, patterns/path/key, scope: job|target:<id>, on_error}`.
 - Pattern syntax: gitignore-style globs — `*` (within segment), `**` (across segments), `?`, trailing `/` marks a directory rule (prunes the whole subtree), leading `/` anchors to the sync root; otherwise patterns match anywhere in the path. Case-insensitive by default (SMB targets are usually case-insensitive), per-rule toggle. Implement with a well-tested library (e.g., `go-gitignore`-style matcher), not hand-rolled regex.
-- **Evaluation order:** (1) if any include rules exist, a file must match at least one include (includes define the universe; a pure-exclude chain implicitly includes everything); (2) then excludes are applied and win over includes; (3) per-target rules are evaluated on top of job-level rules for that destination only — meaning different destinations of the same job can receive different subsets.
+- **Evaluation order:** (0) global exclusions are part of every chain, and being excludes they win unconditionally — which is what makes them absolute; (1) if any include rules exist, a file must match at least one include (includes define the universe; a pure-exclude chain implicitly includes everything); (2) then excludes are applied and win over includes; (3) per-target rules are evaluated on top of job-level rules for that destination only — meaning different destinations of the same job can receive different subsets.
 - Per-target wildcard include/exclude (the simple case from the feature list) is just an inline rule with `scope: target:<id>`.
 - The run log records, per rule, how many paths it excluded/admitted (counts, not full path dumps — with an optional debug toggle to log every filtered path).
 - **Filter dry-run endpoint/UI:** given a job, show a sample of what would be included/excluded (drives a "test filters" button in the job editor).
@@ -195,8 +207,12 @@ jobs(id, name, source_target_id, source_subpath,
      mode[mirror|update|twoway], compare[fast|content], workers, bwlimit_kbps,
      delete_policy, schedule_cron, enabled,
      unavailable_policy[prompt|skip|abort], prompt_timeout_sec, prompt_fallback[skip|abort],
-     parallel_destinations, api_trigger_token)          -- token nullable; set = webhook enabled
+     parallel_destinations, create_dest_dirs[ask|always|never],
+     api_trigger_token)                                 -- token nullable; set = webhook enabled
 job_destinations(id, job_id, dest_target_id, dest_subpath, position)
+global_filter_rules(id, source[inline|listfile|jsonfile], patterns_json,
+     file_path, json_key, case_sensitive, on_error[fail_run|ignore_rule],
+     position)                                          -- applied to every job; no scope or direction by design (§6.5)
 filter_rules(id, job_id, scope[job|target], scope_target_id,
      direction[include|exclude], source[inline|listfile|jsonfile],
      patterns_json, file_path, json_key, case_sensitive, on_error[fail_run|ignore_rule])
@@ -302,7 +318,7 @@ services:
     environment:
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
-      - LISTEN_ADDR=:8384
+      - LISTEN_ADDR=:2649
     volumes:
       - ./data:/data            # sqlite + logs
       - /srv/local-stuff:/mnt/local/stuff:rw   # optional local targets

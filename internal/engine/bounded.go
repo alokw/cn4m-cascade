@@ -116,6 +116,23 @@ func ReadFileBounded(ctx context.Context, timeout time.Duration, path string) ([
 	})
 }
 
+// StatBounded stats a path, bounded like every other call that may land on a
+// share. Exported for the API's filter-file check, which needs to know whether
+// a rule file exists without reading it — a rule file can be large, and an
+// existence question should not pull it into memory.
+func StatBounded(ctx context.Context, timeout time.Duration, path string) (fs.FileInfo, error) {
+	return bounded(ctx, timeout, "reading the details of "+path, func() (fs.FileInfo, error) {
+		return os.Stat(path)
+	})
+}
+
+// MkdirAllBounded creates a directory and its parents, bounded like every
+// other call that may land on a share. Exported for internal/storage, which
+// creates a destination's subpath on first use.
+func MkdirAllBounded(ctx context.Context, timeout time.Duration, path string) error {
+	return boundedMkdirAll(ctx, timeout, path)
+}
+
 func boundedRename(ctx context.Context, timeout time.Duration, from, to string) error {
 	return boundedVoid(ctx, timeout, "renaming into place at "+to, func() error {
 		return os.Rename(from, to)

@@ -38,7 +38,7 @@ func TestLoadDefaults(t *testing.T) {
 		name      string
 		got, want any
 	}{
-		{"listen addr", cfg.ListenAddr, ":8384"},
+		{"listen addr", cfg.ListenAddr, ":2649"},
 		{"data dir", cfg.DataDir, "/data"},
 		{"mount root", cfg.MountRoot, "/mnt/smb"},
 		{"db path", cfg.DBPath(), "/data/smbsync.db"},

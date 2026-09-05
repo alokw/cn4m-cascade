@@ -18,6 +18,9 @@ type DestSnapshot struct {
 	PromptDeadline time.Time `json:"prompt_deadline,omitempty"`
 	// PromptReason is why the destination is being asked about.
 	PromptReason string `json:"prompt_reason,omitempty"`
+	// PromptCanCreate means the destination resolved but its folder does not
+	// exist, so creating it is one of the answers.
+	PromptCanCreate bool `json:"prompt_can_create,omitempty"`
 	engine.Snapshot
 }
 
@@ -204,6 +207,10 @@ type progress struct {
 	// while a destination waits for an answer.
 	promptDeadlines map[string]time.Time
 	promptReasons   map[string]string
+	// promptCanCreate marks the prompts where the folder is merely absent, so
+	// the UI can offer Create. Without it the modal would have to infer the
+	// difference from the message text.
+	promptCanCreate map[string]bool
 	// confirmDeadline is when an unconfirmed preview cancels itself.
 	confirmDeadline time.Time
 	// plans is what each destination intends to do, once diffed.
@@ -242,6 +249,7 @@ func newProgress(now time.Time, destTargetIDs []string) *progress {
 		planned:         map[string]bool{},
 		promptDeadlines: map[string]time.Time{},
 		promptReasons:   map[string]string{},
+		promptCanCreate: map[string]bool{},
 		plans:           map[string]DestPlan{},
 	}
 	for _, id := range destTargetIDs {
@@ -274,11 +282,16 @@ func (p *progress) setStatus(destTargetID string, status store.DestStatus) {
 
 // setPrompt records that a destination is waiting for an answer, and when
 // that wait runs out.
-func (p *progress) setPrompt(destTargetID string, deadline time.Time, reason string) {
+func (p *progress) setPrompt(destTargetID string, deadline time.Time, reason string, canCreate bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.promptDeadlines[destTargetID] = deadline
 	p.promptReasons[destTargetID] = reason
+	if canCreate {
+		p.promptCanCreate[destTargetID] = true
+	} else {
+		delete(p.promptCanCreate, destTargetID)
+	}
 }
 
 // clearPrompt records that a destination is no longer waiting.
@@ -287,6 +300,7 @@ func (p *progress) clearPrompt(destTargetID string) {
 	defer p.mu.Unlock()
 	delete(p.promptDeadlines, destTargetID)
 	delete(p.promptReasons, destTargetID)
+	delete(p.promptCanCreate, destTargetID)
 }
 
 // setConfirmDeadline records when an unconfirmed preview gives up.
@@ -364,6 +378,10 @@ func (p *progress) snapshot(now time.Time) RunSnapshot {
 	for k, v := range p.promptReasons {
 		promptReasons[k] = v
 	}
+	promptCanCreate := make(map[string]bool, len(p.promptCanCreate))
+	for k, v := range p.promptCanCreate {
+		promptCanCreate[k] = v
+	}
 	for k, v := range p.plans {
 		plans[k] = v
 	}
@@ -399,11 +417,12 @@ func (p *progress) snapshot(now time.Time) RunSnapshot {
 		}
 
 		out.Destinations = append(out.Destinations, DestSnapshot{
-			DestTargetID:   id,
-			Status:         statuses[id],
-			PromptDeadline: promptDeadlines[id],
-			PromptReason:   promptReasons[id],
-			Snapshot:       snap,
+			DestTargetID:    id,
+			Status:          statuses[id],
+			PromptDeadline:  promptDeadlines[id],
+			PromptReason:    promptReasons[id],
+			PromptCanCreate: promptCanCreate[id],
+			Snapshot:        snap,
 		})
 		if plan, ok := plans[id]; ok {
 			out.Plans = append(out.Plans, plan)
