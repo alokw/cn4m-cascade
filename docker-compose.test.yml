@@ -36,13 +36,18 @@ services:
       # mean 2am UTC rather than 2am where you are. Set TZ in your shell or a
       # .env file (e.g. TZ=America/New_York) and the job editor's preview will
       # agree with the clock on your wall.
-      TZ: ${TZ:-UTC}
+      # Pinned for the same reason: schedule tests assert against UTC, and a
+      # developer's TZ in .env must not change what they assert.
+      TZ: "UTC"
       # Where this reports its status in the cn4m suite. Defaults to cn4m on
       # the same machine; point it at another host, or set it to "off", when
       # that is not true. Only ever used to create the callback on a fresh
       # database — after that the row is editable in the UI and this variable
       # will not overwrite it.
-      CN4M_CASCADE_STATUS_URL: ${CN4M_CASCADE_STATUS_URL:-http://localhost:2640/suite/status}
+      # Pinned, not interpolated: compose auto-loads `.env` for *every* file in
+      # this directory, so a production .env would otherwise silently
+      # reconfigure the harness. Tests must not depend on deployment settings.
+      CN4M_CASCADE_STATUS_URL: "off"
     volumes:
       - .:/src
       - gomodcache:/go/pkg/mod

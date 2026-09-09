@@ -402,10 +402,25 @@ func TestScheduledRunAgainstADeadDestinationEndsWithoutAnyone(t *testing.T) {
 			"want partial or failed after the fallback", status)
 	}
 
-	// And the job is free again, or every later firing would be skipped for as
-	// long as this one sat there.
-	if h.runner.ActiveForJob(jobID) {
-		t.Fatal("the job is still marked active after its run finished; " +
-			"every subsequent schedule would be skipped")
+	// And the job is freed, or every later firing would be skipped for as long
+	// as this one sat there.
+	//
+	// Polled rather than asserted outright, because "the run row is terminal"
+	// and "the runner released the job" are deliberately two different
+	// moments: `execute` writes the final status, then flushes its buffered
+	// events, and only then does the deferred `finish` give up the slot.
+	// awaitRun returns on the first of those, so asserting the second in the
+	// same breath is a race — one this test lost, which is how the ordering
+	// came to be written down here.
+	//
+	// The window is one event flush. Against a 30s scheduler tick the
+	// practical consequence is nil; what matters is that it closes at all.
+	deadline := time.Now().Add(30 * time.Second)
+	for h.runner.ActiveForJob(jobID) {
+		if time.Now().After(deadline) {
+			t.Fatal("the job is still marked active 30s after its run finished; " +
+				"every subsequent schedule would be skipped")
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 }

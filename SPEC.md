@@ -1,4 +1,4 @@
-# Project Spec: Web-Based SMB Sync Engine ("FreeFileSync in a Container")
+# Project Spec: Web-Based SMB Sync Engine
 
 ## Purpose of this document
 This is a design/architecture spec intended to be handed to an AI coding assistant (or a developer) for implementation. It describes goals, architecture, technology choices, component designs, and a phased build plan. Implement in phases, in order — each phase should produce something runnable and testable.
@@ -7,11 +7,11 @@ This is a design/architecture spec intended to be handed to an AI coding assista
 
 ## 1. Goals
 
-- A self-hosted sync tool, functionally similar to FreeFileSync, that runs in a single Docker container.
+- A self-hosted file sync tool for SMB shares and local folders, running in a single Docker container.
 - Web-based front-end for all configuration and monitoring (no desktop client).
 - Sync **sources and destinations are primarily SMB/CIFS shares addressed by IP** (e.g. `//192.168.1.50/media`), added dynamically by the user through the UI. Local paths (bind-mounted into the container) must also work as sources/destinations.
 - **Throughput is a first-class requirement.** The design should be able to saturate a gigabit link on large files and perform well on many-small-file workloads via parallelism.
-- Sync modes (mirroring FreeFileSync's semantics):
+- Sync modes:
   - **Mirror** — make destination exactly match source (deletes extraneous dest files).
   - **Update** — copy new/newer files to destination, never delete.
   - ~~**Two-way**~~ — bidirectional sync with a persisted state database. **Deferred indefinitely; see §14.**
@@ -145,7 +145,7 @@ Maintained by a central per-run progress tracker, updated by copy workers and pu
 
 ### 6.2 Comparison rules
 
-- Default: **size + mtime** (with a configurable tolerance, default 2 seconds, because SMB/FAT mtime granularity is coarse; also handle the classic DST/whole-hour offset with an optional "ignore ±1 hour" toggle like FreeFileSync has).
+- Default: **size + mtime** (with a configurable tolerance, default 2 seconds, because SMB/FAT mtime granularity is coarse; also handle the classic DST/whole-hour offset with an optional "ignore ±1 hour" toggle).
 - Optional per-job: **content compare** (streaming hash of both sides). Warn in the UI that this reads every byte over the network.
 - Preserve mtimes on copied files (`os.Chtimes` after copy) — this is essential or every subsequent run re-copies everything.
 
@@ -317,8 +317,9 @@ Keep the UI dependency-light; polling fallback if WS drops.
 
 ## 10. Docker packaging
 
-- Multi-stage Dockerfile: Node stage builds the SPA → Go stage embeds it and builds a static binary → final stage on `debian:bookworm-slim` with `cifs-utils` **and `ca-certificates`** installed. Final image well under 100 MB.
-- **`bookworm-slim` rather than alpine**, deliberately: every CIFS behaviour here — the dialect ladder, multichannel fallback, the mount option strings, the uninterruptible-syscall hangs of §5 — was validated against bookworm's `mount.cifs` and glibc. Alpine saves around 20 MB and re-opens all of it against musl.
+- Multi-stage Dockerfile: Node stage builds the SPA → Go stage embeds it and builds a static binary → final stage on **alpine** with `cifs-utils` **and `ca-certificates`** installed. Final image well under 100 MB — **25 MB** as built.
+- **Alpine, decided by measurement.** This section originally specified `debian:bookworm-slim` on the grounds of CIFS parity with the development container. That target was unreachable: Debian measured 158 MB, with the slim base alone at **97.2 MB on arm64**, so "well under 100 MB" could not be met before installing a single package. The parity argument was also weaker than it read — the binary is static Go with `CGO_ENABLED=0`, so musl versus glibc never reaches it, and the CIFS behaviour this project depends on (the dialect ladder, multichannel fallback, the uninterruptible-syscall hangs of §5) is the *kernel's*, which is the host's either way. `mount.cifs` is the same upstream `cifs-utils` on both.
+- That is still an argument rather than evidence, which is why §11's 6a exit criteria require the shipping image to **mount a real share** rather than merely to start: `make verify-image` mounts, lists, writes and unmounts against a live Samba server, and is a repeatable target rather than a one-off check.
 - **`ca-certificates` is load-bearing**, not hygiene: outbound callbacks (§8.2) POST to arbitrary `https://` URLs and fail every one of them without a CA bundle.
 - **No fixed `GOARCH`.** The image builds for whatever the host is, so Windows and macOS both build natively. `CGO_ENABLED=0` and a pure-Go SQLite driver make that free. Multi-arch via buildx is available for *publishing* a prebuilt image and is not needed to run one.
 
@@ -367,12 +368,20 @@ services:
 
 - Graceful shutdown: on SIGTERM, cancel running jobs (marking them `cancelled`), flush DB, lazy-unmount all shares. See `stop_grace_period` above — the promise is only kept if the orchestrator waits.
 
-> **Three corrections to this section, made 2026-09-09 when it was finally built.** It previously
+> **Four corrections to this section, made 2026-09-09 when it was finally built.** It previously
 > passed `ADMIN_PASSWORD`, which the code has never read (it reads `CN4M_CASCADE_ADMIN_PASSWORD`), so
 > the compose file silently ignored the operator's password. It omitted `stop_grace_period`, which
-> made its own graceful-shutdown requirement unachievable. And it mandated `network_mode: host`,
-> which does not work on Docker Desktop and would have made the UI unreachable on the target
-> platform. All three were invisible until the file was actually run.
+> made its own graceful-shutdown requirement unachievable. It mandated `network_mode: host`, which
+> does not work on Docker Desktop and would have made the UI unreachable on the target platform. And
+> it specified a base image whose size target it could not meet — see the alpine note above. The
+> first three were invisible until the file was actually run; the fourth was invisible until it was
+> measured.
+>
+> The base-image correction was itself found late, by review: the amendment above was written in the
+> same change that shipped the *opposite* base image, and both sat in the tree together for a while.
+> CLAUDE.md's first rule is that this document is the source of truth and deviations are raised, not
+> made silently — deviating from a paragraph written minutes earlier is the same failure, and is
+> easier to miss precisely because the reasoning still feels fresh.
 
 ---
 
@@ -481,7 +490,9 @@ is empty, stale, partially written, or from an interrupted run makes present fil
   two-way run is a merge, not a reconciliation.
 - **Conflicts are never guessed.** A file changed on both sides since the last state is marked,
   skipped, left untouched on *both* sides, and surfaced per-file with a "keep left / keep right"
-  action (FreeFileSync semantics).
+  action. The rule is that a conflict is never resolved automatically: whichever side the tool
+  picked would be the side the user did not want roughly half the time, and the loser is
+  overwritten.
 
 **The shape it would take:** `sync_state(job_id, relpath, size, mtime_src, mtime_dst,
 last_synced_at)`, written on successful sync; deletion detection by presence in state and absence on

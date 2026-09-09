@@ -1,8 +1,8 @@
 # Production image (SPEC.md §10).
 #
 # Three stages: Node builds the SPA, Go embeds it and links a static binary,
-# and a slim Debian carries the result plus the one thing this program cannot
-# work without — mount.cifs.
+# and a minimal alpine carries the result plus the one thing this program
+# cannot work without — mount.cifs.
 #
 # No fixed GOARCH anywhere. Each host builds for itself, so Windows and macOS
 # both produce a native image with no cross-compilation and no buildx setup.
@@ -54,7 +54,7 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/cn4m-cascade ./cmd/cn4m-cascade
 #
 # That is an argument, not evidence, which is why the 6a exit criteria require
 # this image to mount a real CIFS share rather than merely to start.
-FROM alpine:3.20
+FROM alpine:3.22
 
 # cifs-utils provides mount.cifs, which is the whole point of the program.
 # ca-certificates is not hygiene either: outbound callbacks (SPEC.md §8.2) POST

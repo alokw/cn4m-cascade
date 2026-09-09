@@ -12,6 +12,11 @@ import (
 	"time"
 )
 
+// DefaultListenAddr is where the server listens unless LISTEN_ADDR says
+// otherwise. Exported because the healthcheck has to dial the same address,
+// and two copies of a port number is two places to get it wrong.
+const DefaultListenAddr = ":2649"
+
 // DefaultCN4MStatusURL is cn4m on the same machine, which is how this is
 // normally deployed — cn4m's own client documents the same default.
 const DefaultCN4MStatusURL = "http://localhost:2640/suite/status"
@@ -61,7 +66,7 @@ const minKeyLen = 16
 // Load reads configuration from the environment.
 func Load() (*Config, error) {
 	c := &Config{
-		ListenAddr:     envStr("LISTEN_ADDR", ":2649"),
+		ListenAddr:     envStr("LISTEN_ADDR", DefaultListenAddr),
 		DataDir:        envStr("DATA_DIR", "/data"),
 		MountRoot:      envStr("MOUNT_ROOT", "/mnt/smb"),
 		CN4MStatusURL:  envStr("CN4M_CASCADE_STATUS_URL", DefaultCN4MStatusURL),

@@ -230,7 +230,14 @@ func buildHarness(t *testing.T, tune func(*mountmgr.Config)) *harness {
 		if err := mounts.Shutdown(ctx); err != nil {
 			t.Logf("mount shutdown: %v", err)
 		}
-		if err := notifier.Stop(ctx); err != nil {
+		// Its own deadline, not the one above. Unmounting a blackholed server
+		// can consume the whole 30s, and passing the exhausted context on made
+		// the notifier report "context deadline exceeded" for having been
+		// given no time rather than for taking too long — a real failure
+		// message about an imaginary failure.
+		notifyCtx, cancelNotify := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelNotify()
+		if err := notifier.Stop(notifyCtx); err != nil {
 			t.Logf("notifier shutdown: %v", err)
 		}
 		stopNotify()

@@ -105,7 +105,9 @@ type DiffOptions struct {
 	Mode      store.SyncMode
 	Tolerance time.Duration
 	// IgnoreDSTHour treats a whole-hour offset as equal, the classic
-	// FAT/DST artefact FreeFileSync also has a toggle for.
+	// FAT/DST artefact: a filesystem that stores local time rather than UTC
+	// shifts every mtime by an hour when the clocks change, which would
+	// otherwise make an entire tree look modified twice a year.
 	IgnoreDSTHour bool
 	// CaseInsensitiveDest tells the differ that two destination paths
 	// differing only in case are the same file. SMB targets usually are

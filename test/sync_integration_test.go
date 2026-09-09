@@ -588,14 +588,108 @@ func blackhole(t *testing.T, ip string) {
 	if err := iptablesBounded("-A", "OUTPUT", "-d", ip, "-j", "DROP"); err != nil {
 		t.Skipf("could not install an iptables rule (needs NET_ADMIN): %v", err)
 	}
+
+	// From here the rule is installed, so the removal path is registered
+	// FIRST — before anything below that can t.Fatal. An abort between the
+	// insert and the cleanup registration would leave a permanent DROP rule
+	// with nothing at all arranged to remove it, which is the wall of
+	// unrelated mount failures this whole mechanism exists to prevent.
+	base := filepath.Join(os.TempDir(),
+		fmt.Sprintf("blackhole-%s-%d", strings.ReplaceAll(ip, ".", "-"), time.Now().UnixNano()))
+	arm, done := base+".arm", base+".done"
+
 	t.Cleanup(func() {
-		// The rule must come out even if the drain below cannot finish:
-		// leaving it installed wedges every later test against this server.
-		if err := iptablesBounded("-D", "OUTPUT", "-d", ip, "-j", "DROP"); err != nil {
-			t.Errorf("could not remove the blackhole on %s; the harness is now dirty "+
-				"(run `make harness-clean`): %v", ip, err)
+		// The fast path: remove it directly. This is what happens whenever the
+		// process is not wedged, which is the common case.
+		if err := removeBlackhole(t, ip); err == nil {
+			_ = os.WriteFile(done, nil, 0o600)
+			dropBlackholes(ip)
 			return
+		} else {
+			t.Logf("could not remove the blackhole on %s directly (%v); handing it to the helper", ip, err)
 		}
-		dropBlackholes(ip)
+
+		// Wedged. Writing a file needs no fork, which is the whole point:
+		// this is the one signal a process that cannot fork can still send.
+		if err := os.WriteFile(arm, []byte(ip), 0o600); err != nil {
+			t.Errorf("could not arm the blackhole helper for %s (%v); "+
+				"the harness is dirty — run `make harness-clean`", ip, err)
+		}
+		// Deliberately not a test failure otherwise. The rule comes out either
+		// way, and failing here reported a harness condition as a broken sync,
+		// which is how a wall of unrelated failures came to look like a
+		// fan-out bug twice (PROGRESS.md §7b, §7d, §7e).
 	})
+
+	// The helper, forked NOW — while forking still works.
+	//
+	// Removing this rule later can be impossible, not merely slow, and the
+	// reason is circular: removal needs a fork; fork blocks in a process whose
+	// threads are parked in uninterruptible CIFS syscalls; and those threads
+	// are parked precisely *because* the rule is installed. Retrying cannot
+	// break that loop, which is why an earlier 90-second retry budget failed
+	// every attempt and then timed out the whole suite (§7e).
+	//
+	// It **waits for a signal rather than a timer**. An earlier version slept
+	// 45s from install and then removed the rule, which was not a dead-man's
+	// switch at all but a 45-second cap on the blackhole — and every caller
+	// budgets far longer than that (this file allows 90s of detection latency;
+	// phase4 allows 120s). It would eventually have revived a destination
+	// mid-test and produced a "sync succeeded when it should have failed"
+	// failure that pointed at the engine rather than at this timer.
+	//
+	// So: poll for .arm (cleanup failed → remove the rule) or .done (cleanup
+	// succeeded → nothing to do), and give up after a bounded life so a killed
+	// test binary cannot leave a helper running indefinitely. `exec` on the
+	// firing path, so the child never needs a fork of its own either.
+	script := fmt.Sprintf(
+		`i=0; while [ $i -lt %d ]; do `+
+			`if [ -f %q ]; then rm -f %q %q; exec iptables -w 5 -D OUTPUT -d %s -j DROP; fi; `+
+			`if [ -f %q ]; then rm -f %q; exit 0; fi; `+
+			`i=$((i+1)); sleep 2; done; rm -f %q %q`,
+		int(helperLifetime.Seconds()/2), arm, arm, done, ip, done, done, arm, done)
+
+	helper := exec.Command("setsid", "sh", "-c", script)
+	if err := helper.Start(); err != nil {
+		// Not fatal: the direct path still works in the common case, and the
+		// cleanup above is already registered.
+		t.Logf("could not start the blackhole helper for %s (%v); "+
+			"a wedged cleanup will need `make harness-clean`", ip, err)
+		return
+	}
+	// Reaped so it is not left a zombie for the life of the suite. On its own
+	// goroutine because the child outlives this test by design.
+	go func() { _ = helper.Wait() }()
+}
+
+// helperLifetime bounds how long a blackhole helper waits for its signal.
+//
+// Longer than the slowest caller's blackhole window — phase4 allows 120s of
+// detection plus 90s of run — so it is still watching when cleanup happens,
+// and short enough that a test binary killed mid-run cannot leave one polling
+// for the rest of the day.
+const helperLifetime = 10 * time.Minute
+
+// removeBlackhole makes ONE bounded attempt to delete the rule.
+//
+// Deliberately not a retry loop. An earlier version retried over a 90-second
+// budget, which was wrong twice over: it cannot succeed — the fork it needs is
+// blocked for as long as the rule is installed, which is the circular
+// dependency the dead-man's switch exists for — and the time it spent failing
+// pushed the whole suite past `go test -timeout`, turning a recoverable mess
+// into a hard timeout with no results at all.
+//
+// So this is the fast path, nothing more. It succeeds whenever the process is
+// not wedged, which is the common case; when it cannot, the switch clears the
+// rule out of band and the suite carries on.
+func removeBlackhole(t *testing.T, ip string) error {
+	t.Helper()
+
+	err := iptablesBounded("-D", "OUTPUT", "-d", ip, "-j", "DROP")
+	// "Bad rule (does a matching rule exist in that chain?)" means it is
+	// already gone, which is what the caller wanted.
+	if err != nil && strings.Contains(err.Error(), "Bad rule") {
+		return nil
+	}
+	return err
 }

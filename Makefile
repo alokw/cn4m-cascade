@@ -55,6 +55,10 @@ verify-cifs: ## PROGRESS.md B-4: prove the host kernel can do CIFS mounts
 
 .PHONY: verify-image
 verify-image: image ## Prove the PRODUCTION image can mount CIFS (SPEC.md §11, 6a)
+	@# Needs the Samba harness: it mounts a real share on the harness network.
+	@docker network inspect cn4m-cascade_smbnet >/dev/null 2>&1 || { \
+	  echo "The test harness is not up — this mounts a real share from it."; \
+	  echo "Run: make harness-up"; exit 1; }
 	@# Distinct from verify-cifs, which proves the *kernel* can mount using the
 	@# Debian dev container. This proves the alpine image that actually ships
 	@# can do it: same kernel, different userspace mount.cifs and a different
@@ -96,14 +100,19 @@ web-dev: ## Vite dev server on http://localhost:5173 (proxies /api to the Go ser
 	$(COMPOSE) exec dev sh -c 'cd /src/web && { [ -d node_modules ] || npm ci --no-audit --no-fund; } && npm run dev -- --host 0.0.0.0'
 
 .PHONY: run
-run: image ## Run the production image on http://localhost:2649
+run: require-env image ## Run the production image on http://localhost:2649
+	$(PROD) up -d
+	@echo "cn4m cascade is on http://localhost:2649  —  make logs / make down"
+
+.PHONY: require-env
+require-env:
+	@# A prerequisite of its own, so a missing .env is reported in a second
+	@# rather than after a full image build.
 	@test -f .env || { \
 	  echo "No .env file. Create one with at least:"; \
 	  echo "  ENCRYPTION_KEY=$$(head -c 24 /dev/urandom | base64 | tr -d '=+/' | head -c 32)"; \
 	  echo "and optionally CN4M_CASCADE_ADMIN_PASSWORD, TZ, CN4M_CASCADE_STATUS_URL."; \
 	  exit 1; }
-	$(PROD) up -d
-	@echo "cn4m cascade is on http://localhost:2649  —  make logs / make down"
 
 .PHONY: image
 image: ## Build the production image (SPEC.md §10)
@@ -120,7 +129,7 @@ logs: ## Follow the production server's logs
 
 .PHONY: dev-run
 dev-run: ## Run the server from source in the dev container, on :12649 (collides with test-integration)
-	@echo "Serving from source at http://localhost:12649 — production is `make run` on :2649."
+	@echo 'Serving from source at http://localhost:12649 — production is: make run (on :2649)'
 	$(COMPOSE) exec dev sh -c 'cd /src && go run ./cmd/cn4m-cascade'
 
 .PHONY: lint
@@ -138,10 +147,17 @@ test-unit: ## Unit tests under the race detector (no kernel, no Samba)
 # server, a *new* mount to it returns error 115, which reads exactly like a
 # broken change rather than a dirty harness.
 .PHONY: harness-clean
+# Removing the blackhole signal files is enough to disarm an orphaned helper:
+# each watches one specific path, so with its files gone it can never fire and
+# simply idles out inside its bounded life. Deliberately no `pkill` — an
+# earlier version ran `pkill -f "blackhole-.*"`, which matched the very shell
+# running it (the pattern appears in its own command line) and killed
+# harness-clean mid-run with exit 143.
 harness-clean: ## Clear leftover mounts and blackholes from a killed test run
 	@$(DEV) sh -c 'mount -t cifs 2>/dev/null | awk "{print \$$3}" | grep -E "^/tmp/(Test|cn4m-mnt-)" \
 	  | while read m; do umount -l "$$m" 2>/dev/null && echo "unmounted $$m"; done; \
 	  rmdir /tmp/cn4m-mnt-*/* /tmp/cn4m-mnt-* 2>/dev/null; \
+	  rm -f /tmp/blackhole-* 2>/dev/null; \
 	  for ip in 172.28.0.10 172.28.0.11; do \
 	    while iptables -D OUTPUT -d $$ip -j DROP 2>/dev/null; do echo "removed blackhole on $$ip"; done; \
 	  done; true'
@@ -149,8 +165,15 @@ harness-clean: ## Clear leftover mounts and blackholes from a killed test run
 # -timeout is explicit because the default one has been observed not to fire:
 # a run wedged in TestDestinationDisappearsMidRun with a leftover blackhole
 # parked below the point where Go's watchdog can act, and simply sat there
-# rather than dumping stacks. 15m is comfortably above the ~5.5m the suite
-# takes; the point is a stack dump instead of an indefinite park.
+# rather than dumping stacks. The point is a stack dump instead of an
+# indefinite park.
+#
+# Raised from 15m to 25m in Phase 6a. The original figure was "comfortably
+# above the ~5.5m the suite takes", and that stopped being true as the suite
+# grew from 53 tests to 85 — a run is now ~10m, and TestDestinationDisappearsMidRun
+# alone can spend several minutes in cleanup when its destination is wedged.
+# A 15m budget started killing the suite outright, which loses every result
+# rather than one test's.
 .PHONY: test-integration
 test-integration: harness-clean web-build ## Integration tests against the Samba harness
 	@# A container's environment is fixed at creation, so a variable renamed in
@@ -164,7 +187,7 @@ test-integration: harness-clean web-build ## Integration tests against the Samba
 	       echo "The container predates the current docker-compose.test.yml."; \
 	       echo "Recreate it:  docker compose -f docker-compose.test.yml up -d --force-recreate dev"; \
 	       exit 1; }
-	$(DEV) env CGO_ENABLED=1 go test -race -tags=integration -count=1 -timeout 15m -v ./test/...
+	$(DEV) env CGO_ENABLED=1 go test -race -tags=integration -count=1 -timeout 25m -v ./test/...
 
 .PHONY: test-scale
 test-scale: ## The 100k-file mirror exit criterion (slow: several minutes)

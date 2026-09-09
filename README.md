@@ -1,6 +1,6 @@
 # cn4m-cascade — SMB Sync Engine
 
-A self-hosted sync tool in the spirit of FreeFileSync, run from a web UI and packaged as a single
+A self-hosted file sync tool for SMB shares and local folders, run from a web UI and packaged as a single
 container. Sources and destinations are primarily **SMB/CIFS shares addressed by IP**, mounted on
 demand by the kernel and treated as ordinary filesystem paths, so the sync engine itself never
 learns about SMB.
@@ -10,15 +10,17 @@ working rules; [PROGRESS.md](PROGRESS.md) tracks what is built and what is next.
 
 ## Status
 
-Built in phases (SPEC.md §11). **Phases 1 and 2 of 6 are complete.**
+Built in phases (SPEC.md §11). **Phases 1 to 5 are complete, and Phase 6 has begun with the
+production packaging** — so this is deployable: `make image && make run`, then open
+<http://localhost:2649>.
 
 | | |
 |---|---|
-| ✅ Works today | Target CRUD over HTTP; on-demand kernel CIFS mounts with refcounting and an idle grace period; SMB dialect and multichannel fallback; stale-mount detection; encrypted credentials; **the sync engine — mirror and update modes to a single destination, with a concurrent scanner, parallel copies, resumable temp-file writes, retries, cancellation, a task log and live progress/ETA** |
-| ⛔ Not built yet | Filters, multi-destination fan-out, the web UI, scheduling, webhooks, two-way sync, rename/move detection |
+| ✅ Works today | The full web UI — dashboard, jobs, targets, run detail, logs, settings. Mirror and update modes, fan-out to many destinations, include/exclude filters with global exclusions, on-demand kernel CIFS mounts with refcounting and an idle grace period, SMB dialect and multichannel fallback, encrypted credentials, preview-before-run, cron scheduling, webhook triggers and signed outbound callbacks, cn4m suite reporting, and a production Docker image |
+| ⛔ Not built yet | Bandwidth limiting, throughput graph, log retention, portable configuration export |
+| 🚫 Not planned | **Two-way sync** — deferred indefinitely, SPEC.md §14.1 |
 
-There is no UI yet — everything is driven over HTTP. Syncing works: a job mirrors or updates one
-source to one destination, and has been tested at 100,000 files.
+Tested at 100,000 files.
 
 ## Sync modes
 
@@ -92,17 +94,21 @@ make down       # stop it
 ```
 
 `make run` needs a `.env` beside the compose file and refuses to start without one, because a server
-that comes up without an encryption key would be a server that cannot store a credential:
+that comes up without an encryption key would be a server that cannot store a credential. Start from
+the template:
 
-```ini
-ENCRYPTION_KEY=<32+ random characters — losing this loses every stored password>
-CN4M_CASCADE_ADMIN_PASSWORD=<optional; seeds first-run setup, never overwrites>
-TZ=America/New_York
-CN4M_CASCADE_STATUS_URL=http://host.docker.internal:2640/suite/status   # or "off"
+```bash
+cp .env.example .env
+openssl rand -base64 32        # paste into ENCRYPTION_KEY
 ```
 
-`make run` prints a generated key if you have no `.env` yet. **Back up `./data`** — it holds the
-SQLite database and the encrypted credentials, and nothing else can reconstruct them.
+`.env.example` documents every setting; only `ENCRYPTION_KEY` is required. `make run` also prints a
+generated key if you try it without a `.env`.
+
+**Back up `./data` and `ENCRYPTION_KEY` together.** The database holds the encrypted credentials and
+the key decrypts them: either one alone is useless, and there is no recovery path from losing the
+key. Both are gitignored, so neither is in the repository — a fresh clone starts with no targets and
+no jobs, which is correct for a separate installation and worth knowing if you expected otherwise.
 
 The production stack and the test harness are deliberately separate compose projects on different
 ports (2649 and 12649), so `make run` and `make test-integration` cannot interfere. They used to
@@ -137,14 +143,31 @@ here as inconclusive and go on to step 3, which is the real test.
 **3. Mount an actual share from the production image.** Replace the host, share and credentials with
 a real SMB target on your network — a NAS you already use is ideal.
 
+First write a credentials file — **not** on the command line, where it would land in PowerShell
+history, in `docker inspect`, and in the process table:
+
+```powershell
+notepad $env:USERPROFILE\smbcreds.txt
+```
+
+```ini
+username=YOURUSER
+password=YOURPASS
+```
+
+Then mount with it bind-mounted read-only, and delete it afterwards:
+
 ```powershell
 docker build -t cn4m-cascade:latest .
 
 docker run --rm `
   --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH `
   --security-opt apparmor:unconfined `
+  -v "${env:USERPROFILE}/smbcreds.txt:/tmp/c:ro" `
   --entrypoint sh cn4m-cascade:latest -c `
-  "mkdir -p /mnt/probe; printf 'username=YOURUSER\npassword=YOURPASS\n' > /tmp/c; chmod 600 /tmp/c; mount.cifs //192.168.1.50/yourshare /mnt/probe -o credentials=/tmp/c,vers=3.1.1 && ls /mnt/probe && umount /mnt/probe && echo 'WINDOWS CIFS OK'"
+  "mkdir -p /mnt/probe && mount.cifs //192.168.1.50/yourshare /mnt/probe -o credentials=/tmp/c,vers=3.1.1 && ls /mnt/probe && umount /mnt/probe && echo 'WINDOWS CIFS OK'"
+
+Remove-Item $env:USERPROFILE\smbcreds.txt
 ```
 
 `WINDOWS CIFS OK` with a directory listing above it is the whole answer: the image, the capabilities
@@ -438,7 +461,10 @@ This is deliberate, and worth understanding before deploying it (SPEC.md §3):
 - **`CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH`** — `mount.cifs` cannot mount anything without them.
   A container with `SYS_ADMIN` is close to root on the host. Run this on a machine you trust.
 - **`apparmor:unconfined`** — some hosts block mounting from a container regardless of capabilities.
-- **`network_mode: host`** (production) — removes NAT overhead between the container and the SMB
+- **Bridge networking with a published port** (production) — `network_mode: host` was the original
+  plan and is Linux-only: on Docker Desktop the container lives in a VM, so "host" means the VM and
+  the UI is unreachable from your browser. On a Linux host you may swap it back to remove NAT
+  overhead between the container and the SMB
   server, which matters because saturating a gigabit link is a first-class requirement.
 - **Let the container own its mounts.** If the host already mounts the same share, the kernel may
   share the CIFS superblock and mix mount options between them (SPEC.md §13).

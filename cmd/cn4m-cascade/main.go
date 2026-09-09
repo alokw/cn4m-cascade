@@ -45,10 +45,9 @@ const shutdownTimeout = 30 * time.Second
 func main() {
 	// The container healthcheck, served by the binary itself.
 	//
-	// debian:bookworm-slim ships neither curl nor wget, and installing one
-	// purely so Docker can ask "are you alive?" would add a network tool to a
-	// production image for no other reason. The binary already knows its own
-	// listen address, so it can ask itself.
+	// The image could shell out to busybox wget, but the binary already knows
+	// its own listen address and how to read LISTEN_ADDR, so asking itself is
+	// both shorter and immune to the base image changing what it ships.
 	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
 		os.Exit(healthcheck())
 	}
@@ -73,7 +72,7 @@ func main() {
 func healthcheck() int {
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {
-		addr = ":2649"
+		addr = config.DefaultListenAddr
 	}
 	// ":2649" is a listen address, not a dial address.
 	if strings.HasPrefix(addr, ":") {

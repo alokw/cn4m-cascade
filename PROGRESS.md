@@ -98,7 +98,9 @@ is what proves the embedded `time/tzdata` works — and what stops a slimmed ima
 every cron schedule into UTC.
 
 ### Outstanding
-- Fresh-context review (CLAUDE.md requires one before the phase counts as done).
+- ~~Fresh-context review~~ — **done, §5p.** Nine findings including two HIGH, all fixed; the suite is
+  84 PASS / 0 FAIL / 1 SKIP afterwards with the harness clean (0 rules, 0 mount roots, 0 stale
+  signal files).
 - **Windows verification** — the WSL2 kernel's CIFS support cannot be tested from macOS. README has
   the procedure; it is U-7.
 
@@ -957,6 +959,9 @@ D-1…D-13 were approved 2026-08-31 before implementation; D-14…D-17 came out 
 | D-108 | **The hook rate limiter runs *after* token verification, not before** | Checking `blocked()` first meant one client with a stale token permanently 429'd every other caller at the same address — and behind a NAT, a reverse proxy or a Docker bridge, every integration shares one address. A bad token is still recorded and still blocked, so brute force is bounded exactly as before; what changes is that a working integration is never collateral damage. The map also has a hard ceiling with oldest-first eviction, because expiry alone is not a bound: a burst from many fresh addresses inside the window leaves every entry unexpired. Evicting a live entry forgets someone's failures early, which is the right trade — the ceiling exists to stop an anonymous caller exhausting memory, and an attacker still failing has one of the newest entries |
 | D-109 | **`prompt` is refused as an `unavailable_policy_override`, not accepted and ignored** | The override exists because an unattended trigger is exactly when a job set to *ask* about an unreachable destination should not. Accepting `prompt` would produce a run that parks for its whole timeout with nobody to answer — silently doing the opposite of what the parameter is for. The override applies to a copy of the job, so triggering a job can never reconfigure it |
 | D-110 | **A webhook `preview:true` can hold a job indefinitely, and SPEC says so** | A parked preview occupies the job until confirmed or timed out, and nobody confirms a webhook preview. A token holder looping it keeps the job unrunnable — scheduled runs skipped, manual ones refused. Support is kept because §8.1 offers it and "plan without executing" is legitimate, but the consequence is now written down: a trigger token's power is "can start this job **and** can keep it from running", which belongs in the decision to issue one |
+| D-120 | **The blackhole helper waits for a signal, never a timer** | The first version slept 45s from install and then removed the rule, which is not a dead-man's switch but a 45-second cap on the blackhole — and every caller budgets longer (90s of detection latency in the sync tests, 120s in phase 4). It would have revived a destination mid-test and produced a failure that read as a sync bug. The signal is a file, chosen because **writing a file needs no fork**: it is the one thing a process that cannot fork can still do, which is exactly the condition this whole mechanism exists for. Cleanup writes `.arm` on failure or `.done` on success; the helper polls for either and idles out inside a bounded life so a killed test binary cannot leave one running |
+| D-121 | **`harness-clean` disarms orphaned helpers by deleting their signal files, and deliberately does not `pkill`** | Each helper watches one specific path, so removing the files makes firing impossible and it expires on its own. The `pkill -f "blackhole-.*"` tried first matched the shell running it — the pattern appears in its own command line — and killed `harness-clean` with exit 143, aborting a suite run before a single test executed |
+| D-119 | **A blackholed destination's iptables rule is removed by a process forked before the wedge, not by retrying afterwards** | The removal needs a fork; fork is blocked by CIFS threads in uninterruptible sleep; those threads are stuck because the rule is installed. That is a deadlock, and two fixes failed on it before the shape was understood — a 90s retry loop (which cannot succeed, and whose cost then pushed the whole suite past `go test -timeout`, losing every result rather than one test's). The escape is now forked at *install* time into a process with no CIFS threads, gated on a marker file so it is a fallback rather than a second remover. Recorded because the general lesson is not about iptables: **when a cleanup depends on the resource it is cleaning up, retrying is not a strategy** — the escape has to be prepared while the resource still works |
 | D-116 | **App-specific environment variables are prefixed `CN4M_CASCADE_`, not `CN4M_`** | Requested 2026-09-09: cn4m is a *different program*, so `CN4M_ADMIN_PASSWORD` reads like configuration for it rather than for this. `ENCRYPTION_KEY`, `DATA_DIR`, `LISTEN_ADDR`, `MOUNT_ROOT` and `TZ` stay unprefixed — they are generic, and they are what SPEC.md §10 already documented. Done now because packaging is the last cheap moment: once a container is deployed, "assume all installations are fresh" stops being true |
 | D-117 | **The production image is alpine, decided by measurement rather than by the argument in the plan** | The plan chose `debian:bookworm-slim` for CIFS parity with the dev container. Debian measured 158 MB, with the slim base alone at 97.2 MB on arm64 — so §10's "well under 100 MB" was unreachable with it. The parity argument was also weak: the binary is static Go, so musl versus glibc cannot reach it, and CIFS behaviour is the kernel's. Rather than assert either way, `make verify-image` mounts, lists, writes and unmounts a real share **from the shipping image**; it passes. 25 MB. The zone database is embedded via `time/tzdata` instead of a system package, which is both smaller and immune to a base image without zoneinfo silently making every cron schedule UTC |
 | D-118 | **The harness publishes host port 12649; production owns 2649** | Giving the server its own container was necessary and not sufficient. Docker binds a *published* port whether or not anything inside the container listens, so the harness holding `2649:2649` meant `make run` still failed with "port is already allocated" whenever the harness was up — the collision this phase exists to end, one layer below where it was being fixed. Inside the container the server still listens on 2649, so tests and the Vite proxy are untouched |
@@ -1492,6 +1497,44 @@ only writing the assertion revealed that.
 
 ---
 
+## 5p. Phase 6a review — findings and resolution
+
+A fresh-context subagent reviewed the packaging work. **It began by correcting the brief**: I told it
+everything was uncommitted, when 6a was already spread across two commits plus a working-tree
+remainder, so `git diff` alone showed roughly a fifth of the change and none of the Dockerfile,
+compose, `main.go` or `config.go`. It noticed, reviewed `git diff c77a233` instead, and said so.
+Worth recording — a review that had trusted the brief would have skipped the entire phase and
+reported it clean.
+
+Nine findings plus a scoping correction. All fixed.
+
+| # | Finding | Resolution |
+|---|---|---|
+| R-1 | **HIGH: the Dockerfile contradicted SPEC §10 — written in the same change.** §10 was rewritten this phase to mandate `debian:bookworm-slim`, with a paragraph arguing against alpine; the Dockerfile shipped alpine. Both sat in the tree together | §10 corrected to alpine with the measured justification. CLAUDE.md's first rule is that SPEC is the source of truth and deviations are *raised*; deviating from a paragraph written minutes earlier is the same failure and is easier to miss because the reasoning still feels fresh |
+| R-2 | **HIGH: `make dev-run` ran `make run`.** The echo contained literal backticks, so the shell performed command substitution — a full image build and a live production container on :2649 before anything printed | Single-quoted. `make -n dev-run` now shows only the echo and the exec |
+| R-3 | **The dead-man's switch was not one.** It fired 45s after *install*, not after cleanup — while every caller budgets far longer (90s of detection latency here, 120s in phase 4). It would eventually have revived a blackholed destination mid-test, producing a "sync succeeded when it should have failed" result pointing at the engine rather than at a timer | Now waits for a **signal**: cleanup writes an `.arm` file on failure, which needs no fork — the one thing a wedged process can still do. Verified directly: unsignalled it does nothing; on arming it clears within seconds |
+| R-4 | **The rule could leak with no cleanup at all.** Two `t.Fatalf` calls sat between installing the rule and registering `t.Cleanup` | Cleanup is registered immediately after the insert, before anything that can abort |
+| R-5 | **The marker did not scope *which* rule was removed**, only whether the helper fired — so a stale helper could delete a later test's blackhole. The comment claimed otherwise | Same fix as R-3; the window shrank from 45s to the couple of seconds between a genuine cleanup failure and the helper acting |
+| R-6 | **Helpers and markers outlived the binary and survived `harness-clean`** | `harness-clean` removes the signal files, which disarms any orphan by construction. **My first attempt added `pkill -f "blackhole-.*"`, which matched the shell running it** — the pattern was in its own command line — and killed `harness-clean` with exit 143 |
+| R-7 | **README still documented `network_mode: host` as production networking**, which this phase had just replaced for being unusable on Docker Desktop | Corrected, with the Linux-only swap noted |
+| R-8 | **The README's Windows procedure put SMB credentials on a command line** — into PowerShell history, `docker inspect` and the process table — eleven lines above the sentence saying credentials are never passed that way. A hard CLAUDE.md rule, broken in documentation I wrote in this phase | Rewritten to a credentials file, bind-mounted read-only and deleted afterwards |
+| R-9 | **The README landing page still said "there is no UI yet" and "phases 1 and 2 of 6"** — above a new section telling people to deploy it and open the UI | Rewritten for what actually ships |
+| R-10 | Smaller: alpine 3.20 is past EOL (now 3.22, CIFS re-verified, 24.5 MB); `make run` built the image before checking for `.env`; `verify-image` silently required the harness; a production `.env` was reconfiguring the *test* harness, since compose auto-loads it for every file in the directory; the listen-address default was duplicated between `config` and the healthcheck | All corrected |
+
+**Also confirmed correct, and worth having checked**: Dockerfile layer caching in both stages; the
+`COPY --from=web` ordering against `web/embed.go`'s `all:` directive; `.dockerignore` excluding
+nothing the build needs; `time/tzdata` taking effect; compose's nested `${A:-${B:-C}}` defaults
+resolving (including the Windows fall-through, since PowerShell's `$HOME` is a shell variable and
+not an environment one); `extra_hosts: host-gateway`; `${ENCRYPTION_KEY:?…}` failing on empty as
+well as unset; `stop_grace_period` headroom; the healthcheck resolving all three `LISTEN_ADDR`
+forms; and the env rename being complete with no double-prefixing.
+
+The reviewer also raised the **musl DNS** question I had not considered — and answered it: with
+`CGO_ENABLED=0` the binary uses Go's pure-Go resolver, so musl's is never linked. That mattered
+because outbound callbacks resolve arbitrary hostnames and `host.docker.internal` has to resolve.
+
+---
+
 ## 6. Open items for the next session
 
 ### Phase 5b
@@ -1542,10 +1585,10 @@ only writing the assertion revealed that.
    from historical runs whose cleanup could not reach a blackholed server (`_ = os.RemoveAll(...)`
    swallows the failure). Harmless but unbounded, and it slows every listing of that share. Safe to
    delete — they are all test scope directories — but nothing should do so automatically.
-5. **The blackhole cleanup is a single 20s `iptables -D` attempt** and can be defeated by the same
-   blocked-fork condition it exists to clean up (§7b step 1). When it loses, the rule stays installed
-   and every later test in that run fails against *both* servers. Retrying with a total budget rather
-   than one attempt is the fix; the block is transient.
+5. ~~The blackhole cleanup is a single 20s `iptables -D` attempt…~~ **Fixed 2026-09-09 (D-119,
+   §7e).** Worth noting the diagnosis recorded here was wrong on both counts: the block is *not*
+   transient, and "retry with a budget" was tried and failed — twice, the second time badly enough
+   to time out the whole suite. The fix is a process forked before the wedge.
 6. **Nothing measures the `dest` filter's query cost.** D-87 added the index by reading the plan, not
    by timing it; there is no large-table benchmark anywhere in the repo, so a future filter added to
    `run_events` could regress the same way without anything noticing.
@@ -1797,6 +1840,51 @@ integration test asserts the guarantee (ends cleanly within 90s) and logs the ti
 asserting it. Only `echo_interval=1` reliably lands under 30s, at the cost of the kernel being
 quickest to declare a merely slow server dead; it stays available as a per-target
 `mount_opts_override` for anyone who wants it.
+
+## 7e. The blackhole cleanup deadlock, and two wrong fixes (2026-09-09)
+
+The recurring cascade of §7b finally got diagnosed properly, after two failed attempts that are
+worth recording because each was wrong in an instructive way.
+
+**The actual mechanism is a deadlock, not a delay.** `TestDestinationDisappearsMidRun` installs an
+iptables DROP rule to kill a destination mid-run. Removing that rule means forking `iptables`. Fork
+blocks in a process whose threads are parked in uninterruptible CIFS syscalls. Those threads are
+parked *because the rule is installed*. So the rule can only be removed by an operation the rule
+itself prevents.
+
+**Wrong fix #1: retry.** Assuming the block was transient — "the kernel gives up on the dead server
+within a minute" — the removal was given a 90-second budget. The log answered directly: *"after 4
+attempts over 1m30s: iptables -D … did not return within 20s"*. Every attempt timed out, because
+nothing about waiting makes the fork possible. **A retry loop cannot break a circular dependency**,
+and the timing data was available before the fix was written.
+
+**Wrong fix #2: the same retry, now expensive.** Those 90 seconds stacked on the harness's own
+30s + 30s + 10s shutdowns pushed the whole suite past `go test -timeout 15m`:
+`panic: test timed out after 15m0s`. That traded a cascade of ten failures for **losing every result
+in the run** — strictly worse. A slow cleanup is not a neutral cost when something upstream is
+counting.
+
+**The fix: fork the escape while forking still works.** At the moment the rule is installed — before
+any thread is wedged — a detached `setsid sh -c 'sleep 45; … exec iptables -D …'` is spawned. It
+lives in a separate process with no CIFS threads of its own, and `exec`s rather than forking again.
+A marker file makes it a genuine fallback: the normal cleanup deletes the marker on success, so the
+switch is a no-op unless the direct path failed, and it cannot clear a blackhole a later test
+installed legitimately. The direct attempt is now a single bounded try — the fast path, nothing more.
+
+Two supporting changes:
+- **The cleanup no longer fails the test.** A dirty harness was being reported as a broken sync,
+  which is how a wall of unrelated failures came to look like a fan-out bug twice.
+- **`-timeout` raised 15m → 25m.** Its own comment justified 15m as "comfortably above the ~5.5m the
+  suite takes", which stopped being true when the suite grew from 53 tests to 85 and a run became
+  ~10m.
+
+**Result:** `TestDestinationDisappearsMidRun` passes in **43s** (was 208s, then a 15m timeout), the
+two tests that used to cascade behind it run in ~1.2s each, and the suite is **84 PASS / 0 FAIL /
+1 SKIP**. The switch did not need to fire in that run — the direct path succeeded — so it is
+insurance verified in isolation rather than exercised by the suite. The wedge is intermittent, which
+is exactly why the insurance exists.
+
+---
 
 ## 7d. Two integration suites at once corrupt each other (2026-09-09)
 
