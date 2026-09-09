@@ -4,8 +4,8 @@
 # has bound the port.
 set -uo pipefail
 
-A="${CN4M_TEST_SAMBA_A:-172.28.0.10}"
-B="${CN4M_TEST_SAMBA_B:-172.28.0.11}"
+A="${CN4M_CASCADE_TEST_SAMBA_A:-172.28.0.10}"
+B="${CN4M_CASCADE_TEST_SAMBA_B:-172.28.0.11}"
 
 for _ in $(seq 1 60); do
     if (exec 3<>"/dev/tcp/$A/445") 2>/dev/null && (exec 3<>"/dev/tcp/$B/445") 2>/dev/null; then

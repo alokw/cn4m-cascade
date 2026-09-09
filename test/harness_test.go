@@ -352,9 +352,9 @@ func env(t *testing.T, name string) string {
 	return v
 }
 
-func sambaA(t *testing.T) string    { return env(t, "CN4M_TEST_SAMBA_A") }
-func sambaB(t *testing.T) string    { return env(t, "CN4M_TEST_SAMBA_B") }
-func offlineIP(t *testing.T) string { return env(t, "CN4M_TEST_OFFLINE") }
+func sambaA(t *testing.T) string    { return env(t, "CN4M_CASCADE_TEST_SAMBA_A") }
+func sambaB(t *testing.T) string    { return env(t, "CN4M_CASCADE_TEST_SAMBA_B") }
+func offlineIP(t *testing.T) string { return env(t, "CN4M_CASCADE_TEST_OFFLINE") }
 
 func uniqueName(prefix string) string {
 	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())

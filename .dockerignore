@@ -1,0 +1,22 @@
+# Everything the build does not need. Keeping this tight matters more than
+# usual here: the build context is sent to the daemon on every `docker build`,
+# and `data/` can hold a multi-megabyte SQLite database plus credentials.
+.git
+.github
+data
+local
+node_modules
+web/node_modules
+web/dist
+*.log
+.env
+.DS_Store
+
+# Docs and test scaffolding play no part in the production image.
+PROGRESS.md
+SPEC.md
+CLAUDE.md
+README.md
+docker-compose.test.yml
+Dockerfile.dev
+test/

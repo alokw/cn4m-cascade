@@ -149,7 +149,7 @@ func TestUnknownTriggerTokenIsIndistinguishableFromNoJob(t *testing.T) {
 // The cn4m callback is created once and then belongs to whoever runs the
 // installation.
 //
-// The rule matters because CN4M_STATUS_URL lives in a compose file: if it
+// The rule matters because CN4M_CASCADE_STATUS_URL lives in a compose file: if it
 // re-applied on every start, someone who re-pointed the callback in the UI
 // would find it silently reverted at the next restart. Same reasoning as the
 // admin password env var, which never overwrites an existing password.

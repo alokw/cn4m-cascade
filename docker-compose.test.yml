@@ -27,9 +27,9 @@ services:
     security_opt: [apparmor:unconfined]
     environment:
       # 172.28.0.99 is deliberately unassigned: the offline-host test target.
-      CN4M_TEST_SAMBA_A: 172.28.0.10
-      CN4M_TEST_SAMBA_B: 172.28.0.11
-      CN4M_TEST_OFFLINE: 172.28.0.99
+      CN4M_CASCADE_TEST_SAMBA_A: 172.28.0.10
+      CN4M_CASCADE_TEST_SAMBA_B: 172.28.0.11
+      CN4M_CASCADE_TEST_OFFLINE: 172.28.0.99
       ENCRYPTION_KEY: test-encryption-key-not-for-production
       # Cron schedules are read in the server's local time, which in a
       # container is UTC unless this says otherwise — so "0 2 * * *" would
@@ -42,7 +42,7 @@ services:
       # that is not true. Only ever used to create the callback on a fresh
       # database — after that the row is editable in the UI and this variable
       # will not overwrite it.
-      CN4M_STATUS_URL: ${CN4M_STATUS_URL:-http://localhost:2640/suite/status}
+      CN4M_CASCADE_STATUS_URL: ${CN4M_CASCADE_STATUS_URL:-http://localhost:2640/suite/status}
     volumes:
       - .:/src
       - gomodcache:/go/pkg/mod
@@ -55,21 +55,28 @@ services:
       # Default: ~/cn4m on macOS and Linux, %USERPROFILE%\cn4m on Windows.
       # `make harness-up` creates it if it does not exist.
       #
-      # To use a different folder, set CN4M_LOCAL_DIR — either in your shell
+      # To use a different folder, set CN4M_CASCADE_LOCAL_DIR — either in your shell
       # or in a .env file beside this one:
       #
-      #     CN4M_LOCAL_DIR=/Volumes/media/to-back-up
+      #     CN4M_CASCADE_LOCAL_DIR=/Volumes/media/to-back-up
       #
       # The nesting below is the cross-platform part: HOME is set on macOS and
       # Linux, USERPROFILE on Windows. Docker Desktop accepts forward slashes
       # in a Windows path, so C:\Users\you/cn4m resolves correctly.
-      - ${CN4M_LOCAL_DIR:-${HOME:-${USERPROFILE:-/tmp}}/cn4m}:/mnt/local
-    # Reachable from the host browser for the manual pass: 2649 is the Go
-    # server (`make run`), 5173 is the Vite dev server (`make web-dev`), which
-    # proxies /api to 2649 inside the container.
+      - ${CN4M_CASCADE_LOCAL_DIR:-${HOME:-${USERPROFILE:-/tmp}}/cn4m}:/mnt/local
+    # Reachable from the host browser for the manual pass.
+    #
+    # Published on 12649, NOT 2649: the production stack owns 2649, and a
+    # published port is bound by Docker whether or not anything inside the
+    # container is listening. Sharing the number meant `make run` failed with
+    # "port is already allocated" whenever the harness was up — the same
+    # class of collision this phase exists to end, one layer down.
+    #
+    # Inside the container the server still listens on 2649, so the Vite proxy
+    # and every test are unaffected; only the host-side number differs.
     ports:
-      - "2649:2649"
-      - "5173:5173"
+      - "12649:2649"   # make dev-run  -> http://localhost:12649
+      - "5173:5173"    # make web-dev
     working_dir: /src
     networks: [smbnet]
     depends_on: [samba-a, samba-b]

@@ -317,29 +317,62 @@ Keep the UI dependency-light; polling fallback if WS drops.
 
 ## 10. Docker packaging
 
-- Multi-stage Dockerfile: Node stage builds the SPA → Go stage embeds it and builds a static binary → final stage on `debian:bookworm-slim` (or alpine) with `cifs-utils` installed. Final image should be well under 100 MB.
-- `docker-compose.yml`:
+- Multi-stage Dockerfile: Node stage builds the SPA → Go stage embeds it and builds a static binary → final stage on `debian:bookworm-slim` with `cifs-utils` **and `ca-certificates`** installed. Final image well under 100 MB.
+- **`bookworm-slim` rather than alpine**, deliberately: every CIFS behaviour here — the dialect ladder, multichannel fallback, the mount option strings, the uninterruptible-syscall hangs of §5 — was validated against bookworm's `mount.cifs` and glibc. Alpine saves around 20 MB and re-opens all of it against musl.
+- **`ca-certificates` is load-bearing**, not hygiene: outbound callbacks (§8.2) POST to arbitrary `https://` URLs and fail every one of them without a CA bundle.
+- **No fixed `GOARCH`.** The image builds for whatever the host is, so Windows and macOS both build natively. `CGO_ENABLED=0` and a pure-Go SQLite driver make that free. Multi-arch via buildx is available for *publishing* a prebuilt image and is not needed to run one.
 
 ```yaml
+# docker-compose.yml
 services:
-  smbsync:
-    image: smbsync:latest
-    network_mode: host          # performance + SMB simplicity
+  cn4m-cascade:
+    image: cn4m-cascade:latest
+    # Bridge networking with a published port, NOT network_mode: host.
+    #
+    # host mode is Linux-only. On Docker Desktop — Windows and macOS, which is
+    # where this actually runs — the container lives in a LinuxKit or WSL2 VM,
+    # so "host" means *the VM* and the UI would not be reachable from the
+    # user's browser at all. On a Linux host, `network_mode: host` remains a
+    # legitimate swap for the performance §3 wanted; nothing else changes.
+    ports: ["2649:2649"]
+    # Makes `host.docker.internal` resolve on Linux too, so one status URL
+    # works on every platform.
+    extra_hosts: ["host.docker.internal:host-gateway"]
     cap_add: [SYS_ADMIN, DAC_READ_SEARCH]
     security_opt: [apparmor:unconfined]   # needed for mount on some hosts
     environment:
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - CN4M_CASCADE_ADMIN_PASSWORD=${CN4M_CASCADE_ADMIN_PASSWORD}
       - LISTEN_ADDR=:2649
-      - TZ=${TZ:-UTC}            # cron schedules are read in this zone (§11, Phase 5a)
-      - CN4M_STATUS_URL=${CN4M_STATUS_URL:-http://localhost:2640/suite/status}   # §8.2; "off" to disable
+      - TZ=${TZ:-UTC}                     # cron schedules are read in this zone (§11, Phase 5a)
+      # localhost inside a bridge-networked container is the container itself,
+      # so the code's bare-metal default would post to itself.
+      - CN4M_CASCADE_STATUS_URL=${CN4M_CASCADE_STATUS_URL:-http://host.docker.internal:2640/suite/status}
     volumes:
-      - ./data:/data            # sqlite + logs
-      - /srv/local-stuff:/mnt/local/stuff:rw   # optional local targets
+      - ./data:/data                      # sqlite + logs
+      - ${CN4M_CASCADE_LOCAL_DIR:-./local}:/mnt/local:rw   # optional local targets
+    # Docker SIGKILLs 10s after SIGTERM by default; §10's own graceful shutdown
+    # budget is 30s, because lazy-unmounting a dead share is the slow case.
+    # Without this the container is killed two-thirds through the cleanup this
+    # section requires.
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/cn4m-cascade", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
 ```
 
-- Graceful shutdown: on SIGTERM, cancel running jobs (marking them `cancelled`), flush DB, lazy-unmount all shares.
+- Graceful shutdown: on SIGTERM, cancel running jobs (marking them `cancelled`), flush DB, lazy-unmount all shares. See `stop_grace_period` above — the promise is only kept if the orchestrator waits.
+
+> **Three corrections to this section, made 2026-09-09 when it was finally built.** It previously
+> passed `ADMIN_PASSWORD`, which the code has never read (it reads `CN4M_CASCADE_ADMIN_PASSWORD`), so
+> the compose file silently ignored the operator's password. It omitted `stop_grace_period`, which
+> made its own graceful-shutdown requirement unachievable. And it mandated `network_mode: host`,
+> which does not work on Docker Desktop and would have made the UI unreachable on the target
+> platform. All three were invisible until the file was actually run.
 
 ---
 
@@ -374,7 +407,15 @@ Split in two: **5a is scheduling**, **5b is webhooks** (inbound tokens and outbo
 
 > **Phases 5 and 6 previously had no exit criteria**, while phases 1–4 all did. CLAUDE.md makes a phase complete only when its exit criteria pass in the harness, so the two largest phases were the two that could not be closed. The criteria above were written 2026-09-05, before any Phase 5 code, so they describe what the phase must prove rather than what it happened to do.
 
-**Phase 6 — Polish.** Bandwidth limiting, throughput graph, multichannel toggle, log retention/pruning, **the packaging of §10**, docs. (Preview mode moved to Phase 4 — see the note there.)
+**Phase 6 — Packaging and polish.** **The packaging of §10 first**, then log retention/pruning, bandwidth limiting, throughput graph, multichannel toggle, docs. (Preview mode moved to Phase 4 — see the note there. Portable configuration is §8's open item, tracked in PROGRESS.md.)
+
+Ordered deliberately: **6a is packaging**, because until it exists there is no way to deploy this at all and everything else is polish on something only a developer can run — and because running the server currently means `exec`ing into the *test* container, which has collided with the suite badly enough to need a Docker daemon restart. **6b is log retention**, the only remaining item with a real failure mode: `run_events` is the largest table in the schema, it grows without bound, and the scheduler now produces runs unattended forever. **6c is bandwidth limiting** (§6.3), which touches the copy hot path and earns its own review. **6d is the throughput graph, the multichannel toggle and docs.**
+
+*Exit criteria (6a): the image builds on a machine with nothing installed but Docker and comes in under 100 MB; a container from that image serves the SPA and answers its healthcheck, and **mounts a real CIFS share** — which is what proves `cifs-utils` and the capabilities are right rather than merely that the binary starts; SIGTERM stops it within its grace period with any running job marked `cancelled` and its mounts released; a missing or too-short `ENCRYPTION_KEY` refuses to start rather than coming up insecure; and running the server no longer shares a container with the test harness, so `make run` and `make test-integration` cannot interfere.*
+
+*Exit criteria (6b): events older than the configured retention are pruned and newer ones are not; retention is configurable and a fresh install has a sane default; pruning a large backlog does not block a running sync; and a run's own events survive for the life of that run regardless of retention.*
+
+*Exit criteria (6c): a job with a bandwidth limit transfers measurably slower than the same job without one and still completes correctly; the limit is per job; and an unlimited job is not slowed by the limiter existing.*
 
 > **§10 was previously assigned to no phase.** Every phase above is a feature phase, so the
 > production Dockerfile and `docker-compose.yml` that §10 specifies were named nowhere in this list

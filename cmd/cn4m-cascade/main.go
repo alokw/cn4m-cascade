@@ -13,8 +13,19 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
+
+	// The IANA zone database, compiled into the binary.
+	//
+	// Cron schedules are read in the server's local zone (SPEC.md §11, Phase
+	// 5a), so a TZ the image cannot resolve means every schedule silently
+	// falls back to UTC — the failure the job editor's timezone line exists to
+	// make visible. Embedding removes the dependency on a system tzdata
+	// package entirely, which costs about 450 KB and works identically on any
+	// base image.
+	_ "time/tzdata"
 
 	"github.com/alokw/cn4m-cascade/internal/api"
 	"github.com/alokw/cn4m-cascade/internal/config"
@@ -32,6 +43,16 @@ import (
 const shutdownTimeout = 30 * time.Second
 
 func main() {
+	// The container healthcheck, served by the binary itself.
+	//
+	// debian:bookworm-slim ships neither curl nor wget, and installing one
+	// purely so Docker can ask "are you alive?" would add a network tool to a
+	// production image for no other reason. The binary already knows its own
+	// listen address, so it can ask itself.
+	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
+		os.Exit(healthcheck())
+	}
+
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
 	slog.SetDefault(log)
 
@@ -42,6 +63,35 @@ func main() {
 		fmt.Fprintf(os.Stderr, "cn4m-cascade: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// healthcheck probes the local /healthz and returns a process exit code.
+//
+// Deliberately minimal: it resolves the listen address the same way the server
+// does, so a container with a non-default LISTEN_ADDR checks the right port
+// rather than silently reporting unhealthy forever.
+func healthcheck() int {
+	addr := os.Getenv("LISTEN_ADDR")
+	if addr == "" {
+		addr = ":2649"
+	}
+	// ":2649" is a listen address, not a dial address.
+	if strings.HasPrefix(addr, ":") {
+		addr = "127.0.0.1" + addr
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://" + addr + "/healthz")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "healthcheck: %s\n", resp.Status)
+		return 1
+	}
+	return 0
 }
 
 func run(log *slog.Logger) error {
@@ -106,11 +156,11 @@ func run(log *slog.Logger) error {
 	// webhook's signing key rather than the encryption key itself, exactly as
 	// the mount manager is given a way to read a target's password.
 	// The suite-reporting callback, created once on a fresh installation at
-	// whatever CN4M_STATUS_URL says. "off" reports nowhere — for a cascade
+	// whatever CN4M_CASCADE_STATUS_URL says. "off" reports nowhere — for a cascade
 	// that is not part of a cn4m suite, or a developer who does not want a
 	// local run showing up in a shared status view.
 	if cfg.CN4MStatusURL == config.CN4MReportingOff {
-		log.Info("cn4m suite reporting is off (CN4M_STATUS_URL=off)")
+		log.Info("cn4m suite reporting is off (CN4M_CASCADE_STATUS_URL=off)")
 	} else if created, err := db.EnsureCN4MWebhook(ctx, cfg.CN4MStatusURL); err != nil {
 		// Not fatal: failing to set up a status callback is no reason to
 		// refuse to run backups.
@@ -134,7 +184,7 @@ func run(log *slog.Logger) error {
 
 	server := api.NewServer(db, provider, mounts, healthc, box, runs, log)
 
-	// CN4M_ADMIN_PASSWORD seeds first-run setup so a container can come up
+	// CN4M_CASCADE_ADMIN_PASSWORD seeds first-run setup so a container can come up
 	// already configured (SPEC.md §8). It never overwrites an existing
 	// password: an env var left in a compose file must not silently reset
 	// the credential every restart.
@@ -146,16 +196,16 @@ func run(log *slog.Logger) error {
 	// as a deliberate blank would turn a forgotten variable into a server
 	// anyone can sign into. Choosing no password has to be an explicit act, so
 	// it is only available through the first-run setup form.
-	if pw := os.Getenv("CN4M_ADMIN_PASSWORD"); pw != "" {
+	if pw := os.Getenv("CN4M_CASCADE_ADMIN_PASSWORD"); pw != "" {
 		set, err := db.AdminPasswordSet(ctx)
 		if err != nil {
 			return fmt.Errorf("checking whether an admin password is set: %w", err)
 		}
 		if !set {
 			if err := db.SetAdminPassword(ctx, pw); err != nil {
-				return fmt.Errorf("setting the admin password from CN4M_ADMIN_PASSWORD: %w", err)
+				return fmt.Errorf("setting the admin password from CN4M_CASCADE_ADMIN_PASSWORD: %w", err)
 			}
-			log.Info("admin password set from CN4M_ADMIN_PASSWORD")
+			log.Info("admin password set from CN4M_CASCADE_ADMIN_PASSWORD")
 		}
 	}
 

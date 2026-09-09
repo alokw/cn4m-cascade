@@ -1,0 +1,79 @@
+# Production deployment (SPEC.md §10).
+#
+# Separate from docker-compose.test.yml in every sense that matters — a
+# different image, a different project name, and no shared containers. Running
+# the server used to mean `exec`ing into the *test* container, which collided
+# with the suite twice and once left a container only a Docker daemon restart
+# could clear (PROGRESS.md §7a, §7d). Nothing here can touch the harness.
+#
+# The project name is explicit so it cannot drift into the harness's, which
+# derives "cn4m-cascade" from the directory. Do not change that one: its named
+# volumes carry the Go module and build caches.
+name: cn4m-cascade-server
+
+services:
+  cn4m-cascade:
+    image: cn4m-cascade:latest
+    build: .
+    container_name: cn4m-cascade
+
+    # Bridge networking with a published port, NOT network_mode: host.
+    #
+    # host mode is Linux-only. On Docker Desktop — Windows and macOS — the
+    # container runs inside a LinuxKit or WSL2 VM, so "host" is *the VM* and
+    # the UI would not be reachable from the browser at all. On a Linux host
+    # you may swap these two lines for `network_mode: host` and drop the
+    # published port; nothing else changes.
+    ports:
+      - "${LISTEN_PORT:-2649}:2649"
+
+    # Lets `host.docker.internal` resolve on Linux as well as Docker Desktop,
+    # so one status URL is correct on every platform.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # mount.cifs needs these. There is no smaller grant that can mount a
+    # share; see the README before deciding this is acceptable on a shared
+    # host.
+    cap_add:
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
+    security_opt:
+      - apparmor:unconfined
+
+    environment:
+      # Required. The server refuses to start without it, because target
+      # passwords are unreadable without the key that encrypted them.
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?set ENCRYPTION_KEY in .env — at least 16 characters}
+
+      # Optional: seeds first-run setup so a container can come up already
+      # configured. Never overwrites an existing password.
+      CN4M_CASCADE_ADMIN_PASSWORD: ${CN4M_CASCADE_ADMIN_PASSWORD:-}
+
+      LISTEN_ADDR: ":2649"
+
+      # Cron schedules are read in this zone. Unset means UTC, which is
+      # usually not what "0 2 * * *" was meant to mean.
+      TZ: ${TZ:-UTC}
+
+      # localhost inside a bridge-networked container is the *container*, so
+      # the code's bare-metal default would post status to itself. Set to
+      # "off" if this install is not part of a cn4m suite.
+      CN4M_CASCADE_STATUS_URL: ${CN4M_CASCADE_STATUS_URL:-http://host.docker.internal:2640/suite/status}
+
+    volumes:
+      # The SQLite database and the encrypted credentials live here. Back this
+      # up; losing it loses every target, job and run.
+      - ./data:/data
+      # Local folders to sync to or from. Defaults to ~/cn4m (%USERPROFILE%\cn4m
+      # on Windows), matching the harness, so the path typed into the UI is
+      # the same string on every platform.
+      - ${CN4M_CASCADE_LOCAL_DIR:-${HOME:-${USERPROFILE:-.}}/cn4m}:/mnt/local:rw
+
+    # Docker SIGKILLs 10s after SIGTERM by default; the graceful shutdown of
+    # §10 budgets 30s, because lazy-unmounting a share whose server has gone is
+    # the slow case. Without this the container is killed two-thirds of the way
+    # through the cleanup, which is exactly when that cleanup matters.
+    stop_grace_period: 45s
+
+    restart: unless-stopped

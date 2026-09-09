@@ -261,7 +261,7 @@ func nullableJobID(jobID string) any {
 // **Never overwrites an existing row**, which is the same rule the admin
 // password follows and for the same reason: an environment variable left in a
 // compose file must not silently undo a deliberate change made in the UI. So
-// CN4M_STATUS_URL sets the address a *fresh* installation starts with, and
+// CN4M_CASCADE_STATUS_URL sets the address a *fresh* installation starts with, and
 // after that the row belongs to whoever is running the thing.
 //
 // Keyed on the format rather than the URL, so a hook someone has already

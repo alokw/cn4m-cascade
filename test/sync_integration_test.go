@@ -338,7 +338,7 @@ func TestDestinationDisappearsMidRun(t *testing.T) {
 	// No override by default: this exercises the shipped mount options,
 	// including the echo_interval that governs detection time (D-25).
 	jobID, srcRoot, _ := smbJobFixture(t, h, string(store.ModeMirror), 1,
-		os.Getenv("CN4M_TEST_DEST_OPTS"))
+		os.Getenv("CN4M_CASCADE_TEST_DEST_OPTS"))
 
 	seedManyFiles(t, srcRoot, 4000)
 
@@ -376,13 +376,13 @@ func TestDestinationDisappearsMidRun(t *testing.T) {
 // The 100k-file exit criterion. Slow by nature, so it only runs when asked:
 // `make test-scale`.
 func TestScaleMirror(t *testing.T) {
-	target := os.Getenv("CN4M_SCALE_FILES")
+	target := os.Getenv("CN4M_CASCADE_SCALE_FILES")
 	if target == "" {
-		t.Skip("set CN4M_SCALE_FILES (e.g. `make test-scale`) to run the scale test")
+		t.Skip("set CN4M_CASCADE_SCALE_FILES (e.g. `make test-scale`) to run the scale test")
 	}
 	count, err := strconv.Atoi(target)
 	if err != nil {
-		t.Fatalf("CN4M_SCALE_FILES=%q is not a number", target)
+		t.Fatalf("CN4M_CASCADE_SCALE_FILES=%q is not a number", target)
 	}
 
 	h := newHarness(t, nil)

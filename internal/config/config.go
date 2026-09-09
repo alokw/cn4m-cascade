@@ -16,7 +16,7 @@ import (
 // normally deployed — cn4m's own client documents the same default.
 const DefaultCN4MStatusURL = "http://localhost:2640/suite/status"
 
-// CN4MReportingOff is the CN4M_STATUS_URL value that disables suite reporting
+// CN4MReportingOff is the CN4M_CASCADE_STATUS_URL value that disables suite reporting
 // entirely. A word rather than an empty string, because an empty environment
 // variable is far more often a mistake — an unset value in a compose file
 // expanding to nothing — than a decision.
@@ -30,7 +30,7 @@ type Config struct {
 
 	// CN4MStatusURL is where this reports its status in the cn4m suite
 	// (SPEC.md §8.2). Defaults to cn4m on the same machine, which is the
-	// common deployment; set CN4M_STATUS_URL when cn4m is elsewhere, or to
+	// common deployment; set CN4M_CASCADE_STATUS_URL when cn4m is elsewhere, or to
 	// "off" to report nowhere.
 	CN4MStatusURL string
 
@@ -64,7 +64,7 @@ func Load() (*Config, error) {
 		ListenAddr:     envStr("LISTEN_ADDR", ":2649"),
 		DataDir:        envStr("DATA_DIR", "/data"),
 		MountRoot:      envStr("MOUNT_ROOT", "/mnt/smb"),
-		CN4MStatusURL:  envStr("CN4M_STATUS_URL", DefaultCN4MStatusURL),
+		CN4MStatusURL:  envStr("CN4M_CASCADE_STATUS_URL", DefaultCN4MStatusURL),
 		EncryptionKey:  os.Getenv("ENCRYPTION_KEY"),
 		MountUID:       os.Getuid(),
 		MountGID:       os.Getgid(),

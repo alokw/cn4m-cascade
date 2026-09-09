@@ -3,6 +3,12 @@
 
 COMPOSE := docker compose -f docker-compose.test.yml
 
+# The production stack, deliberately a different compose project from the
+# harness above. `make run` used to exec into the *test* container, which is
+# how running the server and running the suite came to collide (PROGRESS.md
+# §7a, §7d). They now share nothing.
+PROD := docker compose -f docker-compose.yml
+
 # How to reach the dev container. Overridable because the compose one can end
 # up wedged and unkillable — CIFS threads in uninterruptible D state survive
 # `docker rm -f`, and only a Docker daemon restart clears them (PROGRESS.md
@@ -19,12 +25,12 @@ help:
 # The host folder exposed to the container as /mnt/local, so a "local" target
 # can point at real files on your machine. Override in your shell or a .env
 # file; see docker-compose.test.yml for the full explanation.
-CN4M_LOCAL_DIR ?= $(if $(HOME),$(HOME),$(USERPROFILE))/cn4m
-export CN4M_LOCAL_DIR
+CN4M_CASCADE_LOCAL_DIR ?= $(if $(HOME),$(HOME),$(USERPROFILE))/cn4m
+export CN4M_CASCADE_LOCAL_DIR
 
 .PHONY: local-dir
 local-dir: ## Create the host folder shared with the container as /mnt/local
-	@mkdir -p "$(CN4M_LOCAL_DIR)" && echo "local folder: $(CN4M_LOCAL_DIR) -> /mnt/local"
+	@mkdir -p "$(CN4M_CASCADE_LOCAL_DIR)" && echo "local folder: $(CN4M_CASCADE_LOCAL_DIR) -> /mnt/local"
 
 .PHONY: harness-up
 harness-up: local-dir ## Build and start the Samba servers + dev container
@@ -74,7 +80,31 @@ web-dev: ## Vite dev server on http://localhost:5173 (proxies /api to the Go ser
 	$(COMPOSE) exec dev sh -c 'cd /src/web && { [ -d node_modules ] || npm ci --no-audit --no-fund; } && npm run dev -- --host 0.0.0.0'
 
 .PHONY: run
-run: ## Run the server on http://localhost:2649 with the SPA embedded
+run: image ## Run the production image on http://localhost:2649
+	@test -f .env || { \
+	  echo "No .env file. Create one with at least:"; \
+	  echo "  ENCRYPTION_KEY=$$(head -c 24 /dev/urandom | base64 | tr -d '=+/' | head -c 32)"; \
+	  echo "and optionally CN4M_CASCADE_ADMIN_PASSWORD, TZ, CN4M_CASCADE_STATUS_URL."; \
+	  exit 1; }
+	$(PROD) up -d
+	@echo "cn4m cascade is on http://localhost:2649  —  make logs / make down"
+
+.PHONY: image
+image: ## Build the production image (SPEC.md §10)
+	docker build -t cn4m-cascade:latest .
+	@docker images cn4m-cascade:latest --format '  image size: {{.Size}}'
+
+.PHONY: down
+down: ## Stop the production stack
+	$(PROD) down
+
+.PHONY: logs
+logs: ## Follow the production server's logs
+	$(PROD) logs -f
+
+.PHONY: dev-run
+dev-run: ## Run the server from source in the dev container, on :12649 (collides with test-integration)
+	@echo "Serving from source at http://localhost:12649 — production is `make run` on :2649."
 	$(COMPOSE) exec dev sh -c 'cd /src && go run ./cmd/cn4m-cascade'
 
 .PHONY: lint
@@ -113,8 +143,8 @@ test-integration: harness-clean web-build ## Integration tests against the Samba
 	@# `ok` with exit 0 for having done nothing — which is how a rename once
 	@# produced a green run of 9 PASS and 70 SKIP (PROGRESS.md §7c). Refuse
 	@# outright rather than pass vacuously.
-	@$(DEV) sh -c 'test -n "$$CN4M_TEST_SAMBA_A" && test -n "$$CN4M_TEST_SAMBA_B"' \
-	  || { echo "CN4M_TEST_SAMBA_A/B are not set in the dev container."; \
+	@$(DEV) sh -c 'test -n "$$CN4M_CASCADE_TEST_SAMBA_A" && test -n "$$CN4M_CASCADE_TEST_SAMBA_B"' \
+	  || { echo "CN4M_CASCADE_TEST_SAMBA_A/B are not set in the dev container."; \
 	       echo "The container predates the current docker-compose.test.yml."; \
 	       echo "Recreate it:  docker compose -f docker-compose.test.yml up -d --force-recreate dev"; \
 	       exit 1; }
@@ -122,7 +152,7 @@ test-integration: harness-clean web-build ## Integration tests against the Samba
 
 .PHONY: test-scale
 test-scale: ## The 100k-file mirror exit criterion (slow: several minutes)
-	$(DEV) env CN4M_SCALE_FILES=100000 go test -tags=integration -count=1 -v -timeout 60m \
+	$(DEV) env CN4M_CASCADE_SCALE_FILES=100000 go test -tags=integration -count=1 -v -timeout 60m \
 	  -run TestScaleMirror ./test/...
 
 .PHONY: test
