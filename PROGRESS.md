@@ -101,8 +101,10 @@ every cron schedule into UTC.
 - ~~Fresh-context review~~ — **done, §5p.** Nine findings including two HIGH, all fixed; the suite is
   84 PASS / 0 FAIL / 1 SKIP afterwards with the harness clean (0 rules, 0 mount roots, 0 stale
   signal files).
-- **Windows verification** — the WSL2 kernel's CIFS support cannot be tested from macOS. README has
-  the procedure; it is U-7.
+- **Windows verification** — **done 2026-09-09, §7f**, including the UI: target saved, *Save and test*
+  green, and a real job copied a tree. The WSL2 kernel does CIFS; the shipping image mounted a real NAS. Getting there first required fixing a checkout bug that makes
+  the harness unrunnable on Windows (`*.sh` pinned to LF in `.gitattributes`). The UI half of U-7 —
+  *Save and test* against that NAS — is still unconfirmed.
 
 ---
 
@@ -1324,7 +1326,7 @@ user can action; everything else outstanding is in §6 and is mine.
 |---|---|---|---|
 | ~~U-1~~ | ~~**The manual browser pass**~~ — **done 2026-09-06**, six findings in §5m, all fixed | Confirmed working: never-run cards, logs, duplicate-target, the scheduling toggle, and a scheduled job firing on time | — |
 | ~~U-1b~~ | ~~**The Schedule controls**~~ — **done 2026-09-06.** The next-run preview was showing the browser's zone only, which made a UTC server look wrong (§5m M-5); fixed | — |
-| U-7 | **Verify CIFS mounting on Windows** — the README's *Verifying it on Windows* section has the exact commands. WSL2 uses a different kernel from the LinuxKit one Docker Desktop runs on a Mac, and kernel CIFS support is the one thing that cannot be worked around in this codebase | Only a Windows host can answer it | Before deploying there |
+| ~~U-7~~ | ~~**Verify CIFS mounting on Windows**~~ — **done 2026-09-09, end to end** (§7f). Windows 11 Pro 26200, Docker Desktop 26.1.4, WSL2 kernel `5.15.153.1-microsoft-standard-WSL2`. `cifs` is in `/proc/filesystems`; the shipping image mounted, listed, wrote and unmounted a harness share; and a credentialed SMB 3.1.1 mount of a real NAS (`//10.10.20.42/local_projects`) returned `WINDOWS CIFS OK` with a live listing. The browser half passed too: the NAS saved through the UI, *Save and test* went green, and a job then ran and copied files and folders successfully — so credential storage and the dialect ladder work on this host as well | — | — |
 | U-5 | **Re-check the six §5m fixes in a browser**, and the renamed build comes up at all | Only a browser can | None |
 | ~~U-6~~ | ~~**The Webhooks & API tab**~~ — **done 2026-09-09**, all of it worked. The format selector and the seeded cn4m row are new since that pass but are cosmetic additions to a screen already exercised | — |
 | ~~U-6-old~~ | ~~**The new Webhooks & API tab**~~ — create a token, confirm it is shown once and the curl examples work, regenerate and confirm the old one stops, add a callback URL and watch a run report to it | Only a browser can, and the one-shot token display is exactly the kind of thing that looks right until someone reloads the page | None |
@@ -1841,6 +1843,103 @@ asserting it. Only `echo_interval=1` reliably lands under 30s, at the cost of th
 quickest to declare a merely slow server dead; it stays available as a per-target
 `mount_opts_override` for anyone who wants it.
 
+## 7g. Three UX changes, and the one that was already built (2026-09-09)
+
+Requested after the Windows pass, once a real NAS job had run end to end.
+
+**Update is now the default mode**, and leads the dropdown ([JobEditor.tsx](web/src/screens/JobEditor.tsx)).
+Mirror stays selectable. Removing it outright was considered and rejected: it is specified in SPEC.md
+§1 and §7, and Phase 2's exit criteria *are* "mirror a 100k-file tree". Changing a default costs
+nothing and orphans no data; deleting the mode would have invalidated a recorded exit criterion and
+the whole `deletionGuard` suite along with it.
+
+**Missing destination folders were never the problem — they are already created.** `storage.CreateSubpath`
+exists, the runner sets it for destinations ([runner.go:883](internal/runner/runner.go#L883)) and
+deliberately does not for sources ([runner.go:1094](internal/runner/runner.go#L1094)). Both errors
+reported were sources. Worth remembering as a diagnostic habit: two similar-looking messages, and the
+feature to fix them was already in the tree on one side of the asymmetry.
+
+**A missing source is still a hard error at run time, on purpose.** The existing comment in
+`internal/storage/storage.go` states it: inventing a source turns a typo into a run that copies
+nothing and reports success. In mirror mode it is worse — an empty source is the textbook input for
+emptying a destination, and `deletionGuard` is a backstop that should not become load-bearing. So the
+fix went to **config time instead of run time**: the job editor checks the source subpath as you type
+(debounced, because a listing can mount a share) and offers **Create it now** when — and only when —
+the folder is genuinely absent.
+
+That "only when" needed a new distinction. `GET /api/browse` collapsed *absent* and *unreachable* into
+`target_unavailable`; it now returns **404 `path_not_found`** for `storage.ErrPathNotExist`, so a NAS
+that is merely down does not get offered a create button. Creation itself is a new bounded, validated
+**`POST /api/targets/{id}/mkdir`** that resolves the target at its own root first — so it can make a
+folder *under* a working target and cannot paper over a broken one.
+
+**The end-to-end check caught the new distinction being wrong**, which the unit tests had not: browsing
+a subpath on a *local* target whose root was also missing returned `path_not_found`, so a broken bind
+mount would have been offered a create button after all. `LocalStorage.check` decided "missing subpath"
+purely from `root != LocalPath`, which is true whether or not the root itself exists. It now also
+requires the root to be present (`rootExists`), and falls back to the bind-mount message otherwise.
+SMB was never affected: the mount has to succeed before the subpath is stat'd, so a share that resolves
+proves its own root. The lesson is narrow and repeatable — **a two-way distinction needs both directions
+tested**, and the one that was never asserted is the one that was wrong.
+
+### Verification (CLAUDE.md → Definition of done)
+| Gate | Result |
+|---|---|
+| `go build ./...` | ✅ |
+| `gofmt -l internal/ cmd/ web/` | ✅ 0 files (91 before the line-ending fix) |
+| `golangci-lint run` | ✅ 0 issues (3 before) |
+| `go test -race -count=1 ./...` | ✅ 11 packages |
+| `go test -race -tags=integration ./test/...` | ✅ `ok … 748s`, run twice; 85 tests defined and all three `CN4M_CASCADE_TEST_*` set, so not the vacuous-skip of §7c |
+| SPA `tsc -b && vite build` | ✅ |
+| Production image | ✅ 23.6 MB, healthy, new route behind auth |
+| End-to-end against a live server | ✅ six cases: create, idempotent re-create, traversal refused, broken target refused, and both directions of the 404/502 split |
+
+New tests: `TestMakeDirRejectsBadPaths` (7 cases, api) and
+`TestLocalMissingSubpathUnderMissingRootBlamesTheRoot` (storage, the regression above).
+
+**Not done:** a fresh-context review. CLAUDE.md requires one before declaring a *phase* complete; 6a was
+already reviewed in §5p and these are post-phase UX changes, so one is not owed — but it is also not
+been had, which is worth knowing when reading this diff.
+
+---
+
+## 7f. Windows: the harness cannot start from a stock checkout (2026-09-09)
+
+U-7 asked one question — does `mount.cifs` work in a container on a WSL2 kernel — and the answer is
+**yes, at every layer**. `cifs` is in `/proc/filesystems`, the 23.6 MB alpine image mounted a harness
+share over SMB 3.1.1 and wrote to it, and a credentialed mount of a real NAS listed it. Nothing in the
+packaging needed changing. **The obstacle was somewhere nobody had modelled.**
+
+**Both Samba containers exited 1 instantly**, saying `exec /usr/local/bin/entrypoint.sh: no such file or
+directory` about a file that is plainly in the image. `.gitattributes` said `* text=auto` and the host had
+`core.autocrlf=true`, so a Windows checkout gives every tracked text file CRLF — including the shell
+scripts that get `COPY`d into Linux images. The shebang became `#!/bin/sh\r`, and the kernel went looking
+for an interpreter literally named `/bin/sh<CR>`. **The error names the script, not the interpreter**,
+which is why it reads as a missing file rather than a missing shell.
+
+**The same root cause also breaks the lint gate**, which only showed up once Go was run on this host:
+`gofmt` normalises to LF, so a CRLF checkout makes *every* Go file "not properly formatted" — 91 of 92
+by `gofmt -l`, and `golangci-lint run` failed on three. CLAUDE.md requires lint to pass before any
+commit, so **committing from Windows was impossible** for a reason with nothing to do with the code.
+
+Fixed by pinning the whole tree with `* text=auto eol=lf` in `.gitattributes` (the repo is built and
+run entirely in Linux containers, and there are no `.bat`/`.ps1` files that would want CRLF) and
+renormalising the 157 tracked text files in the worktree. Because git already *stores* LF, that
+changed no content: the diff stayed limited to the files actually edited. Worth noting
+what this class of bug looks like: **it is invisible on every platform the project was developed on**, it
+survives `golangci-lint` and the whole Go test suite because no Go code is involved, and the failure
+surfaces two layers away from its cause. `* text=auto` is the default advice and it is wrong for anything
+executed by a Linux kernel.
+
+**A second trap, in our own instructions.** The README tells the operator to create `smbcreds.txt` with a
+fenced example. Copied out of a rendered view, the ` ``` ` fences land in the file, `mount.cifs` fails to
+parse it, and the result looks like bad credentials. README now says the file is exactly two lines.
+
+**The UI path passed too**, in the same session: the target saved, *Save and test* went green, and a job
+ran and copied its files and folders. So credential encryption and the dialect ladder are confirmed on
+Windows, not just the raw mount. **U-7 is closed.**
+
+---
 ## 7e. The blackhole cleanup deadlock, and two wrong fixes (2026-09-09)
 
 The recurring cascade of §7b finally got diagnosed properly, after two failed attempts that are
@@ -2054,7 +2153,10 @@ is guarded by `.seeded`, so a restart re-creates the fixtures only if they are a
 
 - **No Go toolchain on the host** (macOS 14 / arm64) and `mount.cifs` is Linux-only, so every build,
   lint and test runs in the dev container. The `Makefile` targets are `docker compose` wrappers.
-- **CIFS in the Docker Desktop kernel: confirmed working** (was blocker B-4).
+- **CIFS in the Docker Desktop kernel: confirmed working** (was blocker B-4) — on macOS/LinuxKit, and
+  since 2026-09-09 on **Windows/WSL2** as well (kernel `5.15.153.1-microsoft-standard-WSL2`, §7f).
+- **On Windows, clone with `*.sh` checked out as LF** or the Samba harness cannot start at all (§7f).
+  `make` is also absent; run the `docker compose` commands directly.
 - Docker Desktop's daemon hung for ~40 minutes during this session and needed a restart. If
   `docker` commands produce no output at all, that is the failure mode — restart Docker Desktop.
 - `network_mode: host` does not work on Docker Desktop for macOS; the test compose uses a bridge.

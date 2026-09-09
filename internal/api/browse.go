@@ -2,12 +2,14 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"path"
 	"sort"
 	"time"
 
 	"github.com/alokw/cn4m-cascade/internal/engine"
+	"github.com/alokw/cn4m-cascade/internal/storage"
 	"github.com/alokw/cn4m-cascade/internal/store"
 )
 
@@ -89,6 +91,14 @@ func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	}
 	root, err := st.Resolve(ctx)
 	if err != nil {
+		// A folder that is simply absent is not the same failure as a share
+		// that is down, and the job editor offers to create only the former.
+		// Collapsing both into target_unavailable would make "create it" show
+		// up for an unreachable NAS.
+		if errors.Is(err, storage.ErrPathNotExist) {
+			writeError(w, http.StatusNotFound, "path_not_found", err.Error(), "")
+			return
+		}
 		writeMountError(w, err)
 		return
 	}

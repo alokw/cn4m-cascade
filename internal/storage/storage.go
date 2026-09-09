@@ -207,7 +207,12 @@ func (l *LocalStorage) Release(_ context.Context) error { return nil }
 func (l *LocalStorage) check(root string) error {
 	info, err := os.Stat(root)
 	if os.IsNotExist(err) {
-		if root != l.target.LocalPath {
+		// A missing subpath only means "that folder is absent" when the
+		// target root itself is there. If the root is gone too the bind
+		// mount is wrong, and reporting the subpath as merely absent
+		// invites a caller to offer to create it on a target that cannot
+		// work at all (internal/api/browse.go's path_not_found).
+		if root != l.target.LocalPath && l.rootExists() {
 			// The target root is fine; something under it is not. Saying only
 			// "the target does not exist" here is how a job whose subpath is
 			// wrong reads as a broken target — the target tests green, and the
@@ -223,6 +228,13 @@ func (l *LocalStorage) check(root string) error {
 		return fmt.Errorf("%s: %s is a file, not a directory", l.target.Describe(), root)
 	}
 	return nil
+}
+
+// rootExists reports whether the target's own root is present, which is what
+// separates "the folder under it is missing" from "the bind mount is wrong".
+func (l *LocalStorage) rootExists() bool {
+	_, err := os.Stat(l.target.LocalPath)
+	return err == nil
 }
 
 func withSubpath(root, subpath string) string {

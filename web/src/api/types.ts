@@ -430,6 +430,15 @@ export interface BrowseResult {
   total: number
 }
 
+/** Result of creating one folder beneath a target (POST /api/targets/{id}/mkdir).
+ *  `created` is false when the folder was already there, so the UI can say
+ *  which happened rather than claiming a creation it did not perform. */
+export interface MkdirResult {
+  target_id: string
+  path: string
+  created: boolean
+}
+
 export type PromptAction = 'skip' | 'retry' | 'abort' | 'create'
 
 /** internal/api/hub.go — the three event names the WS feed emits. */

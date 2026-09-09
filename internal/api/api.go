@@ -102,6 +102,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/targets/{id}", s.handleUpdateTarget)
 	mux.HandleFunc("DELETE /api/targets/{id}", s.handleDeleteTarget)
 	mux.HandleFunc("POST /api/targets/{id}/test", s.handleTestTarget)
+	mux.HandleFunc("POST /api/targets/{id}/mkdir", s.handleMakeDir)
 
 	mux.HandleFunc("POST /api/jobs", s.handleCreateJob)
 	mux.HandleFunc("GET /api/jobs", s.handleListJobs)

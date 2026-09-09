@@ -20,7 +20,7 @@ const BLANK: JobPayload = {
   name: '',
   source_target_id: '',
   source_subpath: '',
-  mode: 'mirror',
+  mode: 'update',
   compare: 'fast',
   compare_tolerance_sec: 2,
   ignore_dst_hour: false,
@@ -49,6 +49,20 @@ const NEW_RULE: FilterRulePayload = {
 }
 
 type Tab = 'settings' | 'filters' | 'webhooks'
+
+/** The source subpath's existence, as far as the last check could tell.
+ *  'unknown' covers a target that is unreachable or erroring for some other
+ *  reason: that is the targets page's problem to report, and offering to
+ *  create a folder on a NAS that is down would be noise. */
+type SourceCheck =
+  | { state: 'idle' }
+  | { state: 'checking' }
+  | { state: 'ok' }
+  | { state: 'unknown' }
+  | { state: 'missing'; message: string }
+  | { state: 'creating' }
+  | { state: 'created' }
+  | { state: 'failed'; message: string }
 
 export function JobEditor() {
   const { id } = useParams()
@@ -143,6 +157,7 @@ export function JobEditor() {
   const set = useCallback(<K extends keyof JobPayload>(key: K, value: JobPayload[K]) => {
     setJob((j) => ({ ...j, [key]: value }))
   }, [])
+
 
   const destTargetIDs = useMemo(
     () => job.destinations.map((d) => d.dest_target_id).filter((t) => t !== ''),
@@ -439,6 +454,60 @@ function Settings({
     </option>
   ))
 
+  // Whether the source subpath actually exists. A missing *source* is a hard
+  // error at run time by design (internal/storage/storage.go, CreateSubpath):
+  // inventing one would turn a typo into a run that copies nothing and reports
+  // success. Offering to create it here, before the job is saved, is the
+  // version of that which cannot be mistaken for a successful sync.
+  const [sourceCheck, setSourceCheck] = useState<SourceCheck>({ state: 'idle' })
+
+  const sourceTargetID = job.source_target_id
+  const sourceSubpath = job.source_subpath ?? ''
+
+  // Check the source folder as the user types, debounced. A listing can mount
+  // a share, so this must not fire on every keystroke.
+  useEffect(() => {
+    if (sourceTargetID === '' || sourceSubpath.trim() === '') {
+      // No subpath means the target root, which Resolve already proves exists.
+      setSourceCheck({ state: 'idle' })
+      return
+    }
+    let cancelled = false
+    setSourceCheck({ state: 'checking' })
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          await api.browse(sourceTargetID, sourceSubpath)
+          if (!cancelled) setSourceCheck({ state: 'ok' })
+        } catch (err) {
+          if (cancelled) return
+          if (err instanceof ApiError && err.status === 404 && err.code === 'path_not_found') {
+            setSourceCheck({ state: 'missing', message: err.message })
+          } else {
+            setSourceCheck({ state: 'unknown' })
+          }
+        }
+      })()
+    }, 500)
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [sourceTargetID, sourceSubpath])
+
+  const createSourceFolder = useCallback(async () => {
+    setSourceCheck({ state: 'creating' })
+    try {
+      await api.makeDir(sourceTargetID, sourceSubpath)
+      setSourceCheck({ state: 'created' })
+    } catch (err) {
+      setSourceCheck({
+        state: 'failed',
+        message: err instanceof ApiError ? err.message : 'Could not create that folder.',
+      })
+    }
+  }, [sourceTargetID, sourceSubpath])
+
   return (
     <>
       <div className="card">
@@ -480,6 +549,19 @@ function Settings({
               targetID={job.source_target_id}
               subpath={job.source_subpath ?? ''}
             />
+            {sourceCheck.state === 'missing' && (
+              <p className="warn">
+                <strong>That folder does not exist yet.</strong> A run will stop rather than create
+                it: an empty source that was never there copies nothing and would report success.
+                {' '}
+                <button type="button" className="link" onClick={() => void createSourceFolder()}>
+                  Create it now
+                </button>
+              </p>
+            )}
+            {sourceCheck.state === 'creating' && <p className="hint">Creating the folder…</p>}
+            {sourceCheck.state === 'created' && <p className="hint">Folder created.</p>}
+            {sourceCheck.state === 'failed' && <p className="error">{sourceCheck.message}</p>}
           </label>
         </div>
 
@@ -555,8 +637,8 @@ function Settings({
           <label>
             Mode
             <select value={job.mode} onChange={(e) => set('mode', e.target.value as JobPayload['mode'])}>
-              <option value="mirror">Mirror — make the destination match, deleting extras</option>
               <option value="update">Update — copy new and changed files, never delete</option>
+              <option value="mirror">Mirror — make the destination match, deleting extras</option>
             </select>
           </label>
           <label>

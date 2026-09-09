@@ -9,6 +9,7 @@ import type {
   RunDetail,
   RunEvent,
   IssuedToken,
+  MkdirResult,
   RunPlan,
   SchedulePreview,
   SessionState,
@@ -202,4 +203,10 @@ export const api = {
 
   browse: (targetId: string, path = '') =>
     get<BrowseResult>(`/api/browse${query({ target_id: targetId, path })}`),
+
+  /** Creates one folder beneath a target. Idempotent: an existing folder comes
+   *  back with created:false rather than an error. Only the subpath is made —
+   *  a share that is down or a wrong bind mount still fails. */
+  makeDir: (targetId: string, path: string) =>
+    request<MkdirResult>('POST', `/api/targets/${encodeURIComponent(targetId)}/mkdir`, { path }),
 }

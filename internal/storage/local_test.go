@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,6 +50,27 @@ func TestLocalMissingSubpathNamesThePathThatIsMissing(t *testing.T) {
 	// subpath — the mount is plainly working if the root resolved.
 	if strings.Contains(err.Error(), "bind-mounted") {
 		t.Fatalf("a missing subpath blamed the bind mount: %s", err.Error())
+	}
+}
+
+// A subpath under a root that is ALSO missing must blame the root, not the
+// subpath. Both are absent, so reporting the subpath as merely "does not
+// exist" is technically true and practically wrong: the job editor offers to
+// create a missing folder on the strength of that error (api.path_not_found),
+// and creating one inside a broken bind mount is exactly the papering-over
+// that CreateSubpath exists to prevent.
+func TestLocalMissingSubpathUnderMissingRootBlamesTheRoot(t *testing.T) {
+	absentRoot := filepath.Join(t.TempDir(), "absent")
+
+	_, err := localTarget(t, absentRoot, "nope").Resolve(context.Background())
+	if err == nil {
+		t.Fatal("resolving a subpath under a missing root should fail")
+	}
+	if !strings.Contains(err.Error(), "bind-mounted") {
+		t.Fatalf("a missing root was reported as a missing subpath: %s", err.Error())
+	}
+	if errors.Is(err, ErrPathNotExist) {
+		t.Fatalf("a broken target matched ErrPathNotExist, so a caller would offer to create it: %s", err.Error())
 	}
 }
 

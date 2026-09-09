@@ -1,2 +1,15 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# This repository is built and run entirely inside Linux containers, and its
+# contents are stored with LF. Checking anything out with CRLF breaks things
+# that give no hint about line endings:
+#
+#   *.sh  - COPYed into an image and exec'd. The shebang ends in a carriage
+#           return, so the kernel looks for an interpreter literally named
+#           "/bin/sh<CR>" and reports "no such file or directory" for a script
+#           that is plainly there.
+#   *.go  - gofmt normalises to LF, so every CRLF file counts as unformatted
+#           and `golangci-lint run` fails on files nobody has touched.
+#
+# eol=lf therefore applies to the whole tree rather than to the two extensions
+# that happened to be caught. There are no .bat/.cmd/.ps1 files here that would
+# want CRLF; add an exception below if that changes.
+* text=auto eol=lf

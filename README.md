@@ -26,8 +26,8 @@ Tested at 100,000 files.
 
 | Mode | What it does |
 |---|---|
+| **Update** | Copies new and newer files only. **Never deletes anything at the destination**, whatever is there. The default for a new job. |
 | **Mirror** | Makes the destination match the source. Copies new and changed files, **and deletes destination files the source no longer has.** |
-| **Update** | Copies new and newer files only. **Never deletes anything at the destination**, whatever is there. |
 
 Mirror is the one that removes data, so it has several guards:
 
@@ -201,6 +201,28 @@ manager.
   container as `/mnt/local` — that is the path to type into the UI, on every platform.
 - `make` is not standard on Windows. Use Git Bash or WSL, or run the underlying commands directly:
   `docker build -t cn4m-cascade:latest .` and `docker compose -f docker-compose.yml up -d`.
+- **Line endings will break the test harness, and the lint gate, before anything else does.**
+  `.gitattributes` pins the whole tree to LF (`* text=auto eol=lf`). If you cloned before that
+  pin, or Git has `core.autocrlf=true` and your scripts came out CRLF, the Samba containers exit 1 with
+  `exec /usr/local/bin/entrypoint.sh: no such file or directory` — the file is present, but its
+  shebang ends in a carriage return and the kernel looks for an interpreter named `/bin/sh<CR>`.
+  The same CRLF also makes `gofmt` treat every Go file as unformatted, so `golangci-lint run` fails
+  on files nobody has touched and the commit gate cannot be satisfied. Fix a stale checkout with
+  `git add --renormalize . && git checkout -- .` — commit or stash your work first, because that
+  second command overwrites the worktree. Nothing about either symptom points at line endings, and
+  neither can happen on macOS or Linux.
+- **Do not paste the fenced code block into `smbcreds.txt`.** Copying the credentials snippet above
+  out of a rendered Markdown view can carry the ` ``` ` fences into the file. `mount.cifs` then fails
+  to parse it and reports what looks like an authentication problem. The file must contain exactly
+  two lines, `username=` and `password=`, and nothing else.
+- **A LAN NAS is reached through WSL2's NAT**, a layer Docker Desktop on a Mac does not have. A
+  `mount error(113)` or a hang on an address that answers fine from PowerShell is a networking
+  problem, not a CIFS one — the error table above will not diagnose it.
+
+**Confirmed working on Windows (2026-09-09)** — Windows 11 Pro 26200, Docker Desktop 26.1.4 on the
+WSL2 backend, kernel `5.15.153.1-microsoft-standard-WSL2`. `cifs` is present in `/proc/filesystems`,
+the shipping image is 23.6 MB on amd64, and both a guest mount against the test harness and a
+credentialed SMB 3.1.1 mount of a real NAS succeeded from the production image.
 
 ## Running the whole verification suite
 
@@ -275,6 +297,7 @@ Endpoints so far:
 ```
 POST|GET       /api/targets                 GET|PATCH|DELETE /api/targets/{id}
 POST           /api/targets/{id}/test
+POST           /api/targets/{id}/mkdir      → creates one folder under a target
 
 POST|GET       /api/jobs                    GET|DELETE       /api/jobs/{id}
 POST           /api/jobs/{id}/run           → 202, runs in the background
