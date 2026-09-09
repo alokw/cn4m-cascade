@@ -78,6 +78,107 @@ has no `cifs` module and no amount of code will help — you need a Linux host o
 a wrong password, a nonexistent share, an unreachable host, mount cleanup, and credential hygiene.
 It prints the full JSON response for each so the error messages can be read and judged.
 
+## Deploying it for real
+
+The quickstart above runs everything from source inside the *development* container. That is not how
+you deploy it. Production is a separate 25 MB image with no Go toolchain, no Node, and no test
+harness in it.
+
+```bash
+make image      # build cn4m-cascade:latest
+make run        # start it on http://localhost:2649
+make logs       # follow it
+make down       # stop it
+```
+
+`make run` needs a `.env` beside the compose file and refuses to start without one, because a server
+that comes up without an encryption key would be a server that cannot store a credential:
+
+```ini
+ENCRYPTION_KEY=<32+ random characters — losing this loses every stored password>
+CN4M_CASCADE_ADMIN_PASSWORD=<optional; seeds first-run setup, never overwrites>
+TZ=America/New_York
+CN4M_CASCADE_STATUS_URL=http://host.docker.internal:2640/suite/status   # or "off"
+```
+
+`make run` prints a generated key if you have no `.env` yet. **Back up `./data`** — it holds the
+SQLite database and the encrypted credentials, and nothing else can reconstruct them.
+
+The production stack and the test harness are deliberately separate compose projects on different
+ports (2649 and 12649), so `make run` and `make test-integration` cannot interfere. They used to
+share a container, which twice ended in a wedged Docker daemon.
+
+## Verifying it on Windows
+
+Everything above is verified on macOS and Linux. Windows uses a **WSL2** kernel rather than the
+LinuxKit one Docker Desktop uses on a Mac, and `mount.cifs` needs kernel CIFS support — so the one
+thing worth confirming on a Windows host is that a container can mount a share at all. Run these in
+**PowerShell**, from the repository directory.
+
+**1. Confirm Docker is using the WSL2 backend.**
+
+```powershell
+docker info --format "{{.OperatingSystem}} / {{.KernelVersion}}"
+```
+
+Expect something containing `WSL2` or a kernel version ending `-microsoft-standard-WSL2`. If it says
+`docker-desktop` with a LinuxKit kernel that is fine too; both are Linux VMs.
+
+**2. Confirm the kernel can do CIFS at all.** This is the question that cannot be worked around in
+software — if it fails, no version of this program will mount anything on that host.
+
+```powershell
+docker run --rm --privileged alpine sh -c "apk add --no-cache cifs-utils >/dev/null && grep -q cifs /proc/filesystems && echo 'KERNEL CIFS OK' || echo 'NO CIFS IN KERNEL'"
+```
+
+`cifs` may not appear in `/proc/filesystems` until something has tried to mount, so treat a `NO CIFS`
+here as inconclusive and go on to step 3, which is the real test.
+
+**3. Mount an actual share from the production image.** Replace the host, share and credentials with
+a real SMB target on your network — a NAS you already use is ideal.
+
+```powershell
+docker build -t cn4m-cascade:latest .
+
+docker run --rm `
+  --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH `
+  --security-opt apparmor:unconfined `
+  --entrypoint sh cn4m-cascade:latest -c `
+  "mkdir -p /mnt/probe; printf 'username=YOURUSER\npassword=YOURPASS\n' > /tmp/c; chmod 600 /tmp/c; mount.cifs //192.168.1.50/yourshare /mnt/probe -o credentials=/tmp/c,vers=3.1.1 && ls /mnt/probe && umount /mnt/probe && echo 'WINDOWS CIFS OK'"
+```
+
+`WINDOWS CIFS OK` with a directory listing above it is the whole answer: the image, the capabilities
+and the kernel all work on that host.
+
+**4. Then run it properly and add the same target through the UI.**
+
+```powershell
+make image
+make run
+```
+
+Open <http://localhost:2649>, add the target, and press **Save and test**. A green result means the
+full path works — not just `mount.cifs`, but credential storage, the dialect ladder and the mount
+manager.
+
+**If step 3 fails**, the message says which layer:
+
+| Message | Meaning |
+|---|---|
+| `mount error(2): No such file or directory` | the share name is wrong |
+| `mount error(13): Permission denied` | credentials, or the server requires a dialect this did not offer |
+| `wrong fs type, bad option, bad superblock` | the kernel has no CIFS support — this is the one that cannot be fixed here |
+| `Operation not permitted` | the capabilities did not apply; check `--cap-add SYS_ADMIN` survived your shell quoting |
+
+**Windows-specific notes**
+
+- **Paths in `.env` use forward slashes**: `CN4M_CASCADE_LOCAL_DIR=C:/Users/you/cn4m`. Docker Desktop
+  accepts them and backslashes will be mangled by compose interpolation.
+- The default local folder is `%USERPROFILE%\cn4m`, created for you, and it appears inside the
+  container as `/mnt/local` — that is the path to type into the UI, on every platform.
+- `make` is not standard on Windows. Use Git Bash or WSL, or run the underlying commands directly:
+  `docker build -t cn4m-cascade:latest .` and `docker compose -f docker-compose.yml up -d`.
+
 ## Running the whole verification suite
 
 ```bash

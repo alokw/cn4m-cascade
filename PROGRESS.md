@@ -2,6 +2,18 @@
 
 Living handoff doc. Update at the end of every session (CLAUDE.md → Workflow).
 
+> **Picking this up on another machine, or in a fresh session?** Read this header, then
+> §0-6a for the phase in progress, then §3 "What's next". CLAUDE.md is loaded automatically and
+> is binding; SPEC.md is the source of truth for what is being built. The decisions log (§4) is
+> the "why" behind anything that looks odd — it is a table, so grep it rather than reading it.
+>
+> First, from a clean clone: `make harness-up && make verify-cifs && make verify-image`. On
+> Windows, start with the README's **Verifying it on Windows**, because kernel CIFS support is the
+> one thing that cannot be worked around here.
+
+**Phase 6a (production packaging) is built and verified; its review and browser pass are the
+outstanding gates.** See §0-6a.
+
 **Phase 5 is complete.** 5a scheduling (§0-5a) and 5b webhooks (§0-5b) are built, reviewed and
 verified at **84 PASS / 0 FAIL / 1 SKIP**. Two-way sync — originally 5c — was **deferred
 indefinitely** on 2026-09-09 (D-115, SPEC.md §14.1) and removed from the UI.
@@ -33,6 +45,62 @@ fresh-context review is done (it found five more paths to data loss, all filter-
 data-loss bugs, all fixed with regression tests — §5b), and the bounded-I/O hard rule is satisfied.
 **Phase 1:** ✅ Complete (record retained below).
 **Last updated:** 2026-09-02 (Phase 4b-2b-i code complete; review done, manual pass pending)
+
+---
+
+## 0-6a. Phase 6a status — production packaging
+
+Until this, there was no way to deploy the thing: running the server meant `exec`ing into the
+*development* container the test harness uses, which collided twice and once left a container only
+a Docker daemon restart could clear (§7a, §7d). §10 had specified the packaging from the start and
+no phase owned it.
+
+### Built
+| Area | Contents |
+|---|---|
+| `Dockerfile` | three stages — Node builds the SPA, Go embeds and links it, alpine carries the result plus `mount.cifs`. **25 MB**, no fixed `GOARCH` so Windows and macOS both build natively |
+| `docker-compose.yml` | production stack, its own compose project, bridge networking, `stop_grace_period: 45s` |
+| `Makefile` | `image`, `run`, `down`, `logs`, `verify-image`; the old source-run is now `dev-run` |
+| `cmd/…/main.go` | `-healthcheck`, so the image needs no curl; `time/tzdata` embedded |
+| env prefix | `CN4M_*` → `CN4M_CASCADE_*` (D-116) |
+| `README.md` | deploying, and **Verifying it on Windows** |
+
+### Why alpine, when the plan said bookworm-slim
+The plan argued for Debian on the grounds of CIFS parity with the dev container. **Measurement beat
+the argument.** Debian came out at 158 MB — and `debian:bookworm-slim` alone is **97.2 MB on
+arm64**, so §10's "well under 100 MB" was *unreachable* with it, not merely missed.
+
+The parity reasoning was also weaker than it sounded: the binary is static Go with CGO off, so musl
+versus glibc never touches it, and the CIFS behaviour this project cares about is the *kernel's*,
+which is the host's either way. That is still an argument rather than evidence, which is why
+`make verify-image` exists — it mounts, lists, writes and unmounts a real share **from the shipping
+image**, and it is a repeatable target rather than a command someone once typed.
+
+### The second collision, hiding under the first
+Separating the containers was not enough. The harness *published* host port 2649, and Docker binds
+a published port whether or not anything inside is listening — so `make run` would still have failed
+with "port is already allocated" whenever the harness was up. The harness now publishes **12649**;
+production owns 2649. The container-level fix was necessary and not sufficient, which is worth
+remembering the next time "they are separate now" sounds like the end of a problem.
+
+### Verification — all six §11 6a exit criteria
+| Criterion | Result |
+|---|---|
+| Builds, under 100 MB | ✅ **25 MB** (158 MB on debian) |
+| Serves the SPA, answers its healthcheck | ✅ 200 with `id="root"`; Docker health `healthy`, probe exit 0 |
+| **Mounts a real CIFS share** | ✅ through the whole app: SMB 3.1.1 negotiated, capacity read, unicode names listed, 7 ms |
+| SIGTERM inside the grace period | ✅ **exit 0** in under a second, holding a live mount, lazily unmounted |
+| Bad `ENCRYPTION_KEY` refuses to start | ✅ missing and too-short both refuse legibly |
+| No interference with the harness | ✅ integration tests passed *while* production served on 2649 |
+
+Also verified: `TZ=America/New_York` resolved inside a container with **no system zoneinfo**, which
+is what proves the embedded `time/tzdata` works — and what stops a slimmed image silently turning
+every cron schedule into UTC.
+
+### Outstanding
+- Fresh-context review (CLAUDE.md requires one before the phase counts as done).
+- **Windows verification** — the WSL2 kernel's CIFS support cannot be tested from macOS. README has
+  the procedure; it is U-7.
 
 ---
 
@@ -889,6 +957,9 @@ D-1…D-13 were approved 2026-08-31 before implementation; D-14…D-17 came out 
 | D-108 | **The hook rate limiter runs *after* token verification, not before** | Checking `blocked()` first meant one client with a stale token permanently 429'd every other caller at the same address — and behind a NAT, a reverse proxy or a Docker bridge, every integration shares one address. A bad token is still recorded and still blocked, so brute force is bounded exactly as before; what changes is that a working integration is never collateral damage. The map also has a hard ceiling with oldest-first eviction, because expiry alone is not a bound: a burst from many fresh addresses inside the window leaves every entry unexpired. Evicting a live entry forgets someone's failures early, which is the right trade — the ceiling exists to stop an anonymous caller exhausting memory, and an attacker still failing has one of the newest entries |
 | D-109 | **`prompt` is refused as an `unavailable_policy_override`, not accepted and ignored** | The override exists because an unattended trigger is exactly when a job set to *ask* about an unreachable destination should not. Accepting `prompt` would produce a run that parks for its whole timeout with nobody to answer — silently doing the opposite of what the parameter is for. The override applies to a copy of the job, so triggering a job can never reconfigure it |
 | D-110 | **A webhook `preview:true` can hold a job indefinitely, and SPEC says so** | A parked preview occupies the job until confirmed or timed out, and nobody confirms a webhook preview. A token holder looping it keeps the job unrunnable — scheduled runs skipped, manual ones refused. Support is kept because §8.1 offers it and "plan without executing" is legitimate, but the consequence is now written down: a trigger token's power is "can start this job **and** can keep it from running", which belongs in the decision to issue one |
+| D-116 | **App-specific environment variables are prefixed `CN4M_CASCADE_`, not `CN4M_`** | Requested 2026-09-09: cn4m is a *different program*, so `CN4M_ADMIN_PASSWORD` reads like configuration for it rather than for this. `ENCRYPTION_KEY`, `DATA_DIR`, `LISTEN_ADDR`, `MOUNT_ROOT` and `TZ` stay unprefixed — they are generic, and they are what SPEC.md §10 already documented. Done now because packaging is the last cheap moment: once a container is deployed, "assume all installations are fresh" stops being true |
+| D-117 | **The production image is alpine, decided by measurement rather than by the argument in the plan** | The plan chose `debian:bookworm-slim` for CIFS parity with the dev container. Debian measured 158 MB, with the slim base alone at 97.2 MB on arm64 — so §10's "well under 100 MB" was unreachable with it. The parity argument was also weak: the binary is static Go, so musl versus glibc cannot reach it, and CIFS behaviour is the kernel's. Rather than assert either way, `make verify-image` mounts, lists, writes and unmounts a real share **from the shipping image**; it passes. 25 MB. The zone database is embedded via `time/tzdata` instead of a system package, which is both smaller and immune to a base image without zoneinfo silently making every cron schedule UTC |
+| D-118 | **The harness publishes host port 12649; production owns 2649** | Giving the server its own container was necessary and not sufficient. Docker binds a *published* port whether or not anything inside the container listens, so the harness holding `2649:2649` meant `make run` still failed with "port is already allocated" whenever the harness was up — the collision this phase exists to end, one layer below where it was being fixed. Inside the container the server still listens on 2649, so tests and the Vite proxy are untouched |
 | D-115 | **Two-way sync is deferred indefinitely and removed from the UI** | Requested 2026-09-09: the deployments this serves only ever push one direction, so it would have been the most dangerous feature in the product built for nobody. Every other deletion here is decided by comparing two *live* listings; two-way deletion is inferred from a **stored record of the past**, and that inference fails towards data loss — an empty, stale, partial or interrupted `sync_state` makes present files look deleted. Removing it eliminates that entire class of risk rather than deferring it behind a flag. The design work is preserved in SPEC.md §14.1, not deleted: the single-destination constraint, the first-run-no-deletions rule and the never-guess-a-conflict rule each cost real thought and should not be re-derived. Cheap to do because almost nothing depended on it — `engine.Conflict` is one-way sync's "declined to act, and why", not two-way conflict resolution, and `sync_state` was never built. The UI change was a single disabled dropdown option |
 | D-114 | **`CN4M_STATUS_URL` seeds the suite callback at startup, not in the migration, and never overwrites** | Testing against a real cn4m on another host showed the hardcoded `localhost:2640` seed is wrong for any deployment where cascade and cn4m are not co-located — and a migration cannot read the environment, so the variable would have been useless on exactly those installs. The row is created at first start instead, from the configured URL, with `off` to disable. Not re-applied on later starts: a variable in a compose file must not revert a deliberate UI change, the same rule the admin password follows. Keyed on format rather than URL, so a callback someone has re-pointed still counts as present |
 | D-111 | **Callbacks have a wire `format`, because cn4m does not speak the generic one** | `/suite/status` reads form fields; the generic webhook posts signed JSON. One delivery path with two encodings rather than two mechanisms, chosen so subscription, throttling, retry and the queue are shared and cannot drift. The cn4m format is unsigned (that endpoint checks nothing, so a required secret would be theatre) and **silent on failure**: cn4m is optional infrastructure whose absence is a normal state, and a seeded callback that warned on every run of a machine without cn4m would train people to ignore run warnings |
@@ -1248,6 +1319,7 @@ user can action; everything else outstanding is in §6 and is mine.
 |---|---|---|---|
 | ~~U-1~~ | ~~**The manual browser pass**~~ — **done 2026-09-06**, six findings in §5m, all fixed | Confirmed working: never-run cards, logs, duplicate-target, the scheduling toggle, and a scheduled job firing on time | — |
 | ~~U-1b~~ | ~~**The Schedule controls**~~ — **done 2026-09-06.** The next-run preview was showing the browser's zone only, which made a UTC server look wrong (§5m M-5); fixed | — |
+| U-7 | **Verify CIFS mounting on Windows** — the README's *Verifying it on Windows* section has the exact commands. WSL2 uses a different kernel from the LinuxKit one Docker Desktop runs on a Mac, and kernel CIFS support is the one thing that cannot be worked around in this codebase | Only a Windows host can answer it | Before deploying there |
 | U-5 | **Re-check the six §5m fixes in a browser**, and the renamed build comes up at all | Only a browser can | None |
 | ~~U-6~~ | ~~**The Webhooks & API tab**~~ — **done 2026-09-09**, all of it worked. The format selector and the seeded cn4m row are new since that pass but are cosmetic additions to a screen already exercised | — |
 | ~~U-6-old~~ | ~~**The new Webhooks & API tab**~~ — create a token, confirm it is shown once and the curl examples work, regenerate and confirm the old one stops, add a callback URL and watch a run report to it | Only a browser can, and the one-shot token display is exactly the kind of thing that looks right until someone reloads the page | None |

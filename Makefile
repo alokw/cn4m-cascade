@@ -53,6 +53,22 @@ verify-cifs: ## PROGRESS.md B-4: prove the host kernel can do CIFS mounts
 	  && umount /mnt/smb/_verify \
 	  && echo "CIFS OK"'
 
+.PHONY: verify-image
+verify-image: image ## Prove the PRODUCTION image can mount CIFS (SPEC.md §11, 6a)
+	@# Distinct from verify-cifs, which proves the *kernel* can mount using the
+	@# Debian dev container. This proves the alpine image that actually ships
+	@# can do it: same kernel, different userspace mount.cifs and a different
+	@# libc. Both questions are real and only one of them is about the host.
+	@docker run --rm \
+	  --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH --security-opt apparmor:unconfined \
+	  --network cn4m-cascade_smbnet --entrypoint sh cn4m-cascade:latest -c '\
+	    mkdir -p /mnt/probe \
+	    && mount.cifs //172.28.0.10/public /mnt/probe -o guest,vers=3.1.1 \
+	    && ls /mnt/probe >/dev/null \
+	    && echo probe > /mnt/probe/.image-probe && rm -f /mnt/probe/.image-probe \
+	    && umount /mnt/probe \
+	    && echo "PRODUCTION IMAGE CIFS OK — mounted, listed, wrote, unmounted"'
+
 .PHONY: tidy
 tidy: ## Resolve dependencies (writes go.sum)
 	$(DEV) go mod tidy
