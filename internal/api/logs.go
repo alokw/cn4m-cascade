@@ -13,14 +13,21 @@ import (
 //
 // Newest first, unlike a single run's task log — this is the view someone
 // leaves open to watch for errors, not a transcript read top to bottom.
+//
+// The destination filter is what makes "what has been failing against this
+// NAS?" answerable at all: a target's trouble shows up spread across every job
+// that writes to it, one run at a time, and no per-run view can gather that.
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
 	filter := store.EventFilter{
-		JobID:  q.Get("job_id"),
-		RunID:  q.Get("run_id"),
-		Level:  store.EventLevel(q.Get("level")),
-		Newest: true,
+		JobID: q.Get("job_id"),
+		RunID: q.Get("run_id"),
+		Level: store.EventLevel(q.Get("level")),
+		// Named "dest" to match /api/runs/{id}/events, so the same destination
+		// id filters both the per-run log and this one.
+		DestTargetID: q.Get("dest"),
+		Newest:       true,
 	}
 
 	if filter.Level != "" {

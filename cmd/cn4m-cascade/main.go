@@ -1,7 +1,7 @@
-// Command smbsync is the sync engine server.
+// Command cn4m-cascade is the sync engine server.
 //
-// Phase 1 (SPEC.md §11) serves target CRUD and connection testing; the sync
-// engine, scheduler and UI arrive in later phases.
+// It serves the API and the embedded SPA, runs the sync engine, and fires
+// scheduled jobs, and reports to the cn4m suite.
 package main
 
 import (
@@ -20,7 +20,9 @@ import (
 	"github.com/alokw/cn4m-cascade/internal/config"
 	"github.com/alokw/cn4m-cascade/internal/health"
 	"github.com/alokw/cn4m-cascade/internal/mountmgr"
+	"github.com/alokw/cn4m-cascade/internal/notify"
 	"github.com/alokw/cn4m-cascade/internal/runner"
+	"github.com/alokw/cn4m-cascade/internal/scheduler"
 	"github.com/alokw/cn4m-cascade/internal/secrets"
 	"github.com/alokw/cn4m-cascade/internal/storage"
 	"github.com/alokw/cn4m-cascade/internal/store"
@@ -37,7 +39,7 @@ func main() {
 		log.Error("fatal", "error", err)
 		// The message is repeated on stderr: a container that dies at
 		// startup should say why without needing a log viewer.
-		fmt.Fprintf(os.Stderr, "smbsync: %v\n", err)
+		fmt.Fprintf(os.Stderr, "cn4m-cascade: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -99,9 +101,40 @@ func run(log *slog.Logger) error {
 
 	provider := storage.NewProvider(mounts, healthc)
 	runs := runner.New(db, provider, log)
+
+	// Outbound callbacks (SPEC.md §8.2). The notifier is given a way to read a
+	// webhook's signing key rather than the encryption key itself, exactly as
+	// the mount manager is given a way to read a target's password.
+	// The suite-reporting callback, created once on a fresh installation at
+	// whatever CN4M_STATUS_URL says. "off" reports nowhere — for a cascade
+	// that is not part of a cn4m suite, or a developer who does not want a
+	// local run showing up in a shared status view.
+	if cfg.CN4MStatusURL == config.CN4MReportingOff {
+		log.Info("cn4m suite reporting is off (CN4M_STATUS_URL=off)")
+	} else if created, err := db.EnsureCN4MWebhook(ctx, cfg.CN4MStatusURL); err != nil {
+		// Not fatal: failing to set up a status callback is no reason to
+		// refuse to run backups.
+		log.Warn("could not create the cn4m status callback", "error", err)
+	} else if created {
+		log.Info("created the cn4m status callback", "url", cfg.CN4MStatusURL)
+	}
+
+	notifier := notify.New(db, box.Decrypt, log)
+	// Its OWN context, deliberately not the signal context. On SIGTERM `ctx`
+	// is cancelled immediately, which would stop every delivery worker before
+	// the runs being cancelled below had produced their run_completed events —
+	// so the last thing an integration hears would be "started", and the
+	// callbacks would be dropped into a channel nobody is reading. The
+	// notifier is instead stopped explicitly, last, once the runs that feed it
+	// have finished.
+	notifyCtx, stopNotify := context.WithCancel(context.Background())
+	defer stopNotify()
+	notifier.Start(notifyCtx)
+	runs.SetNotifier(notifier)
+
 	server := api.NewServer(db, provider, mounts, healthc, box, runs, log)
 
-	// SMBSYNC_ADMIN_PASSWORD seeds first-run setup so a container can come up
+	// CN4M_ADMIN_PASSWORD seeds first-run setup so a container can come up
 	// already configured (SPEC.md §8). It never overwrites an existing
 	// password: an env var left in a compose file must not silently reset
 	// the credential every restart.
@@ -113,20 +146,27 @@ func run(log *slog.Logger) error {
 	// as a deliberate blank would turn a forgotten variable into a server
 	// anyone can sign into. Choosing no password has to be an explicit act, so
 	// it is only available through the first-run setup form.
-	if pw := os.Getenv("SMBSYNC_ADMIN_PASSWORD"); pw != "" {
+	if pw := os.Getenv("CN4M_ADMIN_PASSWORD"); pw != "" {
 		set, err := db.AdminPasswordSet(ctx)
 		if err != nil {
 			return fmt.Errorf("checking whether an admin password is set: %w", err)
 		}
 		if !set {
 			if err := db.SetAdminPassword(ctx, pw); err != nil {
-				return fmt.Errorf("setting the admin password from SMBSYNC_ADMIN_PASSWORD: %w", err)
+				return fmt.Errorf("setting the admin password from CN4M_ADMIN_PASSWORD: %w", err)
 			}
-			log.Info("admin password set from SMBSYNC_ADMIN_PASSWORD")
+			log.Info("admin password set from CN4M_ADMIN_PASSWORD")
 		}
 	}
 
 	server.Start(ctx)
+
+	// Started after the interrupted-run reconciliation above, so a job whose
+	// last run died with the process is not considered still-running by the
+	// overlap check the moment a schedule fires.
+	sched := scheduler.New(db, runs, log)
+	sched.Start(ctx)
+	log.Info("scheduler started", "tick", scheduler.TickInterval, "timezone", time.Local.String())
 
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -161,6 +201,11 @@ func run(log *slog.Logger) error {
 	// Disconnect event-feed clients before the runs they are watching go
 	// away, so nothing is broadcasting into a closing database.
 	server.Stop()
+	// Stopped before runs are cancelled, so a tick cannot start a new run
+	// into a server that is on its way down.
+	if err := sched.Shutdown(shutdownCtx); err != nil {
+		log.Warn("scheduler did not stop cleanly", "error", err)
+	}
 	// SPEC.md §10: cancel running jobs, marking them cancelled, before the
 	// mounts they are using go away.
 	if err := runs.Shutdown(shutdownCtx); err != nil {
@@ -169,6 +214,12 @@ func run(log *slog.Logger) error {
 	if err := mounts.Shutdown(shutdownCtx); err != nil {
 		log.Warn("mount cleanup did not complete", "error", err)
 	}
+	// Last, and after the runs that produce them: a "run_completed" callback
+	// for the run that just stopped is worth the moment it takes to send.
+	if err := notifier.Stop(shutdownCtx); err != nil {
+		log.Warn("callback delivery did not drain", "error", err)
+	}
+	stopNotify()
 	log.Info("stopped")
 	return nil
 }

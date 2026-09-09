@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/alokw/cn4m-cascade/internal/runner"
 	"github.com/alokw/cn4m-cascade/internal/store"
@@ -31,6 +32,24 @@ type jobPayload struct {
 	PromptFallback       string `json:"prompt_fallback"`
 	CreateDestDirs       string `json:"create_dest_dirs"`
 	ParallelDestinations bool   `json:"parallel_destinations"`
+
+	// ScheduleCron is a five-field cron expression, or empty for a job that
+	// only runs when asked.
+	//
+	// Note the asymmetry with Enabled below on a PATCH, which is a full
+	// replace: omitting this *clears* the schedule, while omitting Enabled
+	// *turns scheduling on*. Both follow from each field's own default, but a
+	// hand-written client that sends neither un-pauses a job it has just
+	// unscheduled. The UI always sends both (toJobPayload).
+	ScheduleCron string `json:"schedule_cron"`
+	// Enabled is a pointer so an absent field means "yes".
+	//
+	// A plain bool would make omitting it mean *disabled*, which for a field
+	// that gates whether backups happen is the wrong way round: every existing
+	// client, and every hand-written curl, would silently turn scheduling off.
+	// nil means the caller did not express an opinion, and the answer to that
+	// is yes.
+	Enabled *bool `json:"enabled"`
 
 	Destinations []destPayload   `json:"destinations"`
 	Filters      []filterPayload `json:"filters"`
@@ -71,6 +90,8 @@ func (p *jobPayload) toJob() *store.Job {
 		LogEveryFile:         p.LogEveryFile,
 		OnError:              store.ErrorPolicy(p.OnError),
 		DeletePolicy:         store.DeletePolicy(p.DeletePolicy),
+		ScheduleCron:         strings.TrimSpace(p.ScheduleCron),
+		Enabled:              p.Enabled == nil || *p.Enabled,
 	}
 	if p.CompareToleranceSec != nil {
 		job.CompareToleranceSec = *p.CompareToleranceSec
@@ -189,8 +210,19 @@ func (s *Server) handleRunJob(w http.ResponseWriter, r *http.Request) {
 	run, err := start(r.Context(), job)
 	if err != nil {
 		if errors.Is(err, runner.ErrAlreadyRunning) {
-			writeError(w, http.StatusConflict, "already_running",
-				"A run of this job is already in progress.", "")
+			// "Already in progress" is misleading for the common case, which
+			// is a *preview* of this job parked waiting to be confirmed:
+			// nothing is progressing, and the fix is to go and answer it
+			// rather than to wait.
+			message := "A run of this job is already in progress."
+			detail := ""
+			if prev, err := s.db.ListRuns(r.Context(), store.RunFilter{JobID: job.ID, Limit: 1}); err == nil &&
+				len(prev) > 0 && prev[0].Status == store.RunAwaitingConfirmation {
+				message = "A preview of this job is waiting to be confirmed."
+				detail = "Open it to confirm or cancel it, and this job can run again. " +
+					"It cancels itself on its own deadline if nobody answers."
+			}
+			writeError(w, http.StatusConflict, "already_running", message, detail)
 			return
 		}
 		s.writeJobError(w, err)

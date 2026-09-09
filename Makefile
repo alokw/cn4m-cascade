@@ -2,7 +2,15 @@
 # there is no Go toolchain and no mount.cifs (PROGRESS.md B-1/B-2).
 
 COMPOSE := docker compose -f docker-compose.test.yml
-DEV     := $(COMPOSE) exec -T dev
+
+# How to reach the dev container. Overridable because the compose one can end
+# up wedged and unkillable — CIFS threads in uninterruptible D state survive
+# `docker rm -f`, and only a Docker daemon restart clears them (PROGRESS.md
+# §7a, §7c). The documented workaround is an ad-hoc container from the same
+# image, which everything here then works against:
+#
+#   make test-integration DEV="docker exec -i cn4m-cascade-dev-tmp"
+DEV ?= $(COMPOSE) exec -T dev
 
 .PHONY: help
 help:
@@ -67,7 +75,7 @@ web-dev: ## Vite dev server on http://localhost:5173 (proxies /api to the Go ser
 
 .PHONY: run
 run: ## Run the server on http://localhost:2649 with the SPA embedded
-	$(COMPOSE) exec dev sh -c 'cd /src && go run ./cmd/smbsync'
+	$(COMPOSE) exec dev sh -c 'cd /src && go run ./cmd/cn4m-cascade'
 
 .PHONY: lint
 lint: ## golangci-lint
@@ -85,8 +93,9 @@ test-unit: ## Unit tests under the race detector (no kernel, no Samba)
 # broken change rather than a dirty harness.
 .PHONY: harness-clean
 harness-clean: ## Clear leftover mounts and blackholes from a killed test run
-	@$(DEV) sh -c 'mount -t cifs 2>/dev/null | awk "{print \$$3}" | grep "^/tmp/Test" \
+	@$(DEV) sh -c 'mount -t cifs 2>/dev/null | awk "{print \$$3}" | grep -E "^/tmp/(Test|cn4m-mnt-)" \
 	  | while read m; do umount -l "$$m" 2>/dev/null && echo "unmounted $$m"; done; \
+	  rmdir /tmp/cn4m-mnt-*/* /tmp/cn4m-mnt-* 2>/dev/null; \
 	  for ip in 172.28.0.10 172.28.0.11; do \
 	    while iptables -D OUTPUT -d $$ip -j DROP 2>/dev/null; do echo "removed blackhole on $$ip"; done; \
 	  done; true'
@@ -98,11 +107,22 @@ harness-clean: ## Clear leftover mounts and blackholes from a killed test run
 # takes; the point is a stack dump instead of an indefinite park.
 .PHONY: test-integration
 test-integration: harness-clean web-build ## Integration tests against the Samba harness
+	@# A container's environment is fixed at creation, so a variable renamed in
+	@# the compose file does not reach a container that is already running. The
+	@# suite skips every Samba test when it cannot find these, and reports
+	@# `ok` with exit 0 for having done nothing — which is how a rename once
+	@# produced a green run of 9 PASS and 70 SKIP (PROGRESS.md §7c). Refuse
+	@# outright rather than pass vacuously.
+	@$(DEV) sh -c 'test -n "$$CN4M_TEST_SAMBA_A" && test -n "$$CN4M_TEST_SAMBA_B"' \
+	  || { echo "CN4M_TEST_SAMBA_A/B are not set in the dev container."; \
+	       echo "The container predates the current docker-compose.test.yml."; \
+	       echo "Recreate it:  docker compose -f docker-compose.test.yml up -d --force-recreate dev"; \
+	       exit 1; }
 	$(DEV) env CGO_ENABLED=1 go test -race -tags=integration -count=1 -timeout 15m -v ./test/...
 
 .PHONY: test-scale
 test-scale: ## The 100k-file mirror exit criterion (slow: several minutes)
-	$(DEV) env SMBSYNC_SCALE_FILES=100000 go test -tags=integration -count=1 -v -timeout 60m \
+	$(DEV) env CN4M_SCALE_FILES=100000 go test -tags=integration -count=1 -v -timeout 60m \
 	  -run TestScaleMirror ./test/...
 
 .PHONY: test
@@ -110,7 +130,7 @@ test: test-unit test-integration ## All tests (excludes test-scale)
 
 .PHONY: build
 build: web-build ## Compile the server binary with the SPA embedded
-	$(DEV) go build -o /tmp/smbsync ./cmd/smbsync
+	$(DEV) go build -o /tmp/cn4m-cascade ./cmd/cn4m-cascade
 
 .PHONY: demo
 demo: build ## Walk the Phase 1 exit criteria with curl and print every response

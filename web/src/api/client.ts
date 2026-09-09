@@ -8,7 +8,9 @@ import type {
   Run,
   RunDetail,
   RunEvent,
+  IssuedToken,
   RunPlan,
+  SchedulePreview,
   SessionState,
   FilterFileCheck,
   GlobalFilterPayload,
@@ -16,6 +18,8 @@ import type {
   Target,
   TargetPayload,
   TestResult,
+  Webhook,
+  WebhookPayload,
 } from './types'
 
 /** The single error envelope the API uses — internal/api/api.go, errorBody. */
@@ -151,10 +155,24 @@ export const api = {
       }),
   },
 
+  /** Issues a trigger token. The plaintext is returned exactly once — the
+   *  server keeps only its hash, so there is no way to ask for it again. */
+  issueToken: (jobID: string) => post<IssuedToken>(`/api/jobs/${jobID}/token`),
+  revokeToken: (jobID: string) => del(`/api/jobs/${jobID}/token`),
+
+  webhooks: {
+    list: () => get<{ webhooks: Webhook[] }>('/api/webhooks').then((r) => r.webhooks ?? []),
+    create: (payload: WebhookPayload) => post<Webhook>('/api/webhooks', payload),
+    update: (id: string, payload: WebhookPayload) => patch<Webhook>(`/api/webhooks/${id}`, payload),
+    remove: (id: string) => del(`/api/webhooks/${id}`),
+  },
+
   logs: (params: {
     job_id?: string
     run_id?: string
     level?: string
+    /** A destination target id — the same parameter /api/runs/{id}/events takes. */
+    dest?: string
     since?: string
     limit?: number
     offset?: number
@@ -165,6 +183,12 @@ export const api = {
    *  exists is legitimate. */
   checkFilterFile: (filePath: string) =>
     post<FilterFileCheck>('/api/filters/check-file', { file_path: filePath }),
+
+  /** Advisory: what does this cron expression actually mean? An invalid
+   *  expression is a 200 with `valid: false`, never a thrown error — the
+   *  editor asks while you type, and half-typed input is normal. */
+  schedulePreview: (expression: string) =>
+    post<SchedulePreview>('/api/schedule/preview', { expression }),
 
   globalFilters: {
     list: () =>

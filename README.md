@@ -180,10 +180,10 @@ curl -sX POST localhost:2649/api/auth/setup \
 
 ```yaml
 environment:
-  SMBSYNC_ADMIN_PASSWORD: "a good long password"
+  CN4M_ADMIN_PASSWORD: "a good long password"
 ```
 
-`SMBSYNC_ADMIN_PASSWORD` only ever *sets* an unset password — it never overwrites an existing one,
+`CN4M_ADMIN_PASSWORD` only ever *sets* an unset password — it never overwrites an existing one,
 so leaving it in a compose file cannot silently reset the credential on every restart.
 
 ### There is no password policy
@@ -207,7 +207,7 @@ Two things stay true no matter how short the password is:
 - **First-run setup still closes after the first use**, so nobody else can claim a configured
   instance by racing you to `/api/auth/setup`.
 
-One asymmetry worth knowing: an **empty** `SMBSYNC_ADMIN_PASSWORD` means "not configured", not "no
+One asymmetry worth knowing: an **empty** `CN4M_ADMIN_PASSWORD` means "not configured", not "no
 password". SPEC.md §10's compose file passes `ADMIN_PASSWORD=${ADMIN_PASSWORD}`, which expands to an
 empty string whenever the variable is unset on the host — treating that as a deliberate blank would
 turn a forgotten variable into a server anyone can sign into. Choosing no password has to be an

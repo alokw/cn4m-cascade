@@ -55,7 +55,16 @@ export function Jobs() {
       // render a card, but a duplicate has to carry the filter rules too.
       const full = await api.jobs.get(job.id)
       const payload = toJobPayload(full)
-      const created = await api.jobs.create({ ...payload, name: `${payload.name} (copy)` })
+      // The copy arrives with its schedule paused. Duplicating a nightly
+      // backup otherwise creates a *second live nightly backup* the moment
+      // Create returns — before the editor has even opened, and against
+      // whatever destination the original used, which is the one thing the
+      // duplicate is about to be changed away from.
+      const created = await api.jobs.create({
+        ...payload,
+        name: `${payload.name} (copy)`,
+        enabled: false,
+      })
       navigate(`/jobs/${created.id}`)
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Could not duplicate the job.')

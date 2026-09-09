@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/coder/websocket v1.8.15
+	github.com/robfig/cron/v3 v3.0.1
 	modernc.org/sqlite v1.57.0
 )
 

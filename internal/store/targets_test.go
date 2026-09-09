@@ -269,3 +269,42 @@ func TestUNCPath(t *testing.T) {
 		t.Errorf("UNCPath() = %q, want %q", got, "/mnt/local/stuff")
 	}
 }
+
+// A target keeps its own name when it is updated.
+//
+// The symptom this pins was reported from the UI: create a target with a
+// wrong IP, "save and test", watch the test fail, correct the address, save
+// again — refused for a name already in use, which was its own from moments
+// earlier. The cause was entirely client-side (the modal kept POSTing because
+// it had not noticed the first save succeeded), and the server was always
+// right. This test says so, so that a later change to the uniqueness check
+// cannot quietly make the server wrong too.
+func TestUpdatingATargetKeepsItsOwnName(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	target := &Target{Name: "nas-with-a-typo", Type: TargetSMB, Host: "192.168.1.99", Share: "media"}
+	if err := db.CreateTarget(ctx, target); err != nil {
+		t.Fatalf("creating: %v", err)
+	}
+
+	// Same name, corrected address — the exact second save from the report.
+	target.Host = "192.168.1.50"
+	if err := db.UpdateTarget(ctx, target); err != nil {
+		t.Fatalf("updating a target without changing its name: %v", err)
+	}
+
+	stored, err := db.GetTarget(ctx, target.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Host != "192.168.1.50" {
+		t.Fatalf("host = %q, want the corrected address", stored.Host)
+	}
+
+	// And a *different* target may still not take the name.
+	clash := &Target{Name: "nas-with-a-typo", Type: TargetSMB, Host: "192.168.1.51", Share: "media"}
+	if err := db.CreateTarget(ctx, clash); !errors.Is(err, ErrNameTaken) {
+		t.Fatalf("a second target took the name: %v", err)
+	}
+}

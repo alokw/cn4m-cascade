@@ -41,7 +41,7 @@ func TestLoadDefaults(t *testing.T) {
 		{"listen addr", cfg.ListenAddr, ":2649"},
 		{"data dir", cfg.DataDir, "/data"},
 		{"mount root", cfg.MountRoot, "/mnt/smb"},
-		{"db path", cfg.DBPath(), "/data/smbsync.db"},
+		{"db path", cfg.DBPath(), "/data/cn4m-cascade.db"},
 		{"idle grace", cfg.IdleGrace, 60 * time.Second},
 		{"statfs timeout", cfg.StatFSTimeout, 5 * time.Second},
 	}
@@ -55,7 +55,7 @@ func TestLoadDefaults(t *testing.T) {
 func TestLoadOverrides(t *testing.T) {
 	t.Setenv("ENCRYPTION_KEY", "a-sufficiently-long-key")
 	t.Setenv("LISTEN_ADDR", ":9000")
-	t.Setenv("DATA_DIR", "/var/lib/smbsync")
+	t.Setenv("DATA_DIR", "/var/lib/cn4m-cascade")
 	t.Setenv("MOUNT_IDLE_GRACE", "5s")
 	t.Setenv("MOUNT_UID", "1234")
 
@@ -66,7 +66,7 @@ func TestLoadOverrides(t *testing.T) {
 	if cfg.ListenAddr != ":9000" {
 		t.Errorf("listen addr = %q, want %q", cfg.ListenAddr, ":9000")
 	}
-	if cfg.DBPath() != "/var/lib/smbsync/smbsync.db" {
+	if cfg.DBPath() != "/var/lib/cn4m-cascade/cn4m-cascade.db" {
 		t.Errorf("db path = %q", cfg.DBPath())
 	}
 	if cfg.IdleGrace != 5*time.Second {

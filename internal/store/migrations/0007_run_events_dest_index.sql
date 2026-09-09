@@ -1,0 +1,16 @@
+-- The global log (GET /api/logs) can now filter by destination, which is what
+-- makes "what has been failing against this NAS" answerable: the evidence is
+-- one row in each of many runs, spread across every job that writes there.
+--
+-- Until now dest_target_id was only ever filtered *alongside* run_id
+-- (/api/runs/{id}/events), which idx_run_events_run_level covers. The global
+-- view has no run to scope by, so without this index SQLite walks
+-- idx_run_events_ts newest-first and does a row lookup per candidate until it
+-- fills the page — reading the whole of the largest table in the schema
+-- whenever the destination is a quiet one, which is exactly the case someone
+-- filters for. The Logs page re-issues that query every few seconds while a
+-- run is in flight, i.e. while run_events is being written hardest.
+--
+-- (dest_target_id, ts) rather than (dest_target_id) alone so the ORDER BY
+-- ts DESC is served by the index too, rather than sorting the matches.
+CREATE INDEX idx_run_events_dest_ts ON run_events(dest_target_id, ts);

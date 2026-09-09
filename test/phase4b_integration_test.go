@@ -1093,3 +1093,76 @@ func TestGlobalFiltersAreSeededOnAFreshInstall(t *testing.T) {
 		}
 	}
 }
+
+// The global log filters by destination (SPEC.md §9's Logs page).
+//
+// Two destinations, deliberately: with one, a filter that silently matched
+// everything would look exactly like a working one. The interesting question
+// this answers is "what has been going wrong against *this* NAS", and the
+// evidence for it is scattered one row at a time across every job that writes
+// there — which is why no per-run view can substitute.
+func TestLogsFilterByDestination(t *testing.T) {
+	h := newHarness(t, nil)
+	srcID, dstAID, dstBID, scope, srcRoot := fanOutFixture(t, h)
+	seedTree(t, srcRoot, map[string]int{"a.txt": 100, "b.txt": 100})
+
+	jobID := h.createJob(t, map[string]any{
+		"name":             uniqueName("logs-dest"),
+		"source_target_id": srcID,
+		"source_subpath":   scope,
+		"mode":             string(store.ModeMirror),
+		"log_every_file":   true,
+		"destinations": []map[string]any{
+			{"dest_target_id": dstAID, "dest_subpath": scope},
+			{"dest_target_id": dstBID, "dest_subpath": scope},
+		},
+	})
+	h.awaitRun(t, h.runJob(t, jobID), 120*time.Second)
+
+	// dests reports how many events came back and which destinations they
+	// were attributed to.
+	dests := func(query string) (int, map[string]int) {
+		t.Helper()
+		status, body := h.do(http.MethodGet, "/api/logs?limit=1000&"+query, nil)
+		if status != http.StatusOK {
+			t.Fatalf("GET /api/logs?%s = %d, want 200: %v", query, status, body)
+		}
+		events, _ := body["events"].([]any)
+		byDest := map[string]int{}
+		for _, raw := range events {
+			e, _ := raw.(map[string]any)
+			id, _ := e["dest_target_id"].(string)
+			byDest[id]++
+		}
+		return len(events), byDest
+	}
+
+	total, all := dests("job_id=" + jobID)
+	if all[dstAID] == 0 || all[dstBID] == 0 {
+		t.Fatalf("the run logged nothing against one of its destinations: %v", all)
+	}
+	// ListEvents caps a page at 1000. If the fixture ever grows past that,
+	// both counts saturate there and the narrowing check below compares 1000
+	// with 1000 — passing or failing for reasons that have nothing to do with
+	// the filter. Fail loudly instead of silently testing nothing.
+	if total >= 1000 {
+		t.Fatalf("the fixture logs %d events and has outgrown the page cap; the checks below are meaningless", total)
+	}
+
+	got, byDest := dests("job_id=" + jobID + "&dest=" + dstAID)
+	if got == 0 {
+		t.Fatal("filtering by a destination that was written to returned nothing")
+	}
+	if len(byDest) != 1 || byDest[dstAID] != got {
+		t.Fatalf("dest=%s returned events for other destinations: %v", dstAID, byDest)
+	}
+	// The filter has to *narrow*: the run also logs events that belong to no
+	// destination at all, so a filtered page can never be the whole page.
+	if got >= total {
+		t.Fatalf("dest=%s returned %d of %d events — the filter did not narrow anything", dstAID, got, total)
+	}
+
+	if n, _ := dests("dest=no-such-target"); n != 0 {
+		t.Fatalf("filtering by an unknown destination returned %d events", n)
+	}
+}

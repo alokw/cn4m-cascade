@@ -40,7 +40,23 @@ type Runner struct {
 	mu     sync.Mutex
 	active map[string]*handle // by run ID
 	byJob  map[string]string  // job ID -> run ID, enforcing one run per job
-	wg     sync.WaitGroup
+	// queued holds at most one pending webhook trigger per job (SPEC.md §8.1's
+	// `?queue=1`). A set, not a counter: the promise is "one run will follow
+	// this one", so five triggers during a long run still mean one run, not
+	// five. Deliberately in memory — a queued run that survived a restart
+	// would fire for a request nobody remembers making, possibly hours later.
+	queued map[string]bool
+	// notifier, when set, receives run lifecycle events for outbound callbacks
+	// (SPEC.md §8.2). An interface rather than the concrete type so the runner
+	// does not depend on an HTTP client, and nil-safe so every existing test
+	// constructs a Runner without one.
+	notifier Notifier
+
+	// closing stops a queued run from starting during shutdown. Without it,
+	// finishing the cancellation of one run could launch its queued successor
+	// into a server that is halfway through going away.
+	closing bool
+	wg      sync.WaitGroup
 }
 
 type handle struct {
@@ -78,7 +94,51 @@ func New(db *store.DB, provider *storage.Provider, log *slog.Logger) *Runner {
 		log:      log,
 		active:   map[string]*handle{},
 		byJob:    map[string]string{},
+		queued:   map[string]bool{},
 	}
+}
+
+// Notifier receives run lifecycle events. Implemented by *notify.Notifier.
+//
+// Every method must return promptly and must never return an error: a
+// callback problem is not a sync problem, and the run pipeline calls these
+// inline.
+type Notifier interface {
+	Notify(ctx context.Context, jobID, runID, event string, payload map[string]any)
+	Forget(runID string)
+}
+
+// SetNotifier attaches outbound callbacks. Safe to leave unset.
+func (r *Runner) SetNotifier(n Notifier) { r.notifier = n }
+
+// notify emits one lifecycle event, if anything is listening.
+//
+// The nil check is for tests and for a server built without callbacks; in
+// production a notifier is always attached, so every run pays one GetRun, one
+// GetTarget per destination, and one webhooks lookup at start, at completion,
+// and at each prompt — even with no webhooks configured. Against local SQLite
+// that is negligible, and it happens three-ish times per run rather than per
+// file. The progress path, which fires every flush, deliberately does none of
+// it (see notifyProgress).
+func (r *Runner) notify(ctx context.Context, run *store.Run, event string) {
+	if r.notifier == nil {
+		return
+	}
+	fresh, err := r.db.GetRun(ctx, run.ID)
+	if err != nil {
+		fresh = run
+	}
+	var snap *RunSnapshot
+	if live, ok := r.Progress(run.ID); ok {
+		snap = &live
+	}
+	payload := StatusPayload(fresh, snap, func(id string) string {
+		if t, err := r.db.GetTarget(ctx, id); err == nil {
+			return t.Name
+		}
+		return id
+	})
+	r.notifier.Notify(ctx, run.JobID, run.ID, event, payload)
 }
 
 // Start begins a run in the background and returns its record immediately.
@@ -86,16 +146,68 @@ func New(db *store.DB, provider *storage.Provider, log *slog.Logger) *Runner {
 // The run does not inherit the caller's context: an HTTP request finishing
 // must not cancel a sync that may take hours.
 func (r *Runner) Start(ctx context.Context, job *store.Job) (*store.Run, error) {
-	return r.start(ctx, job, false)
+	return r.start(ctx, job, false, store.TriggerManual)
+}
+
+// StartWebhook is Start for a run an external trigger began (SPEC.md §8.1).
+//
+// Like StartScheduled, the only difference is the recorded trigger — and for
+// the same reason: an unattended run started by a machine reads differently in
+// the log from one a person watched, especially when it falls back on a prompt
+// nobody answered.
+func (r *Runner) StartWebhook(ctx context.Context, job *store.Job) (*store.Run, error) {
+	return r.start(ctx, job, false, store.TriggerWebhook)
+}
+
+// ErrShuttingDown means the server is stopping and will not start new runs.
+var ErrShuttingDown = errors.New("the server is shutting down")
+
+// QueueNext records that one more run of this job should follow the current
+// one, and reports whether it was newly queued.
+//
+// Returns false when a run is already queued, so a caller triggering
+// repeatedly during a long run gets an honest "already queued" rather than
+// silently stacking work. Returns false too if the job is not running at all,
+// because there is then nothing to queue behind and the caller should simply
+// start it.
+func (r *Runner) QueueNext(jobID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, running := r.byJob[jobID]; !running {
+		return false
+	}
+	if r.queued[jobID] {
+		return false
+	}
+	r.queued[jobID] = true
+	return true
+}
+
+// Queued reports whether a job has a run waiting to follow the current one.
+func (r *Runner) Queued(jobID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.queued[jobID]
+}
+
+// StartScheduled is Start for a run the scheduler began.
+//
+// The only difference is what gets recorded as the trigger, and that is worth
+// a separate entry point rather than a boolean: an unattended run that fell
+// back on a prompt because nobody was there reads very differently from one a
+// person declined to answer, and the run log is where that distinction has to
+// survive.
+func (r *Runner) StartScheduled(ctx context.Context, job *store.Job) (*store.Run, error) {
+	return r.start(ctx, job, false, store.TriggerSchedule)
 }
 
 // StartPreview plans the run and parks it until confirmed, without copying,
 // deleting or creating anything (SPEC.md §6.1 step 6).
 func (r *Runner) StartPreview(ctx context.Context, job *store.Job) (*store.Run, error) {
-	return r.start(ctx, job, true)
+	return r.start(ctx, job, true, store.TriggerManual)
 }
 
-func (r *Runner) start(ctx context.Context, job *store.Job, preview bool) (*store.Run, error) {
+func (r *Runner) start(ctx context.Context, job *store.Job, preview bool, trigger store.RunTrigger) (*store.Run, error) {
 	if len(job.Destinations) == 0 {
 		return nil, errors.New("this job has no destination")
 	}
@@ -111,6 +223,18 @@ func (r *Runner) start(ctx context.Context, job *store.Job, preview bool) (*stor
 	}
 
 	r.mu.Lock()
+	// Refuse once shutdown has begun. The check belongs here, under the same
+	// lock that reserves the job, and not only in finish(): a queued run is
+	// dispatched on its own goroutine, so finish() can decide to start one,
+	// release the lock, and have Shutdown() complete its wg.Wait() before that
+	// goroutine ever calls in. Without this the successor starts against a
+	// server whose mounts are being torn down and whose database is about to
+	// close, leaving a `runs` row stuck in "running" that nothing will ever
+	// cancel.
+	if r.closing {
+		r.mu.Unlock()
+		return nil, ErrShuttingDown
+	}
 	if _, running := r.byJob[job.ID]; running {
 		r.mu.Unlock()
 		return nil, ErrAlreadyRunning
@@ -120,7 +244,7 @@ func (r *Runner) start(ctx context.Context, job *store.Job, preview bool) (*stor
 	r.byJob[job.ID] = ""
 	r.mu.Unlock()
 
-	run, err := r.db.CreateRun(ctx, job.ID, store.TriggerManual, destTargetIDs(job))
+	run, err := r.db.CreateRun(ctx, job.ID, trigger, destTargetIDs(job))
 	if err != nil {
 		r.mu.Lock()
 		delete(r.byJob, job.ID)
@@ -156,6 +280,10 @@ func (r *Runner) start(ctx context.Context, job *store.Job, preview bool) (*stor
 	go func() {
 		defer r.wg.Done()
 		defer cancel()
+		// Announced from inside the goroutine so Start still returns
+		// immediately: a slow webhook lookup must not delay the HTTP response
+		// that triggered the run.
+		r.notify(runCtx, run, notifyRunStarted)
 		r.execute(runCtx, h, job, run, srcTarget)
 	}()
 
@@ -249,6 +377,10 @@ func destTargetIDs(job *store.Job) []string {
 // final state (SPEC.md §10: running jobs are marked cancelled).
 func (r *Runner) Shutdown(ctx context.Context) error {
 	r.mu.Lock()
+	// Set before cancelling, so a run whose cancellation completes during this
+	// loop cannot start its queued successor on the way out.
+	r.closing = true
+	clear(r.queued)
 	for _, h := range r.active {
 		h.cancelled = true
 		h.cancel()
@@ -391,6 +523,15 @@ func (r *Runner) execute(ctx context.Context, h *handle, job *store.Job, run *st
 	// 7. Finalise.
 	if r.wasCancelled(run.ID) {
 		r.cancelRun(finalCtx, job, run, events)
+		// A cancelled run is still a run that ended, and this path used to
+		// return without saying so — leaving anything told "started" waiting
+		// for a completion that never came, and a cn4m row stuck on orange
+		// until the next run. Cancellation is an outcome, not an absence of
+		// one.
+		r.notify(finalCtx, run, notifyRunCompleted)
+		if r.notifier != nil {
+			r.notifier.Forget(run.ID)
+		}
 		return
 	}
 
@@ -402,6 +543,56 @@ func (r *Runner) execute(ctx context.Context, h *handle, job *store.Job, run *st
 		log.Error("could not finish the run record", "error", err)
 	}
 	log.Info("run finished", "status", status, "destinations", len(outcomes))
+
+	// Emitted after the row is written, so a receiver that immediately polls
+	// the status endpoint sees the same outcome the callback just told it.
+	event := notifyRunCompleted
+	if status == store.RunFailed {
+		event = notifyRunFailed
+	}
+	r.notify(finalCtx, run, event)
+	if r.notifier != nil {
+		r.notifier.Forget(run.ID)
+	}
+}
+
+// Event names, mirroring notify's constants without importing it — the runner
+// must not depend on the delivery mechanism it feeds.
+const (
+	notifyRunStarted   = "run_started"
+	notifyProgress     = "progress"
+	notifyRunCompleted = "run_completed"
+	notifyRunFailed    = "run_failed"
+	notifyPrompt       = "target_unavailable_prompt"
+)
+
+// notifyProgress emits the periodic progress callback of SPEC.md §8.2.
+//
+// Built from the in-memory snapshot alone — no GetRun, no GetTarget — because
+// this fires every flush for the whole of a run and must stay cheap. The
+// throttling that keeps it from flooding a receiver lives in notify, where the
+// per-webhook interval is configured.
+func (r *Runner) notifyProgress(ctx context.Context, runID, jobID string) {
+	if r.notifier == nil {
+		return
+	}
+	snap, ok := r.Progress(runID)
+	if !ok {
+		return
+	}
+	r.notifier.Notify(ctx, jobID, runID, notifyProgress, map[string]any{
+		"run_id":         runID,
+		"job_id":         jobID,
+		"status":         string(store.RunRunning),
+		"phase":          string(snap.Phase),
+		"files_done":     snap.FilesDone,
+		"files_total":    snap.FilesTotal,
+		"bytes_done":     snap.BytesDone,
+		"bytes_total":    snap.BytesTotal,
+		"throughput_bps": snap.ThroughputBPS,
+		"eta_sec":        snap.ETASeconds,
+		"elapsed_sec":    int(snap.ElapsedSec),
+	})
 }
 
 // destOutcome is what happened to one destination.
@@ -749,6 +940,10 @@ func (r *Runner) askAboutDestination(ctx context.Context, h *handle, job *store.
 		"%s — waiting up to %ds for a decision; with no answer this destination will %s",
 		message, job.PromptTimeoutSec, job.PromptFallback)})
 
+	// Told before the wait begins, not after: the whole value of this callback
+	// is that something else can react while there is still time to answer.
+	r.notify(finalCtx, run, notifyPrompt)
+
 	action, answered := waitForPrompt(ctx, ch, timeout, job.PromptFallback)
 
 	h.gate.close(destID)
@@ -939,6 +1134,12 @@ func (r *Runner) startFlusher(ctx context.Context, h *handle, runID string) func
 			case <-ticker.C:
 				h.progress.sample(time.Now())
 				r.flushProgress(ctx, h, runID)
+				// The progress callback rides the flusher rather than having a
+				// ticker of its own: the counters are only refreshed here, so
+				// a separate timer would send the same numbers repeatedly.
+				// notify throttles per webhook to its own min_interval_sec,
+				// which is far coarser than this tick.
+				r.notifyProgress(ctx, runID, h.jobID)
 			}
 		}
 	}()
@@ -1124,9 +1325,51 @@ func (r *Runner) wasCancelled(runID string) bool {
 
 func (r *Runner) finish(runID, jobID string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	delete(r.active, runID)
 	delete(r.byJob, jobID)
+	// Take the queue slot under the same lock that released the job, so a
+	// trigger arriving at this instant either queues behind a run that is
+	// still registered or starts one outright — never both, and never
+	// neither.
+	dequeue := r.queued[jobID] && !r.closing
+	delete(r.queued, jobID)
+	r.mu.Unlock()
+
+	if dequeue {
+		go r.startQueued(jobID)
+	}
+}
+
+// startQueued launches the run that `?queue=1` promised would follow.
+//
+// On its own goroutine because finish() runs at the tail of the previous run
+// and must not block; and reloading the job from the database rather than
+// reusing the finished run's copy, because the queued run may execute minutes
+// later against a job that has since been edited. Running the *old* definition
+// would be the surprising choice — the queue promises another run, not a
+// replay.
+func (r *Runner) startQueued(jobID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	job, err := r.db.GetJob(ctx, jobID)
+	if err != nil {
+		r.log.Error("could not start a queued run: the job could not be loaded",
+			"job_id", jobID, "error", err)
+		return
+	}
+	run, err := r.StartWebhook(context.Background(), job)
+	if err != nil {
+		if errors.Is(err, ErrShuttingDown) {
+			r.log.Info("a queued run was dropped because the server is shutting down",
+				"job_id", jobID, "job", job.Name)
+			return
+		}
+		r.log.Error("could not start a queued run",
+			"job_id", jobID, "job", job.Name, "error", err)
+		return
+	}
+	r.log.Info("started a queued run", "run_id", run.ID, "job_id", jobID, "job", job.Name)
 }
 
 func joinSubpaths(targetSubpath, jobSubpath string) string {

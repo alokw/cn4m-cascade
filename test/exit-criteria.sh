@@ -8,8 +8,8 @@ set -uo pipefail
 BASE="http://127.0.0.1:2649"
 DATA_DIR="$(mktemp -d)"
 MOUNT_ROOT="/mnt/smb-demo"
-SAMBA_A="${SMBSYNC_TEST_SAMBA_A:-172.28.0.10}"
-OFFLINE="${SMBSYNC_TEST_OFFLINE:-172.28.0.99}"
+SAMBA_A="${CN4M_TEST_SAMBA_A:-172.28.0.10}"
+OFFLINE="${CN4M_TEST_OFFLINE:-172.28.0.99}"
 
 pass=0
 fail=0
@@ -50,7 +50,7 @@ MOUNT_ROOT="$MOUNT_ROOT" \
 MOUNT_IDLE_GRACE="5s" \
 MOUNT_TIMEOUT="15s" \
 LISTEN_ADDR=":2649" \
-    /tmp/smbsync &
+    /tmp/cn4m-cascade &
 SERVER_PID=$!
 
 for _ in $(seq 1 50); do

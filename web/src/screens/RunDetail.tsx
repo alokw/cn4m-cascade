@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { ApiError, api } from '../api/client'
 import type {
@@ -12,15 +12,29 @@ import type {
   Target,
 } from '../api/types'
 import { isTerminal } from '../api/types'
+import { Bar } from '../components/Bar'
 import { ConfirmPlan } from '../components/ConfirmPlan'
+import { EventList, LEVELS } from '../components/EventList'
 import { PromptModal } from '../components/PromptModal'
-import { bytes, duration, eta, percent, rate, timestamp } from '../format'
+import { bytes, duration, eta, rate, timestamp } from '../format'
 import { useEvents } from '../hooks/useEvents'
 
 export function RunDetail() {
   const { id = '' } = useParams()
   const navigate = useNavigate()
   const feed = useEvents()
+
+  // Whether this run is parked waiting to be confirmed, read at unmount.
+  //
+  // A preview holds the job — Run answers "already in progress" — until it is
+  // confirmed or its deadline expires, which can be ten minutes of a job that
+  // looks stuck for no visible reason. Leaving the page having been shown the
+  // plan is a clear enough "no" to act on.
+  //
+  // Set only from an effect, never during render. StrictMode mounts, unmounts
+  // and remounts in development; that simulated unmount happens before the
+  // first fetch resolves, so this is still false and the cancel does not fire.
+  const parked = useRef(false)
 
   const [run, setRun] = useState<RunDetailPayload | null>(null)
   const [targets, setTargets] = useState<Target[]>([])
@@ -61,6 +75,10 @@ export function RunDetail() {
     if (status && isTerminal(status)) void load()
   }, [status, load])
 
+  useEffect(() => {
+    parked.current = status === 'awaiting_confirmation'
+  }, [status])
+
   // Starts the same job again and follows the new run, so a failed run does
   // not have to be chased back through the jobs list.
   const rerun = useCallback(
@@ -80,6 +98,16 @@ export function RunDetail() {
     },
     [run, navigate],
   )
+
+  useEffect(() => {
+    return () => {
+      if (parked.current) {
+        // Best effort: the run cancels itself on its deadline anyway, so a
+        // failure here costs a wait rather than a stuck job.
+        void api.runs.cancel(id).catch(() => {})
+      }
+    }
+  }, [id])
 
   const nameFor = useCallback(
     (targetID: string) => targets.find((t) => t.id === targetID)?.name ?? targetID,
@@ -268,17 +296,6 @@ function DestPanel({ dest, name }: { dest: PanelDest; name: string }) {
   )
 }
 
-function Bar({ done, total }: { done: number; total: number }) {
-  const pct = percent(done, total)
-  return (
-    <div className="bar" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
-      <div className="bar-fill" style={{ width: `${pct}%` }} />
-    </div>
-  )
-}
-
-const LEVELS: LogLevel[] = ['info', 'warn', 'error']
-
 const EVENT_POLL_MS = 3000
 
 function EventLog({
@@ -351,17 +368,7 @@ function EventLog({
         </div>
       </div>
 
-      {loading && <p className="muted">Loading…</p>}
-      {!loading && events.length === 0 && <p className="muted">Nothing logged yet.</p>}
-
-      <ul className="events">
-        {events.map((e) => (
-          <li key={e.id} className={e.level}>
-            <span className="muted">{timestamp(e.ts)}</span> <span className="lvl">{e.level}</span>{' '}
-            {e.relpath && <code>{e.relpath}</code>} {e.message}
-          </li>
-        ))}
-      </ul>
+      <EventList events={events} loading={loading} />
     </div>
   )
 }

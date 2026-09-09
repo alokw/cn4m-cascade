@@ -2,8 +2,10 @@ import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 import { AuthProvider, useAuth } from './auth'
 import { EventsProvider, useEvents } from './hooks/useEvents'
 import { SignIn } from './screens/SignIn'
+import { Dashboard } from './screens/Dashboard'
 import { JobEditor } from './screens/JobEditor'
 import { Jobs } from './screens/Jobs'
+import { Logs } from './screens/Logs'
 import { RunDetail } from './screens/RunDetail'
 import { Settings } from './screens/Settings'
 import { Runs } from './screens/Runs'
@@ -31,11 +33,17 @@ function Shell() {
     <EventsProvider>
     <div className="shell">
       <header>
-        <span className="brand">SMB Sync</span>
+        <span className="brand">cn4m cascade</span>
         <nav>
+          {/* `end` so the dashboard is not marked active on every other page:
+              every path starts with "/". */}
+          <NavLink to="/" end>
+            Dashboard
+          </NavLink>
           <NavLink to="/jobs">Jobs</NavLink>
           <NavLink to="/targets">Targets</NavLink>
           <NavLink to="/runs">Runs</NavLink>
+          <NavLink to="/logs">Logs</NavLink>
           <NavLink to="/settings">Settings</NavLink>
         </nav>
         <FeedIndicator />
@@ -46,15 +54,16 @@ function Shell() {
 
       <main>
         <Routes>
+          <Route path="/" element={<Dashboard />} />
           <Route path="/jobs" element={<Jobs />} />
           <Route path="/jobs/new" element={<JobEditor />} />
           <Route path="/jobs/:id" element={<JobEditor />} />
           <Route path="/targets" element={<Targets />} />
           <Route path="/runs" element={<Runs />} />
           <Route path="/runs/:id" element={<RunDetail />} />
+          <Route path="/logs" element={<Logs />} />
           <Route path="/settings" element={<Settings />} />
-          {/* Dashboard and logs arrive in 4b-2b-ii. */}
-          <Route path="*" element={<Navigate to="/jobs" replace />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
     </div>

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { ApiError, api } from '../api/client'
 import type { MountErrorKind, Target, TargetPayload, TargetType } from '../api/types'
@@ -31,6 +31,19 @@ interface Props {
 
 export function TargetModal({ target, duplicate = false, onClose, onSaved, onRefresh }: Props) {
   const editing = target !== null && !duplicate
+
+  // The id to PATCH, which is not the same question as `editing`.
+  //
+  // "Save and test" saves first, so a brand-new target that fails its test is
+  // already *saved* — and the next attempt has to update it, not create it
+  // again. Without this, correcting a typo'd IP and saving again is refused
+  // for a name that is already in use: your own, from thirty seconds ago.
+  //
+  // Kept separate from `editing` because `editing` also drives the title and
+  // the password placeholder, and those read `target`, which is still null
+  // here.
+  const [createdID, setCreatedID] = useState<string | null>(null)
+  const persistID = createdID ?? (editing ? target.id : null)
 
   const [type, setType] = useState<TargetType>(target?.type ?? 'smb')
   const [form, setForm] = useState({
@@ -92,7 +105,14 @@ export function TargetModal({ target, duplicate = false, onClose, onSaved, onRef
 
   async function persist(): Promise<Target> {
     const payload = buildPayload()
-    return editing ? api.targets.update(target.id, payload) : api.targets.create(payload)
+    if (persistID) {
+      return api.targets.update(persistID, payload)
+    }
+    const created = await api.targets.create(payload)
+    // From here on this modal is editing that record, whatever it says at the
+    // top. A duplicate becomes a real target the moment it is first saved too.
+    setCreatedID(created.id)
+    return created
   }
 
   async function submit(e: FormEvent) {
@@ -153,11 +173,26 @@ export function TargetModal({ target, duplicate = false, onClose, onSaved, onRef
   const incomplete =
     form.name === '' || (type === 'smb' ? form.host === '' || form.share === '' : form.local_path === '')
 
+  // Escape still closes, because a dialog with no keyboard way out is its own
+  // kind of trap. It is a deliberate keystroke, unlike a stray click.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
   const title = duplicate ? 'Duplicate target' : editing ? 'Edit target' : 'Add target'
 
   return (
-    <div className="backdrop" onClick={onClose}>
-      <form className="card modal" onClick={(e) => e.stopPropagation()} onSubmit={submit}>
+    // No click-to-dismiss on the backdrop. A half-filled target with a typed
+    // password is expensive to lose, and the click that dismissed it was
+    // usually the click that refocused the browser window — so the form
+    // vanished for doing nothing at all. Closing is deliberate: the Cancel
+    // button or Escape.
+    <div className="backdrop">
+      <form className="card modal" onSubmit={submit}>
         <h2>{title}</h2>
         {duplicate && (
           <p className="hint">

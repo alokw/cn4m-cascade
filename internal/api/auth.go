@@ -13,7 +13,7 @@ import (
 )
 
 // sessionCookie is the cookie the SPA carries.
-const sessionCookie = "smbsync_session"
+const sessionCookie = "cn4m_cascade_session"
 
 // loginAttemptWindow and maxLoginAttempts rate-limit password guessing.
 // SPEC.md §8 asks for rate limiting on the hook endpoints; the login form is

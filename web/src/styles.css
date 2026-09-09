@@ -177,7 +177,13 @@ input[type="radio"] { width: auto; display: inline; margin: 0; }
 .events li.error .lvl { color: var(--err); }
 .events li.info .lvl { color: var(--muted); }
 
-.filters { display: flex; gap: 0.5rem; align-items: center; }
+.filters { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+
+/* Dashboard */
+.run-progress { margin-top: 0.5rem; }
+/* A status badge that links to its run: still a badge, not underlined text. */
+a.badge { text-decoration: none; }
+a.badge:hover { border-color: var(--fg); }
 select {
   padding: 0.3rem 0.4rem;
   background: var(--bg);
@@ -259,3 +265,26 @@ fieldset.bare[disabled] { opacity: 0.6; }
    a copy list can be thousands of rows, and the deletions below it are the
    part that must stay reachable. About six rows tall. */
 .paths { max-height: 9rem; }
+
+/* Webhooks & API tab */
+.tab-body > .card + .card { margin-top: 1rem; }
+/* Tokens and curl examples must be selectable and must not wrap mid-token —
+   a token broken across lines gets copied broken. */
+.token, .curl {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0.6rem;
+  font-size: 0.8rem;
+  overflow-x: auto;
+  white-space: pre;
+  user-select: all;
+}
+.token { color: var(--accent); }
+.events-pick {
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0.6rem 0.8rem;
+  margin-bottom: 0.75rem;
+}
+.events-pick legend { font-size: 0.85rem; color: var(--muted); padding: 0 0.3rem; }

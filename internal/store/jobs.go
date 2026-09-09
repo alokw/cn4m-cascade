@@ -19,7 +19,11 @@ const (
 	ModeMirror SyncMode = "mirror"
 	// ModeUpdate copies new and newer files and never deletes.
 	ModeUpdate SyncMode = "update"
-	// ModeTwoWay arrives in Phase 5.
+	// Two-way sync is deferred indefinitely (SPEC.md §14.1): the deployments
+	// this serves only ever push one direction, and it is the one mode whose
+	// deletions are decided from stored state rather than from comparing two
+	// live listings. Validate still names it explicitly so an old payload
+	// gets an answer rather than a puzzle.
 )
 
 // CompareMethod is how two files are judged the same (SPEC.md §6.2).
@@ -114,9 +118,20 @@ const (
 
 // Workers bounds, from SPEC.md §6.1 step 7.
 const (
-	MinWorkers     = 1
-	MaxWorkers     = 16
-	DefaultWorkers = 4
+	MinWorkers = 1
+	MaxWorkers = 16
+	// DefaultWorkers is 1: one file at a time, per destination.
+	//
+	// Note that this is a *different axis* from destination ordering. Workers
+	// is concurrency **within** one destination; whether destinations run one
+	// after another is `parallel_destinations`, which is off by default. So
+	// destinations are already processed in order regardless of this value —
+	// and raising it makes the first destination finish *sooner*, not later.
+	//
+	// One is nonetheless the default by choice (requested 2026-09-06): it is
+	// the gentlest thing to do to a source share, and the most predictable to
+	// watch. Raise it per job when throughput matters more than politeness.
+	DefaultWorkers = 1
 )
 
 // Job is a sync definition: one source, and in Phase 2 exactly one
@@ -157,6 +172,28 @@ type Job struct {
 	// default: fan-out multiplies read load on the source share
 	// (SPEC.md §6.1 step 7).
 	ParallelDestinations bool `json:"parallel_destinations"`
+
+	// ScheduleCron is a five-field cron expression, or empty for a job that
+	// only ever runs when asked (SPEC.md §11, Phase 5a).
+	ScheduleCron string `json:"schedule_cron,omitempty"`
+	// Enabled gates scheduled firing only; a disabled job can still be run by
+	// hand. Kept separate from ScheduleCron so pausing a nightly backup does
+	// not mean deleting the expression and retyping it from memory.
+	//
+	// NOTE: false is Go's zero value, so a Job built directly in code is
+	// *disabled*. The API defaults it to true when the field is absent
+	// (jobPayload.Enabled is a *bool for exactly that reason); anything
+	// constructing a Job without going through the API must set it.
+	Enabled bool `json:"enabled"`
+	// HasTriggerToken says whether this job can be started through
+	// /api/hooks/* (SPEC.md §8.1). Derived in SQL from whether the hash is
+	// present; the hash itself never reaches Go.
+	HasTriggerToken bool `json:"has_trigger_token"`
+
+	// NextRunAt is derived from ScheduleCron and stored, so the dashboard can
+	// show it without parsing cron and so a missed firing is still detectable
+	// after a restart. Server-owned: the API never accepts it.
+	NextRunAt time.Time `json:"next_run_at"`
 
 	Destinations []JobDestination `json:"destinations"`
 	Filters      []FilterRule     `json:"filters"`
@@ -231,7 +268,7 @@ func (j *Job) Validate() error {
 	switch j.Mode {
 	case ModeMirror, ModeUpdate:
 	case "twoway":
-		return errors.New(`mode "twoway" is not implemented yet`)
+		return errors.New(`two-way sync is not supported (SPEC.md §14.1); use "mirror" or "update"`)
 	default:
 		return fmt.Errorf("mode must be %q or %q, got %q", ModeMirror, ModeUpdate, j.Mode)
 	}
@@ -255,6 +292,12 @@ func (j *Job) Validate() error {
 	default:
 		return fmt.Errorf("delete_policy must be %q or %q, got %q",
 			DeletePolicySkipDeletes, DeletePolicyProceed, j.DeletePolicy)
+	}
+
+	if j.ScheduleCron != "" {
+		if _, err := ParseSchedule(j.ScheduleCron); err != nil {
+			return err
+		}
 	}
 
 	if j.Workers < MinWorkers || j.Workers > MaxWorkers {
@@ -383,7 +426,20 @@ func ValidateSubpath(field, subpath string) error {
 const jobColumns = `id, name, source_target_id, source_subpath, mode, compare,
 	compare_tolerance_sec, ignore_dst_hour, workers, on_error, delete_policy,
 	log_every_file, unavailable_policy, parallel_destinations,
-	prompt_timeout_sec, prompt_fallback, create_dest_dirs, created_at, updated_at`
+	prompt_timeout_sec, prompt_fallback, create_dest_dirs,
+	schedule_cron, enabled, next_run_at, created_at, updated_at`
+
+// jobSelectColumns is jobColumns plus one derived flag, and is used for every
+// read. It cannot be shared with the insert list because the last expression
+// is computed rather than stored.
+//
+// The point is that `api_trigger_token_hash` itself is **never selected**. The
+// UI needs to know whether a token exists, not what it is, and a hash that is
+// never loaded is a hash that cannot be logged, serialised into a response by
+// a future `json:"-"` slip, or read out of a heap dump. This deliberately
+// differs from how targets handle passwords, where the ciphertext does live on
+// the struct because mounting needs it back.
+const jobSelectColumns = jobColumns + `, api_trigger_token_hash IS NOT NULL`
 
 // CreateJob inserts a job and its destinations in one transaction.
 func (d *DB) CreateJob(ctx context.Context, j *Job) error {
@@ -398,6 +454,10 @@ func (d *DB) CreateJob(ctx context.Context, j *Job) error {
 	}
 	now := time.Now().UTC()
 	j.ID, j.CreatedAt, j.UpdatedAt = id, now, now
+	// Local, not `now`: cron fields are evaluated in the location of the
+	// instant handed to them, so a UTC instant would resolve "0 2 * * *" to
+	// 2am UTC. See ParseSchedule.
+	j.RefreshNextRun(time.Now())
 
 	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {
@@ -406,7 +466,7 @@ func (d *DB) CreateJob(ctx context.Context, j *Job) error {
 	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs (`+jobColumns+`)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, jobInsertArgs(j)...); err != nil {
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, jobInsertArgs(j)...); err != nil {
 		if isUniqueViolation(err) {
 			return fmt.Errorf("a job named %q already exists: %w", j.Name, ErrNameTaken)
 		}
@@ -431,7 +491,8 @@ func jobInsertArgs(j *Job) []any {
 		j.CompareToleranceSec, boolToInt(j.IgnoreDSTHour), j.Workers, string(j.OnError),
 		string(j.DeletePolicy), boolToInt(j.LogEveryFile), string(j.UnavailablePolicy),
 		boolToInt(j.ParallelDestinations), j.PromptTimeoutSec, string(j.PromptFallback),
-		string(j.CreateDestDirs), formatTime(j.CreatedAt), formatTime(j.UpdatedAt),
+		string(j.CreateDestDirs), j.ScheduleCron, boolToInt(j.Enabled), formatNextRun(j.NextRunAt),
+		formatTime(j.CreatedAt), formatTime(j.UpdatedAt),
 	}
 }
 
@@ -484,6 +545,10 @@ func (d *DB) UpdateJob(ctx context.Context, id string, j *Job) error {
 	j.ID = existing.ID
 	j.CreatedAt = existing.CreatedAt
 	j.UpdatedAt = time.Now().UTC()
+	// Recomputed rather than carried over: the expression may have just
+	// changed, and keeping the old firing time would schedule the job by an
+	// expression it no longer has. Local instant, as in CreateJob.
+	j.RefreshNextRun(time.Now())
 
 	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {
@@ -494,14 +559,16 @@ func (d *DB) UpdateJob(ctx context.Context, id string, j *Job) error {
 	const set = `UPDATE jobs SET name=?, source_target_id=?, source_subpath=?, mode=?, compare=?,
 		compare_tolerance_sec=?, ignore_dst_hour=?, workers=?, on_error=?, delete_policy=?,
 		log_every_file=?, unavailable_policy=?, parallel_destinations=?,
-		prompt_timeout_sec=?, prompt_fallback=?, create_dest_dirs=?, updated_at=? WHERE id=?`
+		prompt_timeout_sec=?, prompt_fallback=?, create_dest_dirs=?,
+		schedule_cron=?, enabled=?, next_run_at=?, updated_at=? WHERE id=?`
 
 	if _, err := tx.ExecContext(ctx, set,
 		j.Name, j.SourceTargetID, j.SourceSubpath, string(j.Mode), string(j.Compare),
 		j.CompareToleranceSec, boolToInt(j.IgnoreDSTHour), j.Workers, string(j.OnError),
 		string(j.DeletePolicy), boolToInt(j.LogEveryFile), string(j.UnavailablePolicy),
 		boolToInt(j.ParallelDestinations), j.PromptTimeoutSec, string(j.PromptFallback),
-		string(j.CreateDestDirs), formatTime(j.UpdatedAt), j.ID); err != nil {
+		string(j.CreateDestDirs), j.ScheduleCron, boolToInt(j.Enabled), formatNextRun(j.NextRunAt),
+		formatTime(j.UpdatedAt), j.ID); err != nil {
 		if isUniqueViolation(err) {
 			return fmt.Errorf("a job named %q already exists: %w", j.Name, ErrNameTaken)
 		}
@@ -526,7 +593,7 @@ func (d *DB) UpdateJob(ctx context.Context, id string, j *Job) error {
 
 // GetJob loads a job with its destinations.
 func (d *DB) GetJob(ctx context.Context, id string) (*Job, error) {
-	row := d.sql.QueryRowContext(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id = ?`, id)
+	row := d.sql.QueryRowContext(ctx, `SELECT `+jobSelectColumns+` FROM jobs WHERE id = ?`, id)
 	j, err := scanJob(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("job %s: %w", id, ErrNotFound)
@@ -546,7 +613,7 @@ func (d *DB) GetJob(ctx context.Context, id string) (*Job, error) {
 
 // ListJobs returns every job, newest first, each with its destinations.
 func (d *DB) ListJobs(ctx context.Context) ([]*Job, error) {
-	rows, err := d.sql.QueryContext(ctx, `SELECT `+jobColumns+` FROM jobs ORDER BY created_at DESC, id`)
+	rows, err := d.sql.QueryContext(ctx, `SELECT `+jobSelectColumns+` FROM jobs ORDER BY created_at DESC, id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing jobs: %w", err)
 	}
@@ -651,16 +718,20 @@ func scanJob(s scanner) (*Job, error) {
 		mode, compare, onErr, delPol      string
 		unavailable, promptFallback       string
 		createDestDirs                    string
-		created, updated                  string
+		created, updated, nextRun         string
 		ignoreDST, logEveryFile, parallel int
+		enabled, hasToken                 int
 	)
 	err := s.Scan(&j.ID, &j.Name, &j.SourceTargetID, &j.SourceSubpath, &mode, &compare,
 		&j.CompareToleranceSec, &ignoreDST, &j.Workers, &onErr, &delPol, &logEveryFile,
 		&unavailable, &parallel, &j.PromptTimeoutSec, &promptFallback, &createDestDirs,
-		&created, &updated)
+		&j.ScheduleCron, &enabled, &nextRun, &created, &updated, &hasToken)
 	if err != nil {
 		return nil, err
 	}
+	j.HasTriggerToken = hasToken != 0
+	j.Enabled = enabled != 0
+	j.NextRunAt = parseTime(nextRun)
 	j.UnavailablePolicy = UnavailablePolicy(unavailable)
 	j.CreateDestDirs = CreateDestDirs(createDestDirs)
 	j.PromptFallback = PromptFallback(promptFallback)

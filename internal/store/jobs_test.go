@@ -123,7 +123,7 @@ func TestJobValidate(t *testing.T) {
 		{"no name", func(j *Job) { j.Name = "" }, "name is required"},
 		{"no source", func(j *Job) { j.SourceTargetID = "" }, "source target is required"},
 		{"unknown mode", func(j *Job) { j.Mode = "sideways" }, "mode must be"},
-		{"twoway not yet", func(j *Job) { j.Mode = "twoway" }, "not implemented yet"},
+		{"twoway is not supported", func(j *Job) { j.Mode = "twoway" }, "not supported"},
 		{"content compare not yet", func(j *Job) { j.Compare = CompareContent }, "not implemented yet"},
 		{"unknown on_error", func(j *Job) { j.OnError = "explode" }, "on_error must be"},
 		{"unknown delete_policy", func(j *Job) { j.DeletePolicy = "yolo" }, "delete_policy must be"},

@@ -173,7 +173,7 @@ func TestForgedSessionCookieIsRejected(t *testing.T) {
 			if err != nil {
 				t.Fatalf("building the request: %v", err)
 			}
-			req.AddCookie(&http.Cookie{Name: "smbsync_session", Value: value})
+			req.AddCookie(&http.Cookie{Name: "cn4m_cascade_session", Value: value})
 
 			resp, err := h.anonClient.Do(req)
 			if err != nil {

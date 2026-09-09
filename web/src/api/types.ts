@@ -176,6 +176,15 @@ export interface Job {
   prompt_fallback: PromptFallback
   create_dest_dirs: CreateDestDirs
   parallel_destinations: boolean
+  /** A five-field cron expression, or absent for a job that only runs when asked. */
+  schedule_cron?: string
+  enabled: boolean
+  /** Server-derived from schedule_cron. Always present in the payload, so
+   *  guard with isZeroTime rather than a truthiness check. Never sent back. */
+  next_run_at: string
+  /** Whether this job can be started through /api/hooks/*. Server-owned: the
+   *  token itself is stored only as a hash and is never returned. */
+  has_trigger_token: boolean
   destinations: JobDestination[]
   filters?: FilterRule[]
   created_at: string
@@ -218,7 +227,16 @@ export interface FilterRulePayload {
  *  toJobPayload. */
 export type JobPayload = Omit<
   Job,
-  'id' | 'created_at' | 'updated_at' | 'filters' | 'destinations'
+  // next_run_at joins the server-owned fields: it is derived from
+  // schedule_cron, and DisallowUnknownFields 400s the whole save if it is
+  // sent back.
+  | 'id'
+  | 'created_at'
+  | 'updated_at'
+  | 'filters'
+  | 'destinations'
+  | 'next_run_at'
+  | 'has_trigger_token'
 > & {
   destinations: JobDestinationPayload[]
   filters: FilterRulePayload[]
@@ -475,6 +493,10 @@ export function toJobPayload(job: Job): JobPayload {
     prompt_fallback: job.prompt_fallback,
     create_dest_dirs: job.create_dest_dirs,
     parallel_destinations: job.parallel_destinations,
+    schedule_cron: job.schedule_cron ?? '',
+    enabled: job.enabled,
+    // next_run_at is deliberately absent: it is server-derived, and
+    // DisallowUnknownFields rejects it on the way back in.
     destinations: job.destinations.map((d) => ({
       dest_target_id: d.dest_target_id,
       dest_subpath: d.dest_subpath,
@@ -583,4 +605,63 @@ export interface FilterFileCheck {
   checked: boolean
   exists: boolean
   message?: string
+}
+
+/** internal/api/schedule.go — schedulePreviewResponse. */
+export interface SchedulePreview {
+  valid: boolean
+  error?: string
+  /** The zone the *server* evaluates in, which the expression cannot show. */
+  timezone: string
+  next: string[]
+  /** The same firings preformatted in the server's zone — the only way the
+   *  browser can display them, since an instant always renders locally. */
+  next_here: string[]
+}
+
+/** internal/store/webhooks.go — the events a callback may subscribe to. */
+export const WEBHOOK_EVENTS = [
+  'run_started',
+  'progress',
+  'target_unavailable_prompt',
+  'run_completed',
+  'run_failed',
+] as const
+export type WebhookEvent = (typeof WEBHOOK_EVENTS)[number]
+
+/** internal/api/webhooks.go — webhookResponse. Never carries the secret. */
+/** internal/store/webhooks.go — the wire shape a callback is sent in. */
+export type WebhookFormat = 'json' | 'cn4m'
+
+export interface Webhook {
+  id: string
+  /** Empty means every job. */
+  job_id?: string
+  url: string
+  events: string[]
+  enabled: boolean
+  format: WebhookFormat
+  min_interval_sec: number
+  /** Whether a signing secret is set. The secret itself is never returned. */
+  has_secret: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface WebhookPayload {
+  job_id?: string
+  url: string
+  events: string[]
+  enabled: boolean
+  format: WebhookFormat
+  min_interval_sec: number
+  /** Write-only. Empty on update means "leave the existing secret alone", so
+   *  editing the URL does not require re-typing a secret the UI never had. */
+  secret?: string
+}
+
+/** internal/api/hooks.go — the one-time token response. */
+export interface IssuedToken {
+  token: string
+  note: string
 }

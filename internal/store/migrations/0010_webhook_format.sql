@@ -1,0 +1,21 @@
+-- Callback wire formats, and a cn4m callback out of the box.
+--
+-- The generic webhook posts JSON with an HMAC signature, which is right for
+-- n8n, Home Assistant or a custom receiver. cn4m — the parent system this
+-- tool is a component of — wants something else entirely:
+--
+--   curl -X POST http://<cn4m-host>:2640/suite/status \
+--        -d app=cascade -d message="..." -d level=working
+--
+-- That is application/x-www-form-urlencoded with three named fields, not a
+-- JSON body, so posting JSON to it delivers nothing it can read. Hence a
+-- format per callback rather than a second delivery mechanism.
+ALTER TABLE webhooks ADD COLUMN format TEXT NOT NULL DEFAULT 'json';   -- json | cn4m
+
+-- The cn4m callback itself is NOT seeded here.
+--
+-- Its address comes from CN4M_STATUS_URL, and a migration cannot read the
+-- environment — seeding a hardcoded localhost here would make that variable
+-- useless on exactly the installs that need it, which are the ones where cn4m
+-- is on another machine. The row is created at startup instead
+-- (store.EnsureCN4MWebhook), where the configured value is available.

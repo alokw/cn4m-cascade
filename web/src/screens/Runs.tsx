@@ -5,8 +5,11 @@ import type { Run } from '../api/types'
 import { timestamp } from '../format'
 import { useEvents } from '../hooks/useEvents'
 
-/** A minimal run list, so run detail is reachable before the dashboard lands
- *  in 4b-2b. The dashboard replaces this as the front door. */
+/** Every run, newest first, regardless of job.
+ *
+ *  The dashboard is the front door and shows each job's *latest* run; this is
+ *  the only place a run that is not the latest can be found without knowing
+ *  its id. SPEC.md §9 names neither this nor the jobs index — see PROGRESS.md D-86. */
 export function Runs() {
   const [runs, setRuns] = useState<Run[]>([])
   const feed = useEvents()

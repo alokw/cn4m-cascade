@@ -25,7 +25,9 @@ import (
 	"github.com/alokw/cn4m-cascade/internal/api"
 	"github.com/alokw/cn4m-cascade/internal/health"
 	"github.com/alokw/cn4m-cascade/internal/mountmgr"
+	"github.com/alokw/cn4m-cascade/internal/notify"
 	"github.com/alokw/cn4m-cascade/internal/runner"
+	"github.com/alokw/cn4m-cascade/internal/scheduler"
 	"github.com/alokw/cn4m-cascade/internal/secrets"
 	"github.com/alokw/cn4m-cascade/internal/storage"
 	"github.com/alokw/cn4m-cascade/internal/store"
@@ -60,6 +62,7 @@ type harness struct {
 	db         *store.DB
 	mounts     *mountmgr.Manager
 	runner     *runner.Runner
+	scheduler  *scheduler.Scheduler
 	api        *api.Server
 	logs       *syncBuffer
 	mountRoot  string
@@ -122,12 +125,31 @@ func buildHarness(t *testing.T, tune func(*mountmgr.Config)) *harness {
 	t.Helper()
 
 	dir := t.TempDir()
-	mountRoot := filepath.Join(dir, "mnt")
-	if err := os.MkdirAll(mountRoot, 0o755); err != nil {
+
+	// The mount root deliberately does NOT live under t.TempDir(), and this is
+	// not tidiness — it is the difference between a dirty /tmp and a destroyed
+	// share.
+	//
+	// t.TempDir() registers a RemoveAll of everything beneath it. Shares are
+	// mounted at <root>/<target-id>, so if a mount is still attached when that
+	// cleanup runs, RemoveAll walks *into* the live share and deletes the
+	// server's files. That is not hypothetical: it silently emptied
+	// //172.28.0.10/private on 2026-09-05, .seeded and all, and left no trace
+	// beyond one unrelated-looking error about the *other* mount, whose server
+	// happened to be blackholed and so refused the same recursion.
+	//
+	// A mount outliving its test is a normal outcome here, not a bug: an
+	// unmount abandoned on its deadline is exactly what mountmgr is designed to
+	// do when a server dies (D-80), and the whole point of that design is that
+	// the kernel may still hold the mount afterwards. So the cleanup below must
+	// be safe in that state rather than assuming it away.
+	mountRoot, err := os.MkdirTemp("", "cn4m-mnt-")
+	if err != nil {
 		t.Fatalf("creating the mount root: %v", err)
 	}
+	t.Cleanup(func() { removeMountRoot(t, mountRoot) })
 
-	db, err := store.Open(context.Background(), filepath.Join(dir, "smbsync.db"))
+	db, err := store.Open(context.Background(), filepath.Join(dir, "cn4m-cascade.db"))
 	if err != nil {
 		t.Fatalf("opening the database: %v", err)
 	}
@@ -161,6 +183,13 @@ func buildHarness(t *testing.T, tune func(*mountmgr.Config)) *harness {
 
 	provider := storage.NewProvider(mounts, healthc)
 	runs := runner.New(db, provider, log)
+
+	// Outbound callbacks, wired exactly as main.go wires them so the
+	// integration tests exercise the real delivery path rather than a stub.
+	notifier := notify.New(db, box.Decrypt, log)
+	notifyCtx, stopNotify := context.WithCancel(context.Background())
+	notifier.Start(notifyCtx)
+	runs.SetNotifier(notifier)
 	apiSrv := api.NewServer(db, provider, mounts, healthc, box, runs, log)
 
 	// The event hub and session sweeper are background work the server owns;
@@ -177,9 +206,14 @@ func buildHarness(t *testing.T, tune func(*mountmgr.Config)) *harness {
 	authed := srv.Client()
 	authed.Jar = jar
 
+	// Built but deliberately not Started: tests drive Tick with an explicit
+	// time instead of waiting for wall-clock minutes to pass. The one test
+	// that does want the real loop starts it itself.
+	sched := scheduler.New(db, runs, log)
+
 	h := &harness{
 		t: t, server: srv, client: authed, anonClient: &http.Client{},
-		db: db, mounts: mounts, runner: runs, api: apiSrv,
+		db: db, mounts: mounts, runner: runs, scheduler: sched, api: apiSrv,
 		logs: logs, mountRoot: mountRoot,
 	}
 
@@ -196,6 +230,10 @@ func buildHarness(t *testing.T, tune func(*mountmgr.Config)) *harness {
 		if err := mounts.Shutdown(ctx); err != nil {
 			t.Logf("mount shutdown: %v", err)
 		}
+		if err := notifier.Stop(ctx); err != nil {
+			t.Logf("notifier shutdown: %v", err)
+		}
+		stopNotify()
 		db.Close()
 	})
 	return h
@@ -314,9 +352,9 @@ func env(t *testing.T, name string) string {
 	return v
 }
 
-func sambaA(t *testing.T) string    { return env(t, "SMBSYNC_TEST_SAMBA_A") }
-func sambaB(t *testing.T) string    { return env(t, "SMBSYNC_TEST_SAMBA_B") }
-func offlineIP(t *testing.T) string { return env(t, "SMBSYNC_TEST_OFFLINE") }
+func sambaA(t *testing.T) string    { return env(t, "CN4M_TEST_SAMBA_A") }
+func sambaB(t *testing.T) string    { return env(t, "CN4M_TEST_SAMBA_B") }
+func offlineIP(t *testing.T) string { return env(t, "CN4M_TEST_OFFLINE") }
 
 func uniqueName(prefix string) string {
 	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
@@ -343,4 +381,107 @@ func (h *harness) doAnon(method, path string, body any) (int, map[string]any) {
 	defer func() { h.client = saved }()
 
 	return h.do(method, path, body)
+}
+
+// removeMountRoot tears down a harness's mount root without ever recursing
+// into it.
+//
+// The rule it enforces is simple and absolute: **nothing here may use
+// os.RemoveAll**. The children of the mount root are mountpoints, and a
+// recursive delete cannot tell a mountpoint whose server is live from an empty
+// directory — it just walks in and deletes the share. os.Remove on a directory
+// succeeds only when that directory is empty, so against a still-attached
+// mount it returns EBUSY or ENOTEMPTY and touches nothing. The safety is
+// structural rather than a check that could be raced or forgotten.
+//
+// A leftover directory in /tmp is the correct outcome when a mount is still
+// held. `make harness-clean` sweeps them, and a dirty /tmp is recoverable in a
+// way that a deleted share is not.
+func removeMountRoot(t *testing.T, root string) {
+	t.Helper()
+
+	// Reading the root itself is safe: it is an ordinary local directory. Its
+	// children are the mountpoints, and nothing below reads *into* them.
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Logf("mount root %s: %v (leaving it in place)", root, err)
+		return
+	}
+
+	held := 0
+	for _, e := range entries {
+		// Bounded because rmdir(2) on a mountpoint whose server has gone can
+		// block in the kernel, and a cleanup that hangs is how a suite stops
+		// reporting anything at all. Abandoning the goroutine is the accepted
+		// cost (CLAUDE.md); the buffered channel lets it finish whenever the
+		// kernel returns.
+		done := make(chan error, 1)
+		path := filepath.Join(root, e.Name())
+		go func() { done <- os.Remove(path) }()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				held++
+			}
+		case <-time.After(5 * time.Second):
+			held++
+		}
+	}
+
+	if held > 0 {
+		t.Logf("%d mountpoint(s) still held under %s; leaving it for `make harness-clean` "+
+			"rather than deleting through a live mount", held, root)
+		return
+	}
+	if err := os.Remove(root); err != nil {
+		t.Logf("mount root %s: %v", root, err)
+	}
+}
+
+// The harness cleanup must never delete through a mountpoint.
+//
+// This pins the property with an ordinary non-empty directory standing in for
+// a live mount, because the two are indistinguishable to a recursive delete —
+// which is precisely the bug. os.Remove refuses both; os.RemoveAll empties
+// both, and against a real mount "both" means the server's files.
+//
+// Verified to fail against the previous implementation, where the mount root
+// lived under t.TempDir() and was removed recursively.
+func TestMountRootCleanupNeverDeletesThroughAMountpoint(t *testing.T) {
+	root, err := os.MkdirTemp("", "cn4m-mnt-test-")
+	if err != nil {
+		t.Fatalf("creating a mount root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+
+	// Stands in for a mounted share: a mountpoint directory with content
+	// underneath that belongs to somebody else.
+	mountpoint := filepath.Join(root, "0123456789abcdef")
+	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
+		t.Fatalf("creating the mountpoint: %v", err)
+	}
+	victim := filepath.Join(mountpoint, "hello.txt")
+	if err := os.WriteFile(victim, []byte("the server's file\n"), 0o644); err != nil {
+		t.Fatalf("seeding the fixture: %v", err)
+	}
+
+	removeMountRoot(t, root)
+
+	if _, err := os.Stat(victim); err != nil {
+		t.Fatalf("cleanup deleted a file underneath a mountpoint: %v", err)
+	}
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("cleanup removed a mount root that still held a mountpoint: %v", err)
+	}
+
+	// And with nothing held, it must still tidy up after itself — a cleanup
+	// that never removes anything would pass the check above trivially.
+	if err := os.RemoveAll(mountpoint); err != nil {
+		t.Fatalf("clearing the stand-in mountpoint: %v", err)
+	}
+	removeMountRoot(t, root)
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatalf("an empty mount root survived cleanup: %v", err)
+	}
 }

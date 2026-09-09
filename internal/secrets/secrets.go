@@ -18,6 +18,18 @@ import (
 )
 
 // hkdfInfo is versioned so a future scheme change can be distinguished.
+// hkdfInfo is the HKDF info string the credential key is derived from.
+//
+// **Deliberately not renamed with the rest of the project (2026-09-06).** It is
+// never displayed anywhere, so a new name buys nothing — and changing it
+// changes the derived key, which makes every stored target password
+// undecryptable. Nothing would fail at build, lint or test time; targets would
+// simply start failing to mount with a decryption error, at which point the
+// plaintext is gone for good.
+//
+// Leaving it alone is also what lets an existing database survive being
+// renamed on disk. If it ever must change, it needs a "-v2" suffix and a
+// re-encryption migration, which is what the "-v1" was always for.
 const hkdfInfo = "smbsync-target-creds-v1"
 
 // ErrUndecryptable means the stored ciphertext could not be opened with the

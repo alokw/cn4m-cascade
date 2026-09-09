@@ -6,12 +6,15 @@ import type {
   FilterRulePayload,
   FilterTestResult,
   JobPayload,
+  SchedulePreview,
   Target,
   UnavailablePolicy,
 } from '../api/types'
 import { targetRoot, toJobPayload } from '../api/types'
 import { FilterRuleRow } from '../components/FilterRuleRow'
 import { PathPicker } from '../components/PathPicker'
+import { WebhooksTab } from '../components/WebhooksTab'
+import { timestamp } from '../format'
 
 const BLANK: JobPayload = {
   name: '',
@@ -21,7 +24,7 @@ const BLANK: JobPayload = {
   compare: 'fast',
   compare_tolerance_sec: 2,
   ignore_dst_hour: false,
-  workers: 4,
+  workers: 1,
   log_every_file: false,
   on_error: 'skip',
   delete_policy: 'skip_deletes',
@@ -30,6 +33,8 @@ const BLANK: JobPayload = {
   prompt_fallback: 'skip',
   create_dest_dirs: 'ask',
   parallel_destinations: false,
+  schedule_cron: '',
+  enabled: true,
   destinations: [{ dest_target_id: '', dest_subpath: '' }],
   filters: [],
 }
@@ -43,7 +48,7 @@ const NEW_RULE: FilterRulePayload = {
   on_error: 'fail_run',
 }
 
-type Tab = 'settings' | 'filters'
+type Tab = 'settings' | 'filters' | 'webhooks'
 
 export function JobEditor() {
   const { id } = useParams()
@@ -53,6 +58,22 @@ export function JobEditor() {
   const [job, setJob] = useState<JobPayload>(BLANK)
   const [targets, setTargets] = useState<Target[]>([])
   const [tab, setTab] = useState<Tab>('settings')
+  // Whether this job currently has a trigger token. Tracked here rather than
+  // inside the tab so the tab can be unmounted and remounted without losing
+  // it, and refreshed after issuing or revoking.
+  const [hasToken, setHasToken] = useState(false)
+
+  // Re-read after issuing or revoking, so the tab's buttons and the "this job
+  // has a token" line reflect what the server actually holds rather than what
+  // the last click intended.
+  const refreshToken = useCallback(async () => {
+    if (!id) return
+    try {
+      setHasToken((await api.jobs.get(id)).has_trigger_token)
+    } catch {
+      // Advisory: the tab has already shown the outcome of the action itself.
+    }
+  }, [id])
   const [error, setError] = useState<string | null>(null)
   const [ruleErrors, setRuleErrors] = useState<Record<number, string>>({})
   const [busy, setBusy] = useState(false)
@@ -99,9 +120,11 @@ export function JobEditor() {
       try {
         // toJobPayload is required, not tidiness: the server sets
         // DisallowUnknownFields, so a fetched Job handed back verbatim is a 400.
-        const payload = toJobPayload(await api.jobs.get(id))
+        const fetched = await api.jobs.get(id)
+        const payload = toJobPayload(fetched)
         if (cancelled) return
         setJob(payload)
+        setHasToken(fetched.has_trigger_token)
         setSavedSnapshot(snapshotOf(payload))
         setSavedJob(JSON.stringify(payload))
       } catch (err) {
@@ -181,7 +204,12 @@ export function JobEditor() {
       setJob(payload)
       setSavedSnapshot(snapshotOf(payload))
       setSavedJob(JSON.stringify(payload))
-      if (!editing) navigate(`/jobs/${saved.id}`, { replace: true })
+      // Creating a job ends at the jobs list, not in the editor for the thing
+      // just created: "Save" on a new job reads as "I am done here", and
+      // landing back on the same form makes it look as though nothing
+      // happened. Editing stays put, because saving mid-edit is a checkpoint
+      // rather than a finish.
+      if (!editing) navigate('/jobs')
     } catch (err) {
       if (err instanceof ApiError) {
         // "filter rule N: ..." — blame the row rather than printing the whole
@@ -279,6 +307,17 @@ export function JobEditor() {
           <button className={tab === 'filters' ? 'link active' : 'link'} onClick={() => setTab('filters')}>
             Filters {job.filters.length > 0 ? `(${job.filters.length})` : ''}
           </button>
+          {/* Only for a saved job: a trigger token needs a job id to belong
+              to, and issuing one against a job that may never be created
+              would leave a live credential for nothing. */}
+          {editing && (
+            <button
+              className={tab === 'webhooks' ? 'link active' : 'link'}
+              onClick={() => setTab('webhooks')}
+            >
+              Webhooks &amp; API
+            </button>
+          )}
         </div>
       </div>
 
@@ -288,7 +327,11 @@ export function JobEditor() {
         {/* Disabled while saving: the response replaces the whole form, so
             anything typed mid-flight would be silently discarded. */}
         <fieldset className="bare" disabled={busy}>
-        {tab === 'settings' ? (
+        {tab === 'webhooks' ? (
+          // `id ?? ''` only to satisfy the type: this branch is unreachable
+          // unless `editing`, which is exactly `id !== undefined`.
+          <WebhooksTab jobID={id ?? ''} hasToken={hasToken} onTokenChange={() => void refreshToken()} />
+        ) : tab === 'settings' ? (
           <Settings
             job={job}
             set={set}
@@ -514,9 +557,6 @@ function Settings({
             <select value={job.mode} onChange={(e) => set('mode', e.target.value as JobPayload['mode'])}>
               <option value="mirror">Mirror — make the destination match, deleting extras</option>
               <option value="update">Update — copy new and changed files, never delete</option>
-              <option value="twoway" disabled>
-                Two-way — arrives in Phase 5
-              </option>
             </select>
           </label>
           <label>
@@ -532,7 +572,7 @@ function Settings({
 
         <div className="row">
           <label>
-            Workers <span className="hint">1–16</span>
+            Files at a time <span className="hint">1–16</span>
             <input
               type="number"
               min={1}
@@ -540,6 +580,13 @@ function Settings({
               value={job.workers}
               onChange={(e) => set('workers', Number(e.target.value))}
             />
+            <span className="hint">
+              How many files are copied at once <em>within one destination</em>. This does not
+              affect the order of destinations — that is the setting below, and it is off, so
+              destinations are already done one after another in the order listed. Raising this
+              makes the <em>first</em> destination finish sooner, at the cost of more load on the
+              source.
+            </span>
           </label>
           <label>
             Time tolerance <span className="hint">seconds; 0 is treated as 2</span>
@@ -604,21 +651,37 @@ function Settings({
           </label>
         </div>
 
-        <label>
-          If a destination folder does not exist
-          <select
-            value={job.create_dest_dirs}
-            onChange={(e) => set('create_dest_dirs', e.target.value as JobPayload['create_dest_dirs'])}
-          >
-            <option value="ask">Ask me before creating it</option>
-            <option value="always">Create it automatically</option>
-            <option value="never">Treat it as unavailable</option>
-          </select>
+        <div className="card">
+          <h3>Schedule</h3>
+          <label>
+            Run automatically
+            <input
+              value={job.schedule_cron ?? ''}
+              placeholder="0 2 * * *"
+              onChange={(e) => set('schedule_cron', e.target.value)}
+            />
+            <span className="hint">
+              Five fields — minute, hour, day of month, month, day of week. <code>0 2 * * *</code> is
+              2am every day; <code>30 6 * * 1-5</code> is 6:30am on weekdays. <code>@daily</code> and{' '}
+              <code>@every 6h</code> also work. Leave it empty to run this job only when you ask.
+            </span>
+          </label>
+
+          <NextRunPreview expression={job.schedule_cron ?? ''} enabled={job.enabled} />
+
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={job.enabled}
+              onChange={(e) => set('enabled', e.target.checked)}
+            />
+            Scheduling is on
+          </label>
           <span className="hint">
-            A mistyped folder gets created and synced into, which looks exactly like success — so
-            this asks by default. With no answer the destination is skipped, and nothing is created.
+            Turning this off pauses the schedule without discarding it, and does not stop you running
+            the job by hand. A paused job shows no next run at all rather than one it will not honour.
           </span>
-        </label>
+        </div>
 
         <label>
           If a destination folder does not exist
@@ -849,4 +912,74 @@ function snapshotOf(job: JobPayload): string {
     source_subpath: job.source_subpath ?? '',
     destinations: job.destinations,
   })
+}
+
+/**
+ * What a cron expression actually resolves to, asked of the server.
+ *
+ * A cron string cannot be checked by reading it. Whether "0 2 * * *" fires at
+ * 2am where you live depends on the server's timezone, which the expression
+ * does not mention; and "0 0 30 2 *" — the 30th of February — parses perfectly
+ * and never happens. Showing the next three firings makes both answerable at a
+ * glance, and makes a weekly schedule distinguishable from a daily one, which
+ * a single date cannot.
+ */
+function NextRunPreview({ expression, enabled }: { expression: string; enabled: boolean }) {
+  const [preview, setPreview] = useState<SchedulePreview | null>(null)
+
+  useEffect(() => {
+    const trimmed = expression.trim()
+    if (!trimmed) {
+      setPreview(null)
+      return
+    }
+    // Debounced: this fires on every keystroke, and most keystrokes are
+    // half-written expressions nobody needs an answer about.
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      void api
+        .schedulePreview(trimmed)
+        .then((p) => {
+          if (!cancelled) setPreview(p)
+        })
+        // Advisory only. A failed lookup must not make the field look invalid,
+        // because the save will still succeed.
+        .catch(() => {})
+    }, 300)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [expression])
+
+  if (!expression.trim() || !preview) return null
+
+  if (!preview.valid) {
+    return <p className="error">{preview.error}</p>
+  }
+  if (preview.next.length === 0) {
+    return (
+      <p className="warn">
+        That is a valid expression for a date that never occurs, so this job would never run.
+      </p>
+    )
+  }
+
+  // The server's zone is what the expression is read in; the browser's is
+  // what the reader recognises. Showing only the second is what makes
+  // "16 2 * * *" appear as 7:16pm and read as a bug.
+  const here = preview.next_here.join(', ')
+  const yours = preview.next.map((t) => timestamp(t)).join(', ')
+
+  return (
+    <p className={enabled ? 'hint' : 'warn'}>
+      {enabled ? 'Next runs' : 'Would run'} <strong>{here}</strong>{' '}
+      <code>{preview.timezone}</code> — the server's clock, which is what the expression means.
+      {!enabled && ' Scheduling is off, so it will not.'}
+      <br />
+      In your timezone that is <strong>{yours}</strong>. If the server's clock is not the one you
+      meant, set <code>TZ</code> on the container and these will agree.
+    </p>
+  )
 }

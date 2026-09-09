@@ -28,7 +28,17 @@ type RunTrigger string
 
 const (
 	TriggerManual RunTrigger = "manual"
-	// TriggerSchedule and TriggerWebhook arrive in Phase 5.
+	// TriggerSchedule marks a run the scheduler started with nobody watching,
+	// which is why it is worth distinguishing in the log: an unattended run
+	// that fell back on a prompt reads very differently from one a person
+	// declined to answer.
+	TriggerSchedule RunTrigger = "schedule"
+	// TriggerWebhook marks a run some other piece of software started through
+	// /api/hooks/* — a NAS task, n8n, Home Assistant. Worth distinguishing
+	// from `schedule` as well as from `manual`: when a run misbehaves, "which
+	// integration asked for this?" is a different question from "did the cron
+	// fire?".
+	TriggerWebhook RunTrigger = "webhook"
 )
 
 // DestStatus is the state of one destination within a run.

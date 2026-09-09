@@ -35,7 +35,10 @@ type Server struct {
 	log      *slog.Logger
 
 	logins *loginLimiter
-	hub    *hub
+	// hooks rate-limits the token endpoints, which are the only routes in the
+	// application an anonymous caller can reach at all.
+	hooks *hookLimiter
+	hub   *hub
 }
 
 // NewServer wires up the API.
@@ -44,6 +47,7 @@ func NewServer(db *store.DB, provider *storage.Provider, mounts *mountmgr.Manage
 		db: db, provider: provider, mounts: mounts, healthc: healthc,
 		box: box, runner: runs, log: log,
 		logins: newLoginLimiter(),
+		hooks:  newHookLimiter(),
 		hub:    newHub(runs, db, log),
 	}
 }
@@ -116,6 +120,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/runs/{id}/prompt", s.handlePrompt)
 
 	mux.HandleFunc("POST /api/filters/check-file", s.handleCheckFilterFile)
+	mux.HandleFunc("POST /api/schedule/preview", s.handleSchedulePreview)
+
+	// Token management is session-guarded: issuing a trigger token is an
+	// administrative act, and doing it with a trigger token would let a
+	// compromised integration mint fresh credentials for itself.
+	mux.HandleFunc("POST /api/jobs/{id}/token", s.handleIssueToken)
+	mux.HandleFunc("DELETE /api/jobs/{id}/token", s.handleRevokeToken)
+
+	mux.HandleFunc("GET /api/webhooks", s.handleListWebhooks)
+	mux.HandleFunc("POST /api/webhooks", s.handleCreateWebhook)
+	mux.HandleFunc("PATCH /api/webhooks/{id}", s.handleUpdateWebhook)
+	mux.HandleFunc("DELETE /api/webhooks/{id}", s.handleDeleteWebhook)
 
 	mux.HandleFunc("GET /api/settings/filters", s.handleGetGlobalFilters)
 	mux.HandleFunc("PUT /api/settings/filters", s.handleReplaceGlobalFilters)
@@ -130,7 +146,24 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/ws", s.handleWS)
 
+	// The webhook endpoints, mounted OUTSIDE the session guard (SPEC.md §8.1).
+	//
+	// This is the only part of the application an anonymous caller can reach,
+	// and the fact is invisible in the code: it works because Go 1.22's
+	// ServeMux gives the longest matching pattern priority, so "/api/hooks/"
+	// beats the "/api/" registration below it. Nothing here *says* "this
+	// bypasses authentication" except this comment — which is exactly why
+	// TestHooksAreReachableWithoutASessionButNothingElseIs asserts both
+	// directions rather than trusting the routing to stay this way.
+	//
+	// These handlers authenticate themselves, per job, with a bearer token.
+	hooks := http.NewServeMux()
+	hooks.HandleFunc("POST /api/hooks/jobs/{id}/run", s.handleHookRun)
+	hooks.HandleFunc("GET /api/hooks/jobs/{id}/status", s.handleHookJobStatus)
+	hooks.HandleFunc("GET /api/hooks/runs/{run_id}/status", s.handleHookRunStatus)
+
 	root := http.NewServeMux()
+	root.Handle("/api/hooks/", hooks)
 	root.Handle("/api/", s.requireSession(mux))
 	root.HandleFunc("GET /healthz", s.handleLiveness)
 	root.Handle("/", s.spaHandler())

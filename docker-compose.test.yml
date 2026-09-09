@@ -6,14 +6,14 @@
 services:
   samba-a:
     build: ./test/samba
-    container_name: smbsync-samba-a
+    container_name: cn4m-cascade-samba-a
     networks:
       smbnet:
         ipv4_address: 172.28.0.10
 
   samba-b:
     build: ./test/samba
-    container_name: smbsync-samba-b
+    container_name: cn4m-cascade-samba-b
     networks:
       smbnet:
         ipv4_address: 172.28.0.11
@@ -22,15 +22,27 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.dev
-    container_name: smbsync-dev
+    container_name: cn4m-cascade-dev
     cap_add: [SYS_ADMIN, DAC_READ_SEARCH, NET_ADMIN]
     security_opt: [apparmor:unconfined]
     environment:
       # 172.28.0.99 is deliberately unassigned: the offline-host test target.
-      SMBSYNC_TEST_SAMBA_A: 172.28.0.10
-      SMBSYNC_TEST_SAMBA_B: 172.28.0.11
-      SMBSYNC_TEST_OFFLINE: 172.28.0.99
+      CN4M_TEST_SAMBA_A: 172.28.0.10
+      CN4M_TEST_SAMBA_B: 172.28.0.11
+      CN4M_TEST_OFFLINE: 172.28.0.99
       ENCRYPTION_KEY: test-encryption-key-not-for-production
+      # Cron schedules are read in the server's local time, which in a
+      # container is UTC unless this says otherwise — so "0 2 * * *" would
+      # mean 2am UTC rather than 2am where you are. Set TZ in your shell or a
+      # .env file (e.g. TZ=America/New_York) and the job editor's preview will
+      # agree with the clock on your wall.
+      TZ: ${TZ:-UTC}
+      # Where this reports its status in the cn4m suite. Defaults to cn4m on
+      # the same machine; point it at another host, or set it to "off", when
+      # that is not true. Only ever used to create the callback on a fresh
+      # database — after that the row is editable in the UI and this variable
+      # will not overwrite it.
+      CN4M_STATUS_URL: ${CN4M_STATUS_URL:-http://localhost:2640/suite/status}
     volumes:
       - .:/src
       - gomodcache:/go/pkg/mod

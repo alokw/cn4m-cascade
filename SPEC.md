@@ -14,7 +14,7 @@ This is a design/architecture spec intended to be handed to an AI coding assista
 - Sync modes (mirroring FreeFileSync's semantics):
   - **Mirror** — make destination exactly match source (deletes extraneous dest files).
   - **Update** — copy new/newer files to destination, never delete.
-  - **Two-way** — bidirectional sync with a persisted state database to detect deletions/conflicts.
+  - ~~**Two-way**~~ — bidirectional sync with a persisted state database. **Deferred indefinitely; see §14.**
 - Jobs can be run manually, on a schedule (cron-style), or **triggered externally via a tokenized webhook URL**; sync status (state, progress, ETA) is likewise **queryable via a tokenized status URL** and can be **pushed to user-configured outbound callback URLs**.
 - A job may have **one source and one or more destination targets** (fan-out). Progress/ETA is reported per file, per destination target, and for the job as a whole.
 - **Flexible include/exclude filtering**: inline lists, wildcard patterns, external JSON files (with a user-specified key selecting the list inside the file), attachable at both the job level and per-target.
@@ -62,7 +62,7 @@ This is a design/architecture spec intended to be handed to an AI coding assista
 2. **SMB access via kernel CIFS mounts, not a userspace SMB library.** The backend mounts shares on demand at `/mnt/smb/<target-id>` using `mount.cifs`, then treats them as ordinary filesystem paths. This gets kernel-level performance (readahead, large rsize/wsize, SMB3 multichannel) and lets the entire sync engine be protocol-agnostic.
 3. **`network_mode: host`** to eliminate NAT overhead and any SMB networking weirdness.
 4. **Container capabilities:** `SYS_ADMIN` and `DAC_READ_SEARCH` (required for mount.cifs). Document clearly in the README that this is a privileged-ish container and why.
-5. **SQLite** (via `mattn/go-sqlite3` or `modernc.org/sqlite`) for all persistence: targets, job definitions, run history, and the two-way-sync state database.
+5. **SQLite** (via `mattn/go-sqlite3` or `modernc.org/sqlite`) for all persistence: targets, job definitions and run history. (The two-way state database is deferred — §14.)
 6. **Frontend: React + Vite SPA**, embedded into the Go binary with `embed.FS` so the container serves everything from one process. WebSocket for live progress.
 
 ---
@@ -131,7 +131,7 @@ A job has **one source and one or more destinations**. A run proceeds in stages,
 5. **Diff** source vs each destination according to sync mode → one ordered action plan per destination: `[]Action{Copy, Delete, MkDir, RmDir, ConflictSkip...}` with byte totals for progress/ETA reporting.
 6. **(Optional) Preview gate:** if the job is run manually with "preview" enabled, plan every destination, then send the plans to the UI and wait for confirmation before executing any of them. This is the one stage that holds the whole run. The run's status is `awaiting_confirmation` while it waits; it holds its mounts so that what is confirmed executes against what was planned, and an unconfirmed plan expires after `prompt_timeout_sec` and changes nothing.
 7. **Execute** per destination with a worker pool (default 4 concurrent copy workers per destination, configurable 1–16; destinations run sequentially by default with a per-job `parallel_destinations` toggle — parallel fan-out multiplies read load on the source share). Directories created first (top-down, sequential-ish), file copies in parallel, deletions last (bottom-up).
-8. **Finalize:** write per-destination and overall run summaries to DB, update two-way state DB if applicable, fire outbound status callbacks (§8.2), emit completion event.
+8. **Finalize:** write per-destination and overall run summaries to DB, fire outbound status callbacks (§8.2), emit completion event.
 
 ### 6.1.1 Progress & ETA reporting
 
@@ -157,11 +157,11 @@ Maintained by a central per-run progress tracker, updated by copy workers and pu
 - Per-job bandwidth limit (optional, token-bucket wrapper around the copy reader).
 - Skip-on-error vs abort-on-error is a per-job setting; always record per-file failures in the run log.
 
-### 6.4 Two-way sync state
+### 6.4 Two-way sync state — **deferred, see §13**
 
-- Per job, a SQLite table `sync_state(job_id, relpath, size, mtime_src, mtime_dst, last_synced_at)` capturing the state at last successful sync.
-- Deletion detection: file present in state but missing on one side → propagate deletion to the other side.
-- Conflict (changed on both sides since last state): do **not** guess. Mark as conflict, skip, surface prominently in UI with a per-file "keep left / keep right" resolution action. (FreeFileSync semantics.)
+Two-way sync is not built and is not planned. The design work done for it, and the reasons it is
+dangerous, are kept in §14 rather than here, so that this section describes only what the engine
+actually does.
 
 ### 6.5 Filtering system
 
@@ -173,7 +173,9 @@ Filters decide which files/folders are in scope. Multiple filter **rules** combi
 - **Absolute.** A job's own include rule cannot re-admit a path a global rule excludes. This falls out of the evaluation order below, and is kept deliberately: the alternative is a layered evaluator inside the code that guarantees prune and admit agree — the guarantee that stops a mirror deleting a subtree one side cannot see.
 - **Job-wide, therefore prunable.** A global rule may prune the shared source walk exactly as a job-scoped rule may, and for the same reason: it applies identically to every destination.
 
-A fresh database is **seeded** with a default set of exclusions — editor and OS metadata (`.DS_Store`, `Thumbs.db`, `desktop.ini`), sync-tool state files, and archive folders — so the common noise is excluded before anyone configures anything. The seed runs once, at migration time, and reaches existing installs as well as new ones; because global exclusions are absolute, a seeded pattern cannot be re-admitted by a job and must be removed from Settings instead. The list is a starting point, not a fixed policy.
+A fresh database is **seeded** with a default set of exclusions — editor and OS metadata (`.DS_Store`, `Thumbs.db`, `desktop.ini`), sync-tool state files, archive folders, and a handful of site-specific artefacts — so the common noise is excluded before anyone configures anything. The seed is applied once by the migration that creates the table. It is a starting point, not a fixed policy: the list is fully editable in Settings, and because global exclusions are absolute, a pattern that should not apply must be **removed there** rather than overridden by a job.
+
+Two consequences worth stating, because neither is obvious from the list itself. A seeded pattern that matches a file someone actually syncs makes that file invisible on both sides — never copied again, and never deleted either, so the destination keeps a stale copy with nothing to signal it. And should the seed ever ship to a database that predates it, it would apply to already-configured jobs without their owner choosing it; that is acceptable only while no such deployment exists.
 
 A global rule that cannot be loaded degrades **every** job's chain, disabling deletions for those runs — the same treatment a dropped per-job rule gets, because the consequence is the same: a filter narrower than configured turns protected files into extraneous ones.
 
@@ -204,11 +206,11 @@ A global rule that cannot be loaded degrades **every** job's chain, disabling de
 targets(id, name, type[smb|local], host, share, subpath, username,
         password_encrypted, domain, mount_opts_override, created_at)
 jobs(id, name, source_target_id, source_subpath,
-     mode[mirror|update|twoway], compare[fast|content], workers, bwlimit_kbps,
-     delete_policy, schedule_cron, enabled,
+     mode[mirror|update], compare[fast|content], workers, bwlimit_kbps,
+     delete_policy, schedule_cron, enabled, next_run_at,      -- scheduling: Phase 5a
      unavailable_policy[prompt|skip|abort], prompt_timeout_sec, prompt_fallback[skip|abort],
      parallel_destinations, create_dest_dirs[ask|always|never],
-     api_trigger_token)                                 -- token nullable; set = webhook enabled
+     api_trigger_token_hash)                            -- SHA-256; NULL = webhooks disabled (§8.1)
 job_destinations(id, job_id, dest_target_id, dest_subpath, position)
 global_filter_rules(id, source[inline|listfile|jsonfile], patterns_json,
      file_path, json_key, case_sensitive, on_error[fail_run|ignore_rule],
@@ -227,7 +229,6 @@ run_events(id, run_id, ts, level[info|warn|error], dest_target_id, relpath, mess
      -- the task/error log; indexed on (run_id, level) and (ts); pruned by retention setting
 webhooks(id, job_id_nullable, url, events[start|progress|prompt|complete|error],
      secret, enabled, min_interval_sec)                  -- outbound status callbacks
-sync_state(job_id, relpath, size, mtime_src, mtime_dst, last_synced_at)
 settings(key, value)                                     -- incl. log retention days
 ```
 
@@ -252,7 +253,7 @@ POST   /api/runs/{id}/prompt     body: {action: skip|retry|abort, dest_target_id
 GET    /api/runs?job_id=&status= history
 GET    /api/runs/{id}            full run detail incl. per-destination status/progress/ETA
 GET    /api/runs/{id}/events?level=&dest=&page=   paged task/error log
-GET    /api/logs?level=error&since=&job_id=       global log view across runs
+GET    /api/logs?level=&since=&job_id=&dest=     global log view across runs
 GET    /api/browse?target_id=&path=   directory listing for path pickers
 
 # Webhook endpoints (token auth, NOT session auth — see below)
@@ -273,10 +274,16 @@ GET    /api/hooks/jobs/{id}/status?token=...       same shape, for the job's lat
 WS     /api/ws                   events: run progress (bytes/sec, files done/total,
                                  per-file/per-destination/total ETA, current files
                                  in flight), target health changes, target-unavailable
-                                 prompts, run completion, conflicts needing resolution
+                                 prompts, run completion
 ```
 
 Auth: single admin password (env var or first-run setup), session cookie, all `/api/*` behind it **except** `/api/hooks/*`, which use per-job/per-run bearer tokens (long random strings, shown once at creation, regenerable, revocable). Rate-limit hook endpoints.
+
+`unavailable_policy_override` accepts `skip` or `abort` only. `prompt` is refused with a 400 rather than accepted and then ignored: an unattended trigger is precisely the case where there is nobody to answer, and a run that silently parks for its whole prompt timeout is worse than a request that says why it was rejected. The override applies to that run alone and never edits the stored job — a caller that can trigger a job must not be able to reconfigure it.
+
+**A `preview:true` webhook run parks the job until it is confirmed or times out.** Nobody answers a webhook preview, so it burns its `prompt_timeout_sec` holding the job — during which scheduled runs are skipped and manual ones are refused. Support is kept because this section offers it and "plan without executing" is a legitimate thing to ask for, but a token's power is therefore "can start this job *and* can keep it from running", which is worth knowing before handing one out.
+
+The token may be sent either as the `?token=` query parameter shown above or as `Authorization: Bearer <token>`, and **the header is the documented form**. Both work, because integrations expect the query parameter — but a credential in a URL ends up in proxy logs, browser history and `Referer` headers, none of which are places a trigger credential should be. Tokens are stored **hashed** (SHA-256), exactly as session tokens are, so a leaked database contains nothing that can start a run.
 
 ### 8.2 Outbound status callbacks
 
@@ -289,9 +296,14 @@ Optionally, per job (or globally), the user configures webhook URLs that the bac
 Pages:
 1. **Dashboard** — job cards with last-run status, next scheduled run *(Phase 5)*, live progress bars for running jobs (via WS) showing per-destination and total progress + ETA, aggregate throughput graph for active runs *(Phase 6)*.
 2. **Targets** — list with health dots; add/edit modal with a **type selector**: an *SMB share* (name, IP, share, subpath, credentials, advanced mount options) or a *local folder* (name, absolute path inside the container, subpath — no credentials, no mount). Either type may be a job's source or a destination. A "test connection" button shows real mount errors; it acts on a saved target, so it sits on the target list rather than inside the modal.
-3. **Job editor** — pick source target + subpath and **one or more destinations** (each with its own subpath), mode, compare method, workers, bandwidth limit *(Phase 6)*, schedule *(Phase 5)*, preview-before-run toggle, unavailable-destination policy, and a **Filters tab**: add/edit filter rules of all three source types (inline patterns, list file, JSON file + key), scoped to the job or to a specific destination, with a "Test filters" button (calls `/api/jobs/{id}/filter-test`) showing a live included/excluded sample. Also a **Webhooks/API tab** *(Phase 5)*: view/regenerate the trigger token (with copy-paste `curl` examples), configure outbound callback URLs and event subscriptions.
-4. **Run detail** — live or historical: per-destination panels (status, progress bar, ETA, throughput), currently-copying files with per-file progress, action plan, paged task log with level/destination filters and an errors-only toggle, conflict resolution UI for two-way jobs *(Phase 5)*. When a `target_unavailable` prompt is active, a blocking modal with Skip / Retry / Abort and a visible countdown to the fallback action.
-5. **Logs** — global view across all runs (`/api/logs`), filter by level/job/date, and a persistent error log view; retention configurable in settings *(Phase 6)*.
+3. **Job editor** — pick source target + subpath and **one or more destinations** (each with its own subpath), mode, compare method, workers, bandwidth limit *(Phase 6)*, schedule *(Phase 5)*, preview-before-run toggle, unavailable-destination policy, and a **Filters tab**: add/edit filter rules of all three source types (inline patterns, list file, JSON file + key), scoped to the job or to a specific destination, with a "Test filters" button (calls `/api/jobs/{id}/filter-test`) showing a live included/excluded sample. Also a **Webhooks/API tab** *(Phase 5)*: issue, **regenerate** and revoke the trigger token (with copy-paste `curl` examples), and configure outbound callback URLs and event subscriptions. The token is displayed **once, at the moment it is issued**, and never again — §8.1 stores only its hash, so there is nothing left to show. This section previously said "view/regenerate", which the storage rule made impossible; settled 2026-09-06 in favour of §8.1, because a token that can be redisplayed is one a leaked database also hands over.
+4. **Run detail** — live or historical: per-destination panels (status, progress bar, ETA, throughput), currently-copying files with per-file progress, action plan, paged task log with level/destination filters and an errors-only toggle. When a `target_unavailable` prompt is active, a blocking modal with Skip / Retry / Abort and a visible countdown to the fallback action.
+5. **Logs** — global view across all runs (`/api/logs`), filter by level/job/**destination**/date, and a persistent error log view; retention configurable in settings *(Phase 6)*. The destination filter is what makes a target's history readable at all: its trouble is spread one event at a time across every job that writes to it, so no per-run view can gather it.
+
+Two further screens exist that this list does not name, both reached from the nav: a **Jobs** index
+(the dashboard's cards show a job's *latest* run, but creating, duplicating and deleting jobs needs
+a list of its own) and a **Runs** list (every run regardless of job — the only way to reach a run
+that is not its job's most recent, short of knowing its id). See PROGRESS.md D-74 and D-86.
 
 Keep the UI dependency-light; polling fallback if WS drops.
 
@@ -319,6 +331,8 @@ services:
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
       - LISTEN_ADDR=:2649
+      - TZ=${TZ:-UTC}            # cron schedules are read in this zone (§11, Phase 5a)
+      - CN4M_STATUS_URL=${CN4M_STATUS_URL:-http://localhost:2640/suite/status}   # §8.2; "off" to disable
     volumes:
       - ./data:/data            # sqlite + logs
       - /srv/local-stuff:/mnt/local/stuff:rw   # optional local targets
@@ -349,9 +363,30 @@ Phase 4 is split in two: **4a is the API**, verifiable in the Samba harness with
 
 > **Preview mode was moved here from Phase 6.** §11 originally listed it under Phase 6 while §6.1 step 6, §8 (`POST /api/jobs/{id}/confirm`) and §9 (the "preview-before-run toggle") all specified it as part of the run pipeline and the job editor. That was a contradiction in this document, not a choice available to the implementer. It is resolved in favour of Phase 4: the preview gate is a *run-pipeline* feature whose only interface is the run-detail screen, so building it apart from that screen would mean building it twice. Phase 6 keeps the polish items that genuinely are polish.
 
-**Phase 5 — Scheduler, webhooks, two-way sync.** Cron scheduling (robfig/cron), inbound trigger tokens + status endpoints, outbound signed callbacks, sync_state DB, deletion propagation, conflict surfacing/resolution UI.
+**Phase 5 — Scheduler and webhooks.** Cron scheduling (robfig/cron), inbound trigger tokens + status endpoints, outbound signed callbacks.
 
-**Phase 6 — Polish.** Bandwidth limiting, throughput graph, multichannel toggle, log retention/pruning, docs. (Preview mode moved to Phase 4 — see the note there.)
+Split in two: **5a is scheduling**, **5b is webhooks** (inbound tokens and outbound callbacks). 5a adds no new attack surface and no new deletion path; 5b adds an endpoint reachable without a session, so it carries its own security review. **Two-way sync was originally 5c and has been deferred indefinitely — §14.**
+
+*Exit criteria (5a): a job with a cron expression fires at its scheduled time and records `trigger=schedule`; a disabled job never fires; a fire while that job's previous run is still going is skipped and logged rather than queued or overlapped; an invalid cron expression is refused at save with a legible message; a schedule missed while the server was down does not fire on startup and says so in the log; a scheduled run against an unavailable destination reaches a terminal state with no human input.*
+
+*Exit criteria (5b): a valid trigger token starts a run and an invalid, revoked or absent one is refused; a second trigger while running is a 409 unless `?queue=1`; the status endpoints return the documented shape both during a run and after it; an outbound callback carries a verifiable HMAC-SHA256 signature; a callback endpoint that is down or slow is retried, logged at warn, and **does not delay or fail the sync**; `/api/hooks/*` is reachable without a session while the rest of `/api/*` still is not.*
+
+
+> **Phases 5 and 6 previously had no exit criteria**, while phases 1–4 all did. CLAUDE.md makes a phase complete only when its exit criteria pass in the harness, so the two largest phases were the two that could not be closed. The criteria above were written 2026-09-05, before any Phase 5 code, so they describe what the phase must prove rather than what it happened to do.
+
+**Phase 6 — Polish.** Bandwidth limiting, throughput graph, multichannel toggle, log retention/pruning, **the packaging of §10**, docs. (Preview mode moved to Phase 4 — see the note there.)
+
+> **§10 was previously assigned to no phase.** Every phase above is a feature phase, so the
+> production Dockerfile and `docker-compose.yml` that §10 specifies were named nowhere in this list
+> — an omission, not a decision. They are Phase 6 work. Until they exist the only way to run the
+> server is `make run`, which execs into the *dev* container the test harness also uses; the two
+> collide, and that collision has killed a running server more than once (PROGRESS.md §7a).
+
+> **Portable configuration — exporting a setup and importing it on another installation — is
+> requested but not yet specified.** It is not in this document at all, and it cannot be added
+> without first settling what happens to credentials: stored passwords are encrypted under a key
+> derived from `ENCRYPTION_KEY`, so ciphertext does not travel and plaintext should not. See
+> PROGRESS.md §8 T-1 for the design questions; nothing should be built until they are answered.
 
 ---
 
@@ -372,3 +407,51 @@ Phase 4 is split in two: **4a is the API**, verifiable in the Samba harness with
 - If the host itself already mounts the same share, kernel CIFS may share the superblock and mix options; document "let the container own its mounts."
 - Symlinks over SMB are messy — v1 policy: skip symlinks, log them.
 - Decide at implementation time whether `preserve permissions` is meaningful (SMB + uid/gid mapping usually makes this moot; default to not trying).
+
+---
+
+## 14. Deferred — someday, maybe
+
+Work that was specified, thought through, and then deliberately not built. Kept here rather than
+deleted so that a later decision to build it starts from the reasoning rather than from scratch.
+
+### 14.1 Two-way sync
+
+**Deferred indefinitely, 2026-09-09.** The intended deployments only ever push one direction, so
+this would have been the most dangerous feature in the product built for nobody. Removed from
+Phase 5, and from the UI: the job editor no longer offers the mode, and `mode: "twoway"` is refused
+by validation with a message saying it is not supported rather than not yet implemented.
+
+**Why it is the dangerous one.** Every other deletion in this system is decided by comparing two
+live listings: if a file is at the destination and not at the source *right now*, it is extraneous.
+Two-way deletion is decided from a **stored record of the past** — the file was here last time and
+is not here now, therefore someone deleted it, therefore delete it on the other side too. That
+inference is only as good as the stored state, and it fails towards data loss: a `sync_state` that
+is empty, stale, partially written, or from an interrupted run makes present files look deleted.
+
+**What was already settled, and should not be re-litigated:**
+
+- **One destination per two-way job.** §6.4's `sync_state` row carries a single `mtime_dst`, and one
+  row cannot describe a file living in three places with three different mtimes. Fan-out stays
+  available for `mirror` and `update`, which are one-directional and have nothing to reconcile.
+  (This resolved a real contradiction between §6.4 and the multi-destination model of §3.)
+- **The first run must propagate no deletions at all.** An empty `sync_state` cannot distinguish
+  "deleted since the last sync" from "never synced", and neither can an interrupted one. A first
+  two-way run is a merge, not a reconciliation.
+- **Conflicts are never guessed.** A file changed on both sides since the last state is marked,
+  skipped, left untouched on *both* sides, and surfaced per-file with a "keep left / keep right"
+  action (FreeFileSync semantics).
+
+**The shape it would take:** `sync_state(job_id, relpath, size, mtime_src, mtime_dst,
+last_synced_at)`, written on successful sync; deletion detection by presence in state and absence on
+one side; conflict detection by both sides differing from the recorded state.
+
+**Its exit criteria, if it is ever revived:** a file changed on one side propagates to the other and
+a file deleted on one side is deleted on the other; a file changed on **both** sides is marked a
+conflict, left untouched on both sides, and resolvable per-file in the UI; a `twoway` job with a
+second destination is refused; and the first run of a two-way job propagates no deletions at all.
+
+Note that CLAUDE.md's standing rule applies whatever happens here: **file identity must never be
+inferred from metadata.** Size and mtime are not an identity, and acting on a false match relocates
+data permanently and silently. Real identity needs this database — which is exactly why the database
+is the risk rather than the remedy.
