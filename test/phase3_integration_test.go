@@ -595,3 +595,77 @@ func TestParallelDestinations(t *testing.T) {
 		}
 	}
 }
+
+// The catalogue case (SPEC.md §6.5): a JSON file keyed by hashes the user
+// cannot predict, addressed with "*", and two sections combined in one rule.
+// This is an *include* rule, which is the direction where a mistake is quiet —
+// a chain that resolves to nothing copies nothing and still reports success.
+func TestJSONFilterWildcardKeysIncludeACatalogue(t *testing.T) {
+	h := newHarness(t, nil)
+	srcID, dstAID, _, scope, srcRoot := fanOutFixture(t, h)
+
+	seedTree(t, srcRoot, map[string]int{
+		"1200/1205_A1_EvanOpening_v001.mov": 400,
+		"1500/1519_A1_RDJWalkOn_v000.mov":   500,
+		"2000/2001_B2_Finale_v003.mov":      600,
+		"1200/scratch_not_catalogued.mov":   700,
+		"notes.txt":                         50,
+	})
+
+	// Hashes deliberately out of sorted order, and one entry with no "name",
+	// so the fan-out has to sort and to skip.
+	catalogue := `{
+  "tracked_flags": {},
+  "tracked_repo_assets": {
+    "cb2cf6dbd5ecbcd83ac9aab1e4a85c45": {"name": "1205_A1_EvanOpening_v001.mov"},
+    "7ee451f5837d8174bea08f2b1cb7c86b": {"name": "1519_A1_RDJWalkOn_v000.mov"}
+  },
+  "untracked_repo_assets": {
+    "aa11bb22cc33dd44ee55ff6677889900": {"name": "2001_B2_Finale_v003.mov"},
+    "bb22cc33dd44ee55ff66778899001122": {"pending": true}
+  }
+}`
+	cataloguePath := filepath.Join(srcRoot, "catalogue.json")
+	if err := os.WriteFile(cataloguePath, []byte(catalogue), 0o644); err != nil {
+		t.Fatalf("writing the catalogue: %v", err)
+	}
+
+	jobID := h.createJob(t, map[string]any{
+		"name":             uniqueName("jsonwildcard"),
+		"source_target_id": srcID,
+		"source_subpath":   scope,
+		"mode":             string(store.ModeUpdate),
+		"destinations":     []map[string]any{{"dest_target_id": dstAID, "dest_subpath": scope}},
+		"filters": []map[string]any{{
+			"direction": string(store.FilterInclude),
+			"source":    string(store.SourceJSONFile),
+			"file_path": "target://" + srcID + "/" + scope + "/catalogue.json",
+			"json_key":  "tracked_repo_assets.*.name\nuntracked_repo_assets.*.name",
+		}},
+	})
+
+	run := h.awaitRun(t, h.runJob(t, jobID), 2*time.Minute)
+	if got := run["status"]; got != string(store.RunSuccess) {
+		t.Fatalf("status = %v, want success: %v", got, run)
+	}
+
+	dstRoot := filepath.Join(h.mountFor(t, dstAID), scope)
+
+	// Every catalogued asset, from both sections, found at its own depth.
+	for _, want := range []string{
+		"1200/1205_A1_EvanOpening_v001.mov",
+		"1500/1519_A1_RDJWalkOn_v000.mov",
+		"2000/2001_B2_Finale_v003.mov",
+	} {
+		if _, err := os.Stat(filepath.Join(dstRoot, want)); err != nil {
+			t.Errorf("catalogued asset %s was not copied: %v", want, err)
+		}
+	}
+
+	// Nothing else, or the include rule admitted more than the catalogue.
+	for _, unwanted := range []string{"1200/scratch_not_catalogued.mov", "notes.txt"} {
+		if _, err := os.Stat(filepath.Join(dstRoot, unwanted)); !os.IsNotExist(err) {
+			t.Errorf("%s is not in the catalogue but was copied", unwanted)
+		}
+	}
+}

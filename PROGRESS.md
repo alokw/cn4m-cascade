@@ -8,11 +8,13 @@ Living handoff doc. Update at the end of every session (CLAUDE.md → Workflow).
 > the "why" behind anything that looks odd — it is a table, so grep it rather than reading it.
 >
 > First, from a clean clone: `make harness-up && make verify-cifs && make verify-image`. On
-> Windows, start with the README's **Verifying it on Windows**, because kernel CIFS support is the
-> one thing that cannot be worked around here.
+> Windows, read the README's **Windows notes** first — the checkout gotchas there (§7f) stop the
+> harness and the lint gate before any of this runs.
 
-**Phase 6a (production packaging) is built and verified; its review and browser pass are the
-outstanding gates.** See §0-6a.
+**Phase 6a (production packaging) is complete.** Built, reviewed (§5p, nine findings all fixed) and
+verified on both macOS and Windows — U-7, the one claim that could not be tested from a Mac, passed
+end to end on 2026-09-09 (§7f). See §0-6a. **Next: the rest of Phase 6** — log retention/pruning,
+bandwidth limiting, the throughput graph, the multichannel toggle and docs (§3).
 
 **Phase 5 is complete.** 5a scheduling (§0-5a) and 5b webhooks (§0-5b) are built, reviewed and
 verified at **84 PASS / 0 FAIL / 1 SKIP**. Two-way sync — originally 5c — was **deferred
@@ -63,7 +65,7 @@ no phase owned it.
 | `Makefile` | `image`, `run`, `down`, `logs`, `verify-image`; the old source-run is now `dev-run` |
 | `cmd/…/main.go` | `-healthcheck`, so the image needs no curl; `time/tzdata` embedded |
 | env prefix | `CN4M_*` → `CN4M_CASCADE_*` (D-116) |
-| `README.md` | deploying, and **Verifying it on Windows** |
+| `README.md` | deploying, and the Windows verification procedure (since removed — U-7 passed, and the durable parts are now **Windows notes**) |
 
 ### Why alpine, when the plan said bookworm-slim
 The plan argued for Debian on the grounds of CIFS parity with the dev container. **Measurement beat
@@ -769,7 +771,11 @@ integration `-race` green (`ok ... 70.157s`, 20 tests incl. all Phase 1 cases).
 
 ---
 
-## 1. Verification (CLAUDE.md → Definition of done)
+## 1. Verification — the Phase 1 record (CLAUDE.md → Definition of done)
+
+> **This is Phase 1's table**, kept because `make demo` still reproduces it. Every later
+> phase carries its own verification block: §0-6a for 6a, §0-5b for 5b, and §7g for the most recent
+> session's gates. Read those for current state, not this.
 
 | Gate | Result |
 |---|---|
@@ -812,7 +818,14 @@ unicode/0-byte fixtures), `docker-compose.test.yml` (two servers on static IPs +
 **Code** — `internal/config`, `internal/secrets` (AES-256-GCM + HKDF), `internal/store` (SQLite +
 embedded migrations + target CRUD/validation), `internal/health`, `internal/mountmgr` (Mounter seam,
 dialect ladder, multichannel fallback, refcounting, idle reaper, stale-mount watchdog, startup
-hygiene, bounded shutdown), `internal/storage` (SPEC §4 verbatim), `internal/api`, `cmd/smbsync`.
+hygiene, bounded shutdown), `internal/storage` (SPEC §4 verbatim), `internal/engine` (scanner,
+differ, copier, executor, progress, the bounded-I/O helpers), `internal/filter`, `internal/runner`,
+`internal/scheduler`, `internal/notify`, `internal/api`, `cmd/cn4m-cascade` (renamed from
+`cmd/smbsync` in D-99).
+
+**Packaging** — `Dockerfile` (three stages, 23.6 MB alpine), `docker-compose.yml` (production stack,
+its own project, port 2649 against the harness's 12649), `make image|run|down|logs|verify-image`,
+`-healthcheck` in the binary and embedded `time/tzdata`.
 
 **SPA** (`web/src`) — all seven screens of SPEC.md §9 as built: Dashboard (`/`), Jobs, Job editor,
 Targets, Runs, Run detail, Logs and Settings. One WebSocket for the whole app with a polling
@@ -821,6 +834,20 @@ the pieces two screens would otherwise let drift apart (`EventList`, `Bar`, `Pat
 `FilterRuleRow`, `PromptModal`, `ConfirmPlan`, `TargetModal`, `RuleFileField`).
 
 ## 3. What's next
+
+**Phase 6a is done and Phase 4's browser pass is done** (U-1 2026-09-06, U-7 2026-09-09). What is
+left of **Phase 6 — polish**, from SPEC.md §11: log retention and pruning, bandwidth limiting, the
+throughput graph, the multichannel toggle, and docs. Plus the portable-configuration work of §8 T-1,
+whose credential question is already settled (D-91). **Start the next one in plan mode** (CLAUDE.md).
+
+Only one user-owned item is still open: **U-5**, re-checking the six §5m fixes in a browser (§5z).
+Nothing is blocked on it.
+
+Two smaller gaps this session left, both tracked in §6: the `mkdir` endpoint has unit and end-to-end
+coverage but no integration test, and these UX changes have not had a fresh-context review (not owed
+— 6a was reviewed in §5p and these are post-phase — but not had).
+
+*(Superseded — the Phase 4 browser pass, retained:)*
 
 **Immediately: the manual browser pass on the dashboard and the global log** (§0-4b2bii, and §5z
 U-1). It is the only gate left on Phase 4, and it has caught a UI-only bug in every sub-phase it has
@@ -887,6 +914,10 @@ Phase 2 got three things from Phase 1 worth knowing about:
 ## 4. Decisions log
 
 D-1…D-13 were approved 2026-08-31 before implementation; D-14…D-17 came out of the review.
+
+> **Grepping this table: D-59, D-60 and D-61 each appear twice**, from two different phases, and the
+> numbers were never reconciled. They are not renumbered here because other sections cite them by
+> number and renumbering would silently redirect those references. Check which row you landed on.
 
 | # | Decision | Rationale |
 |---|---|---|
@@ -963,6 +994,14 @@ D-1…D-13 were approved 2026-08-31 before implementation; D-14…D-17 came out 
 | D-110 | **A webhook `preview:true` can hold a job indefinitely, and SPEC says so** | A parked preview occupies the job until confirmed or timed out, and nobody confirms a webhook preview. A token holder looping it keeps the job unrunnable — scheduled runs skipped, manual ones refused. Support is kept because §8.1 offers it and "plan without executing" is legitimate, but the consequence is now written down: a trigger token's power is "can start this job **and** can keep it from running", which belongs in the decision to issue one |
 | D-120 | **The blackhole helper waits for a signal, never a timer** | The first version slept 45s from install and then removed the rule, which is not a dead-man's switch but a 45-second cap on the blackhole — and every caller budgets longer (90s of detection latency in the sync tests, 120s in phase 4). It would have revived a destination mid-test and produced a failure that read as a sync bug. The signal is a file, chosen because **writing a file needs no fork**: it is the one thing a process that cannot fork can still do, which is exactly the condition this whole mechanism exists for. Cleanup writes `.arm` on failure or `.done` on success; the helper polls for either and idles out inside a bounded life so a killed test binary cannot leave one running |
 | D-121 | **`harness-clean` disarms orphaned helpers by deleting their signal files, and deliberately does not `pkill`** | Each helper watches one specific path, so removing the files makes firing impossible and it expires on its own. The `pkill -f "blackhole-.*"` tried first matched the shell running it — the pattern appears in its own command line — and killed `harness-clean` with exit 143, aborting a suite run before a single test executed |
+| D-122 | **`update` is the default sync mode; `mirror` is kept and still selectable** | Requested 2026-09-09. The ask was to remove mirror from the dropdown; that was raised rather than done, because mirror is specified in SPEC.md §1 and §7 and Phase 2's exit criteria *are* "mirror a 100k-file tree". Removing it would have invalidated a recorded exit criterion and deleted the whole `deletionGuard` suite. Changing the default costs nothing, orphans no existing job, and is a one-line revert. `update` also now leads the dropdown, so the default reads as the default |
+| D-123 | **A missing *source* folder is offered at config time, never created at run time** | The ask was for a missing source to be created like a destination's. Destinations already are (`storage.CreateSubpath`, set at [runner.go:883](internal/runner/runner.go#L883)); sources deliberately are not, and the existing comment says why — inventing a source turns a typo into a run that copies nothing and reports success, and in mirror mode an empty source is the textbook input for emptying a destination. So the offer moved *earlier* instead: the job editor checks the subpath as you type (debounced, because a listing can mount a share) and shows **Create it now**. A human confirms while a typo is still obvious, rather than a scheduler acting on one at 3am |
+| D-124 | **`GET /api/browse` distinguishes 404 `path_not_found` from 502 `target_unavailable`** | D-123's create button must appear only for a folder that is genuinely absent, never for a NAS that is down; the endpoint had collapsed both into `target_unavailable`. The end-to-end check then caught the new distinction being wrong for *local* targets: `LocalStorage.check` inferred "missing subpath" from `root != LocalPath`, which holds whether or not the root exists, so a broken bind mount was reported as an absent folder and would have been offered a create button. It now requires the root to be present (`rootExists`). SMB was never affected — the mount must succeed before the subpath is stat'd. Pinned by `TestLocalMissingSubpathUnderMissingRootBlamesTheRoot`, which asserts both the message and that `errors.Is(err, ErrPathNotExist)` is false |
+| D-125 | **`.gitattributes` pins the whole tree to LF (`* text=auto eol=lf`), not just `*.sh`** | A Windows checkout with `core.autocrlf=true` broke two unrelated things with messages that name neither line endings nor each other: the Samba containers exited 1 with `exec …/entrypoint.sh: no such file or directory` (shebang ending in CR), and `gofmt` flagged 91 of 92 Go files, failing `golangci-lint` and making CLAUDE.md's commit gate unsatisfiable on Windows. `*.sh` alone would have fixed only the first. The repo is built and run entirely in Linux containers and has no `.bat`/`.ps1`, so tree-wide `eol=lf` is safe; git already stored LF, so renormalising 157 files changed no content (§7f) |
+| D-126 | **The README's *Verifying it on Windows* procedure was removed once it had passed** | Requested 2026-09-09 after U-7 closed. A one-shot proof nobody will run again is a maintenance liability, and it named a specific NAS and credential file. The durable half survives as **Windows notes** (line endings, forward slashes, absent `make`, WSL2 NAT), and the mount-error table moved to **Troubleshooting**, where it diagnoses any target on any platform rather than only a first run. The evidence it produced is preserved in §7f, so nothing is lost by deleting the steps |
+| D-127 | **A JSON filter key gains a `*` wildcard segment and accepts several keys, one per line** | Requested 2026-09-09. A catalogue keyed by content hashes (`{"tracked_repo_assets": {"<hash>": {"name": …}}}`) was unaddressable: the key had to be a literal dot-path onto something that was already a list of strings, so the only working key named one hash and returned one file. `*` fans out over an object's values or an array's elements, in **sorted key order** — Go randomises map iteration, and an unstable pattern order would make the run log and the rule's pattern count differ between two identical runs. Multiple keys are unioned and de-duplicated; this is convenience rather than capability, since includes are OR'd and one rule per key already worked, but it configures the file path, `on_error` and the run-log counter once instead of per key. **Strictness is split, which is the part to remember:** a key with no `*` stays an *assertion* and keeps every existing error, so a typo in `backup.exclude` still fails loudly; a key with `*` is a *query* and skips children that lack the path, skips non-string values, and may match nothing. The user chose the lenient reading knowingly after the silent-empty-include risk was raised; it is mitigated already, because the runner reports a rule that resolves to no patterns as a run event (warn, or error for a global rule). A wildcard makes the whole of *that key* lenient — mixing the two readings inside one key would be a rule nobody could hold in their head. *Limitation:* an object key literally named `*` is no longer selectable, documented in SPEC.md §6.5 rather than given an escape |
+| D-128 | **cn4m status lines carry no job identifier; progress reports percentage and speed** | Requested 2026-09-09: the suite view read `Started 9fc012f2ac2524cc9bf41333e51cfc6b`. The cause was not a formatting choice but a **missing field** — `cn4mMessage` prints `payload["job"]` and falls back to `job_id`, and nothing ever set `job`, because the §8.1 status payload carries `job_id` and no job *name*. Rather than add a field to a SPEC-defined shape that outside software consumes, the identifier was dropped from the message entirely: cn4m renders one row per app, and a 32-character hex string was the least useful thing that row could hold. Progress is now `Sync in Progress: 65%, 910 MB/s`. Percentage prefers **bytes over files** (a run whose remaining files are the large ones is not as far along as a file count suggests) and is **clamped to 0–100**, because totals are revised while the scan is still running and `104%` reads as a bug in the sync. Both parts are **omitted rather than guessed**: an early event with no total would otherwise print `0%` for a sync that is working, and a momentary stall would print `0 B/s`. **Consequence to accept:** two jobs running at once are indistinguishable in the suite view. That is the shape cn4m already had — one row per app, not per job — and the previous hex string did not really help; adding the job *name* to the payload is the fix if it ever matters |
+| D-129 | **The cn4m catalogue filter is offered as a one-click fill, not pre-filled into every rule** | Requested 2026-09-09, where the ask was "pre-fill, or at least examples". Both are provided: the file and key hints name the cn4m values, and a **Fill these in** button sets `/mnt/local/assets.json` plus the two wildcard keys in one click. Not pre-filled into every new rule, because a rule added for something else would arrive carrying a path to an unrelated file — and a wrong value already sitting in the box is easier to miss than an empty one. `RuleFileField` gained a `placeholder` prop so a JSON rule can suggest a catalogue path while a list-file rule still suggests an excludes list |
 | D-119 | **A blackholed destination's iptables rule is removed by a process forked before the wedge, not by retrying afterwards** | The removal needs a fork; fork is blocked by CIFS threads in uninterruptible sleep; those threads are stuck because the rule is installed. That is a deadlock, and two fixes failed on it before the shape was understood — a 90s retry loop (which cannot succeed, and whose cost then pushed the whole suite past `go test -timeout`, losing every result rather than one test's). The escape is now forked at *install* time into a process with no CIFS threads, gated on a marker file so it is a fallback rather than a second remover. Recorded because the general lesson is not about iptables: **when a cleanup depends on the resource it is cleaning up, retrying is not a strategy** — the escape has to be prepared while the resource still works |
 | D-116 | **App-specific environment variables are prefixed `CN4M_CASCADE_`, not `CN4M_`** | Requested 2026-09-09: cn4m is a *different program*, so `CN4M_ADMIN_PASSWORD` reads like configuration for it rather than for this. `ENCRYPTION_KEY`, `DATA_DIR`, `LISTEN_ADDR`, `MOUNT_ROOT` and `TZ` stay unprefixed — they are generic, and they are what SPEC.md §10 already documented. Done now because packaging is the last cheap moment: once a container is deployed, "assume all installations are fresh" stops being true |
 | D-117 | **The production image is alpine, decided by measurement rather than by the argument in the plan** | The plan chose `debian:bookworm-slim` for CIFS parity with the dev container. Debian measured 158 MB, with the slim base alone at 97.2 MB on arm64 — so §10's "well under 100 MB" was unreachable with it. The parity argument was also weak: the binary is static Go, so musl versus glibc cannot reach it, and CIFS behaviour is the kernel's. Rather than assert either way, `make verify-image` mounts, lists, writes and unmounts a real share **from the shipping image**; it passes. 25 MB. The zone database is embedded via `time/tzdata` instead of a system package, which is both smaller and immune to a base image without zoneinfo silently making every cron schedule UTC |
@@ -1327,7 +1366,7 @@ user can action; everything else outstanding is in §6 and is mine.
 | ~~U-1~~ | ~~**The manual browser pass**~~ — **done 2026-09-06**, six findings in §5m, all fixed | Confirmed working: never-run cards, logs, duplicate-target, the scheduling toggle, and a scheduled job firing on time | — |
 | ~~U-1b~~ | ~~**The Schedule controls**~~ — **done 2026-09-06.** The next-run preview was showing the browser's zone only, which made a UTC server look wrong (§5m M-5); fixed | — |
 | ~~U-7~~ | ~~**Verify CIFS mounting on Windows**~~ — **done 2026-09-09, end to end** (§7f). Windows 11 Pro 26200, Docker Desktop 26.1.4, WSL2 kernel `5.15.153.1-microsoft-standard-WSL2`. `cifs` is in `/proc/filesystems`; the shipping image mounted, listed, wrote and unmounted a harness share; and a credentialed SMB 3.1.1 mount of a real NAS (`//10.10.20.42/local_projects`) returned `WINDOWS CIFS OK` with a live listing. The browser half passed too: the NAS saved through the UI, *Save and test* went green, and a job then ran and copied files and folders successfully — so credential storage and the dialect ladder work on this host as well | — | — |
-| U-5 | **Re-check the six §5m fixes in a browser**, and the renamed build comes up at all | Only a browser can | None |
+| U-5 | **Re-check the six §5m fixes in a browser**, and the renamed build comes up at all. **Also now: the job editor's new "Create it now" warning** (D-123) — its logic is tested and its wording and placement under the source subpath field are not, and the mode dropdown should show *Update* selected by default (D-122) | Only a browser can | None |
 | ~~U-6~~ | ~~**The Webhooks & API tab**~~ — **done 2026-09-09**, all of it worked. The format selector and the seeded cn4m row are new since that pass but are cosmetic additions to a screen already exercised | — |
 | ~~U-6-old~~ | ~~**The new Webhooks & API tab**~~ — create a token, confirm it is shown once and the curl examples work, regenerate and confirm the old one stops, add a callback URL and watch a run report to it | Only a browser can, and the one-shot token display is exactly the kind of thing that looks right until someone reloads the page | None |
 | ~~U-2~~ | ~~**Leftover scope directories**~~ — **cleared 2026-09-06** with the user's agreement. 182 on Samba B plus a handful on Samba A; both shares are back to their seeded fixtures | — |
@@ -1538,6 +1577,19 @@ because outbound callbacks resolve arbitrary hostnames and `host.docker.internal
 ---
 
 ## 6. Open items for the next session
+
+### This session (2026-09-09) — Windows verification and the job-editor UX
+
+1. **`POST /api/targets/{id}/mkdir` has no integration test.** It is covered by unit tests for the
+   validation paths (`TestMakeDirRejectsBadPaths`) and by an end-to-end run against a live server on
+   a local target — create, idempotent re-create, traversal refused, broken target refused, and both
+   directions of the 404/502 split. What is missing is the same against a **real SMB share** through
+   the harness, which is the case where `MkdirAllBounded` actually has to be bounded.
+2. **These changes have not had a fresh-context review.** CLAUDE.md requires one before declaring a
+   *phase* complete; 6a was reviewed in §5p and this is post-phase work, so one is not owed — but it
+   has not happened, which is worth knowing when reading the diff.
+3. **The new editor warning has not been seen in a browser by me.** The logic is tested; the wording
+   and placement under the source subpath field are not. Folded into U-5 (§5z).
 
 ### Phase 5b
 
@@ -1798,8 +1850,9 @@ because outbound callbacks resolve arbitrary hostnames and `host.docker.internal
    time out with goroutines parked in the kernel, and the "no hung process" criterion rests on the
    CIFS `soft` mount option rather than on our code. **Recommend fixing before Phase 3**, which
    multiplies the shares one run touches.
-7. `SMBSYNC_TEST_DEST_OPTS` lets CI silently run the cable-pull criterion with non-default mount
-   options. Harmless today, misleading later.
+7. `CN4M_CASCADE_TEST_DEST_OPTS` (named `SMBSYNC_TEST_DEST_OPTS` when this was written, renamed by
+   D-99/D-116) lets CI silently run the cable-pull criterion with non-default mount options.
+   Harmless today, misleading later. Still present: `test/sync_integration_test.go:341`.
 4. `job_destinations` allows exactly one row (validated in Go). Phase 3 lifts that.
 5. `PATCH /api/jobs/{id}` does not exist — jobs are create/delete only so far.
 
@@ -1842,6 +1895,108 @@ integration test asserts the guarantee (ends cleanly within 90s) and logs the ti
 asserting it. Only `echo_interval=1` reliably lands under 30s, at the cost of the kernel being
 quickest to declare a merely slow server dead; it stays available as a per-target
 `mount_opts_override` for anyone who wants it.
+
+## 7j. A green notification for a red test run (2026-09-09)
+
+Worth recording because the mistake is invisible and repeatable.
+
+The integration suite was backgrounded as `go test ... 2>&1 | tail -12`. **A pipeline's exit status
+is the last command's**, so the harness reported *exit code 0* for a run whose output plainly said
+`FAIL`. Every backgrounded suite this session carried the flaw; the earlier ones happened to be
+genuine passes, since their text said `ok ... 715s`, so the wrong evidence was cited for a right
+conclusion — the worst kind of near miss, because nothing looks wrong afterwards. Runs now capture
+`go test`'s own status before any pipe:
+
+    go test ... > /tmp/it.log 2>&1; code=$?; echo "GO_TEST_EXIT=$code"
+
+**The failure itself was self-inflicted, and §7d had already described it.** A second suite was
+started while the first was still running, and `TestSecondSambaServer` failed with
+`mount error(111): could not connect to 172.28.0.11`. Nothing in that session's changes touches
+mounting — the filter change parses JSON keys, the cn4m change formats a string — and the same test
+passes in **1.6s** on its own. Two suites at once corrupt each other (§7d); reading that section
+earlier in the same session did not prevent repeating it.
+
+A clean re-run after `harness-clean`: `GO_TEST_EXIT=0`, `ok … 738.360s`, harness left at 0 mounts,
+0 mount roots, 0 signal files. **Duration is the honest check for the §7c vacuous-skip trap** when a
+run is not verbose: without `-v` there are no per-test lines to count, so the evidence is the three
+`CN4M_CASCADE_TEST_*` variables being set, 86 tests defined, and 738 seconds of work — a suite that
+skipped everything would finish in seconds.
+
+---
+
+## 7i. What the cn4m suite line actually said (2026-09-09)
+
+The report was cosmetic — "the status includes the long job id" — and the cause was not.
+`cn4mMessage` prints `payload["job"]` and falls back to `payload["job_id"]`; **nothing has ever set
+`job`**, because SPEC.md §8.1's status payload carries `job_id` and no job name. So the fallback was
+not a fallback in practice, it was the only path, and every cn4m line since the feature shipped has
+been a hex string. The tests did not catch it because they build payloads by hand and pass
+`"job": "photos-to-nas"` — a value the real builder never produces. **A fixture that supplies a field
+production never sets will pass a test that production fails**, and two tests asserted on it.
+
+Fixed by dropping the identifier rather than adding the field: cn4m renders one row per app, and
+`Sync in Progress: 65%, 910 MB/s` is what a person reads that row for. Adding a name to a
+SPEC-defined payload that outside software consumes is a bigger change than the request warranted.
+
+Three judgement calls inside the formatting, each a way of not lying in a one-line status:
+
+- **Percentage prefers bytes to files.** A run whose remaining files are the large ones is not as far
+  along as its file count says.
+- **Percentage is clamped to 0–100.** The scan revises totals while the copy runs, so `bytes_done`
+  can briefly exceed the total known so far. `104%` reads as a bug in the sync rather than in the
+  arithmetic.
+- **Both parts are omitted when unknown, never defaulted.** An early event with no total would print
+  `0%` for a sync that is working; a momentary stall would print `0 B/s`.
+
+`TestCN4MMessagesCarryNoIdentifiers` walks every emitted event with a job id in the payload and
+asserts none of them prints it, so the regression cannot come back one event at a time.
+
+**Accepted consequence:** two concurrent jobs are now indistinguishable in the suite view. That was
+already true in substance — one row per app, not per job — and the hex string did not disambiguate
+anything a person could act on. Adding the job *name* to the payload is the fix if it ever matters.
+
+---
+
+## 7h. Wildcards in JSON filter keys (2026-09-09)
+
+**The question that produced this was a usage question, not a feature request**, and answering it
+honestly was most of the work. A catalogue keyed by content hashes could not be addressed at all: the
+JSON key was a literal dot-path onto a value that had to *already* be a list of strings, so the only
+key that worked named one hash and selected one file. Checking that against the real document first —
+`tracked_repo_assets` → "holds an object", `tracked_repo_assets.*.name` → "does not exist (no
+`tracked_repo_assets.*`)" — is what made the answer specific rather than a guess about the code.
+
+**Half of the request already existed.** "Provide multiple" needed no code: includes are OR'd, there
+is no cap on rules per job, and two `jsonfile` rules may share a file with different keys. Saying so
+turned "build multi-key support" into a choice about convenience, which the user then made
+deliberately (D-127).
+
+**The strictness split is the design decision worth re-reading.** Making the whole extractor lenient
+would have regressed something valuable: a mistyped literal key would stop erroring and start
+silently selecting nothing. So `*` in a key makes *that key* a query — skip what does not resolve,
+matching nothing is fine — while a key without one stays an assertion and keeps every existing error
+and every existing test. The user chose leniency after the silent-empty-include risk was named; that
+risk turned out to be already mitigated, because `internal/runner/filters.go` was reporting a
+rule that resolves to no patterns as a run event long before this change. **Worth checking for an
+existing mitigation before building one.**
+
+Object fan-out is emitted in **sorted key order**, pinned by a test that runs the same document 50
+times. Go randomises map iteration, so without it the pattern list — and the rule's count in the run
+log — would differ between two identical runs, which is the kind of instability that gets blamed on
+the sync rather than on the filter.
+
+### Verification
+| Gate | Result |
+|---|---|
+| `go build ./...`, `go vet -tags=integration ./test/...` | ✅ |
+| `golangci-lint run` | ✅ 0 issues |
+| `go test -race -count=1 ./internal/...` | ✅ 11 packages |
+| New unit tests | ✅ `TestPatternsAtKeyWildcardAndMultipleKeys` (16 cases) and `TestPatternsAtKeyWildcardOrderIsStable` |
+| Existing `TestPatternsAtKey` | ✅ unchanged and passing — the non-wildcard contract did not move |
+| New integration test | ✅ `TestJSONFilterWildcardKeysIncludeACatalogue` — a hash-keyed catalogue, two sections in one rule, over real SMB |
+| SPA `tsc -b && vite build` | ✅ |
+
+---
 
 ## 7g. Three UX changes, and the one that was already built (2026-09-09)
 
@@ -1934,6 +2089,12 @@ executed by a Linux kernel.
 **A second trap, in our own instructions.** The README tells the operator to create `smbcreds.txt` with a
 fenced example. Copied out of a rendered view, the ` ``` ` fences land in the file, `mount.cifs` fails to
 parse it, and the result looks like bad credentials. README now says the file is exactly two lines.
+
+**The README procedure has since been removed** (2026-09-09, at the user's request) now that it has
+been run and passed. What it was for — proving kernel CIFS on WSL2 — is answered, and a procedure
+nobody will run again is a maintenance liability. The durable half survives as **Windows notes**: the
+line-ending trap, forward slashes in `.env`, the absent `make`, and WSL2 NAT. The mount-error table
+moved to **Troubleshooting**, where it applies to any platform rather than only to a first-run check.
 
 **The UI path passed too**, in the same session: the target saved, *Save and test* went green, and a job
 ran and copied its files and folders. So credential encryption and the dialect ladder are confirmed on
@@ -2204,7 +2365,13 @@ Other things the design has to settle:
 Suggested home: **Phase 6**, alongside the other operator-facing work. It is not a blocker for
 Phase 5.
 
-### T-2. Rename "SMB Sync" to "cn4m cascade"
+### T-2. Rename "SMB Sync" to "cn4m cascade" — **DONE 2026-09-06 (D-99)**
+
+Both halves were carried out: the cosmetic four, and the identifiers, as one deliberate commit while
+installs were still fresh. `hkdfInfo` was left alone as recommended. The database filename changed,
+so an existing dev database is ignored rather than migrated — `mv <data-dir>/smbsync.db
+<data-dir>/cn4m-cascade.db` keeps existing targets and jobs (§5z U-3). The analysis below is retained
+because the reasoning about which identifiers are safe to change still applies to the next rename.
 
 The official name of the utility. The mentions split into two groups with very different costs.
 
@@ -2224,7 +2391,14 @@ in `web/src/App.tsx`, and the headings in `README.md` and `SPEC.md`.
 Recommendation: do the cosmetic four now, and the identifiers as one deliberate commit **while
 installs are still fresh** — with `hkdfInfo` explicitly left alone and a comment saying why.
 
-### T-3. Run the whole thing under Docker rather than `make run`
+### T-3. Run the whole thing under Docker rather than `make run` — **DONE 2026-09-05/09 (Phase 6a)**
+
+Resolved exactly as recommended: §10 became an explicit Phase 6 deliverable, the production image and
+`docker-compose.yml` exist, and the container collision is gone — the harness now publishes 12649 and
+production owns 2649 (D-118). `make run` is the production stack; the old source-run is `make dev-run`.
+**The line below about `make run` being `docker compose exec dev go run ./cmd/smbsync` is no longer
+true**; it is retained as the description of the problem that motivated the work. The Linux
+file-ownership `user:` mapping it pairs with is still open (§6, Phase 4b-2 item 5).
 
 **This is not a new feature — SPEC.md §10 already specifies it** (multi-stage Dockerfile, the
 production `docker-compose.yml`, `network_mode: host`, `cap_add`, the `./data` volume, graceful

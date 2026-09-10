@@ -92,49 +92,133 @@ func cn4mForm(event string, payload Payload) url.Values {
 // cn4mMessage renders the one line a person reads in the suite view.
 //
 // Short and specific, because that is the whole contract: cn4m shows a single
-// status line per app, so "Mirroring photos-to-nas" beats a serialised
-// snapshot, and a run that failed has to say so in the first few words.
+// status line per app, so a person scanning the suite view wants to know
+// whether a sync is running and how far along it is, in the first few words.
+//
+// **No job identifier appears here, deliberately** (D-128). The payload of
+// SPEC.md §8.1 carries `job_id` and no job *name*, so naming the job meant
+// printing a 32-character hex string — "Started 9fc012f2ac2524cc9bf41333e51cfc6b"
+// — which fills the row with the least useful thing on it. Percentage and
+// throughput are what a person actually reads.
 func cn4mMessage(event string, payload Payload) string {
-	job := stringField(payload, "job")
-	if job == "" {
-		job = stringField(payload, "job_id")
-	}
-
 	switch event {
 	case EventRunStarted:
-		return fmt.Sprintf("Started %s", job)
+		return "Sync Started"
 
 	case EventProgress:
-		done, total := intField(payload, "files_done"), intField(payload, "files_total")
-		if total > 0 {
-			return fmt.Sprintf("Syncing %s — %d/%d files", job, done, total)
-		}
-		return fmt.Sprintf("Syncing %s", job)
+		return "Sync in Progress" + progressDetail(payload)
 
 	case EventPrompt:
-		return fmt.Sprintf("%s is waiting: a destination is unreachable", job)
+		return "Sync Paused: waiting on an unreachable destination"
 
 	case EventRunCompleted:
-		status := stringField(payload, "status")
 		files := intField(payload, "files_done")
-		if errs := intField(payload, "errors_count"); errs > 0 {
-			return fmt.Sprintf("%s finished %s — %d file(s), %d destination error(s)",
-				job, status, files, errs)
+		switch stringField(payload, "status") {
+		case string(store.RunSuccess):
+			return fmt.Sprintf("Sync Complete: %d files", files)
+		case string(store.RunCancelled):
+			return fmt.Sprintf("Sync Cancelled: %d files copied", files)
+		case string(store.RunFailed):
+			if last := stringField(payload, "last_error"); last != "" {
+				return fmt.Sprintf("Sync Failed: %s", truncate(last, 160))
+			}
+			return "Sync Failed"
+		default:
+			// partial: finished, nothing broken, but not clean either.
+			if errs := intField(payload, "errors_count"); errs > 0 {
+				return fmt.Sprintf("Sync Incomplete: %d files, %d destination errors", files, errs)
+			}
+			return fmt.Sprintf("Sync Incomplete: %d files", files)
 		}
-		return fmt.Sprintf("%s finished %s — %d file(s)", job, status, files)
 
 	case EventRunFailed:
 		if last := stringField(payload, "last_error"); last != "" {
-			return fmt.Sprintf("%s failed: %s", job, truncate(last, 160))
+			return fmt.Sprintf("Sync Failed: %s", truncate(last, 160))
 		}
-		return fmt.Sprintf("%s failed", job)
+		return "Sync Failed"
 	}
-	return fmt.Sprintf("%s: %s", job, event)
+	return "Sync: " + event
+}
+
+// progressDetail renders ": 65%, 910 MB/s" — whichever of the two is known.
+//
+// Both are omitted rather than guessed at. A percentage needs a total, and the
+// scan that produces one runs concurrently with the copy, so early progress
+// events legitimately have nothing to divide by; printing "0%" there would
+// show a stalled sync that is in fact working.
+func progressDetail(payload Payload) string {
+	var parts []string
+
+	if pct, ok := percentDone(payload); ok {
+		parts = append(parts, fmt.Sprintf("%d%%", pct))
+	}
+	if bps := floatField(payload, "throughput_bps"); bps > 0 {
+		parts = append(parts, perSecond(bps))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return ": " + strings.Join(parts, ", ")
+}
+
+// percentDone prefers bytes over files: a run whose remaining files are the
+// large ones is not as far along as a file count suggests.
+func percentDone(payload Payload) (int, bool) {
+	for _, pair := range [][2]string{
+		{"bytes_done", "bytes_total"},
+		{"files_done", "files_total"},
+	} {
+		done, total := floatField(payload, pair[0]), floatField(payload, pair[1])
+		if total <= 0 {
+			continue
+		}
+		pct := int(done / total * 100)
+		// Clamped, not trusted: totals are revised while the scan is still
+		// running, so done can briefly exceed the total known so far, and
+		// "104%" in a suite view reads as a bug in the sync.
+		if pct < 0 {
+			pct = 0
+		}
+		if pct > 100 {
+			pct = 100
+		}
+		return pct, true
+	}
+	return 0, false
+}
+
+// perSecond formats a byte rate in the decimal units people quote transfer
+// speeds in, so 910 MB/s reads the way it would on a network graph.
+func perSecond(bps float64) string {
+	switch {
+	case bps >= 1e9:
+		return fmt.Sprintf("%.1f GB/s", bps/1e9)
+	case bps >= 1e6:
+		return fmt.Sprintf("%.0f MB/s", bps/1e6)
+	case bps >= 1e3:
+		return fmt.Sprintf("%.0f KB/s", bps/1e3)
+	default:
+		return fmt.Sprintf("%.0f B/s", bps)
+	}
 }
 
 func stringField(p Payload, key string) string {
 	s, _ := p[key].(string)
 	return s
+}
+
+// floatField reads a numeric field, tolerating both the float64 a decoded JSON
+// number becomes and the int a payload built in-process carries.
+func floatField(p Payload, key string) float64 {
+	switch v := p[key].(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	}
+	return 0
 }
 
 // intField reads a count, tolerating the float64 a decoded JSON number becomes.

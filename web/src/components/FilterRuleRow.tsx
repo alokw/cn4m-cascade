@@ -28,6 +28,18 @@ const SOURCE_LABEL: Record<FilterSource, string> = {
   jsonfile: 'A JSON file (patterns under a key)',
 }
 
+/**
+ * The cn4m catalogue, which is what this rule is used for most of the time.
+ *
+ * Offered as a button rather than pre-filled into every new rule: a rule added
+ * for something else would otherwise arrive carrying a path to a file that has
+ * nothing to do with it, and a wrong value that is already in the box is
+ * easier to miss than an empty one.
+ */
+const CN4M_FILE_PATH = '/mnt/local/assets.json'
+const CN4M_JSON_KEYS = `tracked_repo_assets.*.name
+untracked_repo_assets.*.name`
+
 export function FilterRuleRow({
   rule,
   index,
@@ -137,17 +149,40 @@ export function FilterRuleRow({
           <RuleFileField
             value={rule.file_path ?? ''}
             onChange={(v) => onChange({ ...rule, file_path: v })}
+            placeholder={
+              rule.source === 'jsonfile'
+                ? CN4M_FILE_PATH
+                : '/mnt/local/excludes.txt or target://<target-id>/excludes.txt'
+            }
           />
           {rule.source === 'jsonfile' && (
             <label>
               JSON key
-              <input
+              <textarea
                 value={rule.json_key ?? ''}
-                placeholder="backup.exclude"
+                rows={2}
+                placeholder="assets.*.name (one key per line)"
                 onChange={(e) => onChange({ ...rule, json_key: e.target.value })}
               />
               <span className="hint">
-                Dot-path to the list inside the file. Numeric segments index arrays.
+                Dot-path to the list inside the file. Numeric segments index arrays, and{' '}
+                <code>*</code> matches every entry of an object or array &mdash; so{' '}
+                <code>assets.*.name</code> collects the name of every asset in a catalogue keyed by
+                id. One key per line; the results are combined.
+              </span>
+              <span className="hint">
+                For a cn4m catalogue: <code>{CN4M_FILE_PATH}</code> with{' '}
+                <code>tracked_repo_assets.*.name</code> and{' '}
+                <code>untracked_repo_assets.*.name</code>.{' '}
+                <button
+                  type="button"
+                  className="link"
+                  onClick={() =>
+                    onChange({ ...rule, file_path: CN4M_FILE_PATH, json_key: CN4M_JSON_KEYS })
+                  }
+                >
+                  Fill these in
+                </button>
               </span>
             </label>
           )}

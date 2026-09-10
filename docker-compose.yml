@@ -69,6 +69,22 @@ services:
       # on Windows), matching the harness, so the path typed into the UI is
       # the same string on every platform.
       - ${CN4M_CASCADE_LOCAL_DIR:-${HOME:-${USERPROFILE:-.}}/cn4m}:/mnt/local:rw
+      #
+      # More than one local folder? Add it here. The left side is the host
+      # path, the right side is what you type into the UI when creating a
+      # local target — never the host path, which the container cannot see.
+      #
+      # Windows uses forward slashes; backslashes are mangled by compose
+      # interpolation. Mounting a source :ro is worth doing, because then the
+      # kernel refuses a write to it whatever a job is later set to do.
+      #
+      #   - D:/Media/Footage:/mnt/footage:ro       # Windows, source only
+      #   - C:/Users/you/Documents:/mnt/docs:rw    # Windows, read-write
+      #   - /Volumes/Media:/mnt/footage:ro         # macOS
+      #
+      # Compose reads this list only when the container is created, so
+      # `docker compose -f docker-compose.yml up -d` after editing it — a
+      # restart will not pick it up.
 
     # Docker SIGKILLs 10s after SIGTERM by default; the graceful shutdown of
     # §10 budgets 30s, because lazy-unmounting a share whose server has gone is

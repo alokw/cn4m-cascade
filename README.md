@@ -57,6 +57,51 @@ deletion. Adding an exclude rule to save bandwidth must never destroy what is al
 you want a directory removed from the destination, delete it at the source and let mirror propagate
 that, or remove it by hand.
 
+### Picking files from a JSON catalogue
+
+A filter rule can take its patterns from a JSON file (**source: JSON file**, plus a key). The key is
+a dot-path; numeric segments index arrays; and **`*` matches every value of an object or every
+element of an array**. That last part is what makes a catalogue keyed by ids you cannot predict
+usable:
+
+```json
+{
+  "tracked_flags": {},
+  "tracked_repo_assets": {
+    "cb2cf6dbd5ecbcd83ac9aab1e4a85c45": { "name": "1205_A1_EvanOpening_v001.mov", "size": "594.6 MiB" },
+    "7ee451f5837d8174bea08f2b1cb7c86b": { "name": "1519_A1_RDJWalkOn_v000.mov",  "size": "2.475 GiB" }
+  },
+  "untracked_repo_assets": {
+    "aa11bb22cc33dd44ee55ff6677889900": { "name": "2001_B2_Finale_v003.mov" }
+  }
+}
+```
+
+**The key field takes one key per line**, and the results are combined, so both sections come from a
+single rule:
+
+```
+tracked_repo_assets.*.name
+untracked_repo_assets.*.name
+```
+
+Set the rule's direction to **include** and only those files are synced. Three things worth knowing:
+
+- **Use the filenames, not the folders.** Patterns match at any depth, so `1205_A1_EvanOpening_v001.mov`
+  is found wherever it lives. A catalogue's `folder` field is a path on the origin server, which is
+  usually not the path under your sync root — you do not need to translate it.
+- **A `*` key is a query; a plain key is an assertion.** With a wildcard, a section that is missing
+  or empty, an entry without the field, and a non-string value are all skipped, because a catalogue's
+  shape varies legitimately. Without one, a key that does not resolve is an error — so a typo in
+  `backup.exclude` still fails loudly instead of quietly selecting nothing.
+- **A rule that ends up matching nothing is reported** in the run log (a warning, or an error for a
+  global rule). Worth checking after the first run: an include rule that resolves to zero patterns
+  copies nothing and still finishes green.
+
+The file is re-read at the start of every run, so regenerating the catalogue is enough — you do not
+need to re-save the job. It can live on a share (`target://<target-id>/path/catalogue.json`) or on a
+bind-mounted local path.
+
 ## Requirements
 
 - **Docker** (Docker Desktop is fine). The daemon must be responsive — see [Troubleshooting](#troubleshooting).
@@ -64,7 +109,63 @@ that, or remove it by hand.
   build, lint and test runs inside the dev container, because `mount.cifs` is Linux-only and the
   host is often macOS. Every `make` target is a thin `docker compose` wrapper.
 
-## Quickstart
+## Quickstart (Docker)
+
+The fastest path from a clone to a working UI. You need **Docker and nothing else** — no Go, no
+Node, and no `make`, which matters on Windows where `make` is not standard.
+
+**1. Create `.env`.** The server refuses to start without an encryption key, because one that came
+up without a key could not store a credential. The template ships a **placeholder** that is long
+enough to start the server, so replacing it is on you — a forgotten one is a real key everyone with
+the repository knows.
+
+```bash
+cp .env.example .env
+openssl rand -base64 32          # REPLACE the ENCRYPTION_KEY placeholder with this
+```
+
+On Windows PowerShell, where there is no `openssl`:
+
+```powershell
+Copy-Item .env.example .env
+$b = New-Object byte[] 32
+[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
+[Convert]::ToBase64String($b)    # REPLACE the ENCRYPTION_KEY placeholder with this
+```
+
+**2. Build and start it.** One command builds the image and brings the stack up:
+
+```bash
+docker compose -f docker-compose.yml up -d --build
+```
+
+**3. Open <http://localhost:2649>** and set an admin password. There is no default account; the
+first visit creates one, and first-run setup then closes.
+
+**4. Add a target** and press **Save and test**. For a NAS, that is the host, share and credentials.
+For a folder on this machine, the path is **`/mnt/local`** — the container sees the host folder
+`docker-compose.yml` maps there (`%USERPROFILE%\cn4m` or `~/cn4m` by default), never the host path
+itself. See [Adding another local folder](#adding-another-local-folder) for a second one.
+
+**Then:**
+
+```bash
+docker compose -f docker-compose.yml logs -f     # follow it
+docker compose -f docker-compose.yml down        # stop it
+docker compose -f docker-compose.yml up -d       # start it again
+```
+
+With `make` available, `make image`, `make run`, `make logs` and `make down` are wrappers for the
+same things. Read [Deploying it for real](#deploying-it-for-real) before you rely on it — the
+backup rule there is the part that bites.
+
+**Back up `./data` and your `ENCRYPTION_KEY` together.** The database holds encrypted credentials
+and the key decrypts them; either alone is useless and there is no recovery from losing the key.
+
+## Quickstart (development harness)
+
+This one builds from source in the *dev* container and is for working on the code, not for running
+it. To just run it, use the Docker quickstart above.
 
 ```bash
 make harness-up      # build images, start two Samba servers + the dev container
@@ -83,7 +184,7 @@ It prints the full JSON response for each so the error messages can be read and 
 ## Deploying it for real
 
 The quickstart above runs everything from source inside the *development* container. That is not how
-you deploy it. Production is a separate 25 MB image with no Go toolchain, no Node, and no test
+you deploy it. Production is a separate ~24 MB image with no Go toolchain, no Node, and no test
 harness in it.
 
 ```bash
@@ -114,115 +215,63 @@ The production stack and the test harness are deliberately separate compose proj
 ports (2649 and 12649), so `make run` and `make test-integration` cannot interfere. They used to
 share a container, which twice ended in a wedged Docker daemon.
 
-## Verifying it on Windows
+## Windows notes
 
-Everything above is verified on macOS and Linux. Windows uses a **WSL2** kernel rather than the
-LinuxKit one Docker Desktop uses on a Mac, and `mount.cifs` needs kernel CIFS support — so the one
-thing worth confirming on a Windows host is that a container can mount a share at all. Run these in
-**PowerShell**, from the repository directory.
+Windows runs a **WSL2** kernel rather than the LinuxKit one Docker Desktop uses on a Mac, and
+`mount.cifs` needs kernel CIFS support. That was verified on 2026-09-09 — Windows 11 Pro 26200,
+Docker Desktop 26.1.4, kernel `5.15.153.1-microsoft-standard-WSL2` — end to end: a real NAS mounted
+from the production image, saved through the UI, and a job copied a tree. Nothing here is
+Windows-specific in the code; what follows is the environment.
 
-**1. Confirm Docker is using the WSL2 backend.**
-
-```powershell
-docker info --format "{{.OperatingSystem}} / {{.KernelVersion}}"
-```
-
-Expect something containing `WSL2` or a kernel version ending `-microsoft-standard-WSL2`. If it says
-`docker-desktop` with a LinuxKit kernel that is fine too; both are Linux VMs.
-
-**2. Confirm the kernel can do CIFS at all.** This is the question that cannot be worked around in
-software — if it fails, no version of this program will mount anything on that host.
-
-```powershell
-docker run --rm --privileged alpine sh -c "apk add --no-cache cifs-utils >/dev/null && grep -q cifs /proc/filesystems && echo 'KERNEL CIFS OK' || echo 'NO CIFS IN KERNEL'"
-```
-
-`cifs` may not appear in `/proc/filesystems` until something has tried to mount, so treat a `NO CIFS`
-here as inconclusive and go on to step 3, which is the real test.
-
-**3. Mount an actual share from the production image.** Replace the host, share and credentials with
-a real SMB target on your network — a NAS you already use is ideal.
-
-First write a credentials file — **not** on the command line, where it would land in PowerShell
-history, in `docker inspect`, and in the process table:
-
-```powershell
-notepad $env:USERPROFILE\smbcreds.txt
-```
-
-```ini
-username=YOURUSER
-password=YOURPASS
-```
-
-Then mount with it bind-mounted read-only, and delete it afterwards:
-
-```powershell
-docker build -t cn4m-cascade:latest .
-
-docker run --rm `
-  --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH `
-  --security-opt apparmor:unconfined `
-  -v "${env:USERPROFILE}/smbcreds.txt:/tmp/c:ro" `
-  --entrypoint sh cn4m-cascade:latest -c `
-  "mkdir -p /mnt/probe && mount.cifs //192.168.1.50/yourshare /mnt/probe -o credentials=/tmp/c,vers=3.1.1 && ls /mnt/probe && umount /mnt/probe && echo 'WINDOWS CIFS OK'"
-
-Remove-Item $env:USERPROFILE\smbcreds.txt
-```
-
-`WINDOWS CIFS OK` with a directory listing above it is the whole answer: the image, the capabilities
-and the kernel all work on that host.
-
-**4. Then run it properly and add the same target through the UI.**
-
-```powershell
-make image
-make run
-```
-
-Open <http://localhost:2649>, add the target, and press **Save and test**. A green result means the
-full path works — not just `mount.cifs`, but credential storage, the dialect ladder and the mount
-manager.
-
-**If step 3 fails**, the message says which layer:
-
-| Message | Meaning |
-|---|---|
-| `mount error(2): No such file or directory` | the share name is wrong |
-| `mount error(13): Permission denied` | credentials, or the server requires a dialect this did not offer |
-| `wrong fs type, bad option, bad superblock` | the kernel has no CIFS support — this is the one that cannot be fixed here |
-| `Operation not permitted` | the capabilities did not apply; check `--cap-add SYS_ADMIN` survived your shell quoting |
-
-**Windows-specific notes**
-
+- **Line endings will break the harness, and the lint gate, before anything else does.**
+  `.gitattributes` pins the whole tree to LF (`* text=auto eol=lf`). If you cloned before that pin,
+  or Git has `core.autocrlf=true` and files came out CRLF, the Samba containers exit 1 with
+  `exec /usr/local/bin/entrypoint.sh: no such file or directory` — the file is there, but its shebang
+  ends in a carriage return and the kernel looks for an interpreter named `/bin/sh<CR>`. The same
+  CRLF makes `gofmt` treat every Go file as unformatted, so `golangci-lint run` fails on files nobody
+  has touched. Fix a stale checkout with `git add --renormalize . && git checkout -- .` — commit or
+  stash first, because that second command overwrites the worktree. Neither symptom points at line
+  endings, and neither can happen on macOS or Linux.
 - **Paths in `.env` use forward slashes**: `CN4M_CASCADE_LOCAL_DIR=C:/Users/you/cn4m`. Docker Desktop
-  accepts them and backslashes will be mangled by compose interpolation.
+  accepts them; backslashes are mangled by compose interpolation.
 - The default local folder is `%USERPROFILE%\cn4m`, created for you, and it appears inside the
-  container as `/mnt/local` — that is the path to type into the UI, on every platform.
+  container as `/mnt/local` — that is the path to type into the UI, on every platform. To sync a
+  folder somewhere else (another drive, a media volume), see **Adding another local folder** below.
 - `make` is not standard on Windows. Use Git Bash or WSL, or run the underlying commands directly:
   `docker build -t cn4m-cascade:latest .` and `docker compose -f docker-compose.yml up -d`.
-- **Line endings will break the test harness, and the lint gate, before anything else does.**
-  `.gitattributes` pins the whole tree to LF (`* text=auto eol=lf`). If you cloned before that
-  pin, or Git has `core.autocrlf=true` and your scripts came out CRLF, the Samba containers exit 1 with
-  `exec /usr/local/bin/entrypoint.sh: no such file or directory` — the file is present, but its
-  shebang ends in a carriage return and the kernel looks for an interpreter named `/bin/sh<CR>`.
-  The same CRLF also makes `gofmt` treat every Go file as unformatted, so `golangci-lint run` fails
-  on files nobody has touched and the commit gate cannot be satisfied. Fix a stale checkout with
-  `git add --renormalize . && git checkout -- .` — commit or stash your work first, because that
-  second command overwrites the worktree. Nothing about either symptom points at line endings, and
-  neither can happen on macOS or Linux.
-- **Do not paste the fenced code block into `smbcreds.txt`.** Copying the credentials snippet above
-  out of a rendered Markdown view can carry the ` ``` ` fences into the file. `mount.cifs` then fails
-  to parse it and reports what looks like an authentication problem. The file must contain exactly
-  two lines, `username=` and `password=`, and nothing else.
-- **A LAN NAS is reached through WSL2's NAT**, a layer Docker Desktop on a Mac does not have. A
+- **A LAN NAS is reached through WSL2 NAT**, a layer Docker Desktop on a Mac does not have. A
   `mount error(113)` or a hang on an address that answers fine from PowerShell is a networking
-  problem, not a CIFS one — the error table above will not diagnose it.
+  problem, not a CIFS one.
 
-**Confirmed working on Windows (2026-09-09)** — Windows 11 Pro 26200, Docker Desktop 26.1.4 on the
-WSL2 backend, kernel `5.15.153.1-microsoft-standard-WSL2`. `cifs` is present in `/proc/filesystems`,
-the shipping image is 23.6 MB on amd64, and both a guest mount against the test harness and a
-credentialed SMB 3.1.1 mount of a real NAS succeeded from the production image.
+## Adding another local folder
+
+The container sees exactly the host folders `docker-compose.yml` maps into it. `/mnt/local` is set up
+for you; anything else needs a bind mount, and the path you type into the UI is the path *inside* the
+container, never the host path.
+
+To point the existing mount somewhere else, set it in `.env`:
+
+```ini
+# Windows — forward slashes, and quote nothing
+CN4M_CASCADE_LOCAL_DIR=D:/Media/Projects
+```
+
+That still appears as `/mnt/local`. To have **more than one**, add a volume to the `cn4m-cascade` service
+in `docker-compose.yml` — there is a commented example there to copy:
+
+```yaml
+    volumes:
+      - ./data:/data
+      - ${CN4M_CASCADE_LOCAL_DIR:-${HOME:-${USERPROFILE:-.}}/cn4m}:/mnt/local:rw
+      # A second folder, read-only so it can only ever be a source:
+      - D:/Media/Footage:/mnt/footage:ro
+```
+
+Then create a local target whose path is `/mnt/footage`. Mounting a source `:ro` is worth doing: it
+makes the kernel refuse a write to it, whatever a job is later configured to do.
+
+Compose only reads the volume list at container creation, so `docker compose -f docker-compose.yml up
+-d` after editing it — a restart is not enough.
 
 ## Running the whole verification suite
 
@@ -272,15 +321,15 @@ docker compose -f docker-compose.test.yml ps
 
 ## Poking at the API by hand
 
-The dev container publishes no ports, so the server is not reachable from your machine. Work from
-inside it:
+The dev container publishes 12649 (the server) and 5173 (the Vite dev server), but the simplest way
+to drive the API by hand is from inside it:
 
 ```bash
 make dev-shell
 
 # in the container:
-go build -o /tmp/smbsync ./cmd/smbsync
-ENCRYPTION_KEY=some-long-development-key DATA_DIR=/tmp/data MOUNT_ROOT=/mnt/smb /tmp/smbsync &
+go build -o /tmp/cascade ./cmd/cn4m-cascade
+ENCRYPTION_KEY=some-long-development-key DATA_DIR=/tmp/data MOUNT_ROOT=/mnt/smb /tmp/cascade &
 
 # add a target by IP (172.28.0.10 is the first Samba server)
 curl -sS -X POST localhost:2649/api/targets -H 'Content-Type: application/json' -d '{
@@ -502,7 +551,7 @@ addressed by IP.
 ## Repository layout
 
 ```
-cmd/smbsync/       server entrypoint
+cmd/cn4m-cascade/  server entrypoint
 internal/
   api/             HTTP handlers
   config/          environment configuration
@@ -523,6 +572,16 @@ it never answers, restart Docker Desktop.
 
 **`make verify-cifs` fails with an unknown filesystem type.** The VM kernel lacks the `cifs` module.
 Nothing in this project can work around that; use a Linux host.
+
+**A target will not mount.** The message names the layer that failed:
+
+| Message | Meaning |
+|---|---|
+| `mount error(2): No such file or directory` | the share name is wrong |
+| `mount error(13): Permission denied` | credentials, or the server requires a dialect this did not offer |
+| `mount error(113): could not connect` | the host is unreachable — routing or firewall, not CIFS |
+| `wrong fs type, bad option, bad superblock` | the kernel has no CIFS support; nothing here can work around it |
+| `Operation not permitted` | the capabilities did not apply; check `SYS_ADMIN` survived your shell quoting |
 
 **Integration tests fail with `mount error(115): Operation now in progress`.** Almost always a dirty
 harness rather than a real failure. A test process killed before its cleanup ran leaves behind an

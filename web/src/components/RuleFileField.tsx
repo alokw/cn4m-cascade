@@ -14,9 +14,13 @@ import type { FilterFileCheck } from '../api/types'
 export function RuleFileField({
   value,
   onChange,
+  placeholder = '/mnt/local/excludes.txt or target://<target-id>/excludes.txt',
 }: {
   value: string
   onChange: (v: string) => void
+  /** Overridden per source, so a JSON rule can show a catalogue path rather
+   *  than an excludes list that would be the wrong shape for it. */
+  placeholder?: string
 }) {
   const [check, setCheck] = useState<FilterFileCheck | null>(null)
 
@@ -48,11 +52,7 @@ export function RuleFileField({
   return (
     <label>
       File path
-      <input
-        value={value}
-        placeholder="/mnt/local/excludes.txt or target://<target-id>/excludes.txt"
-        onChange={(e) => onChange(e.target.value)}
-      />
+      <input value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />
       <span className="hint">
         A path inside the container, or <code>target://&lt;target-id&gt;/path</code> to read it off a
         share. Re-read at the start of every run, not saved with the job.

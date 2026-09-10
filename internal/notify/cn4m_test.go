@@ -64,12 +64,16 @@ func TestCN4MCallbackArrivesAsFormFields(t *testing.T) {
 			t.Fatal("no level was sent")
 		}
 		// The message is what a person reads in the suite view, so it has to
-		// name the job and say what happened.
-		if !contains(r.message, "photos-to-nas") {
-			t.Fatalf("message %q does not name the job", r.message)
-		}
-		if !contains(r.message, "success") {
+		// say what happened in the first few words.
+		if !contains(r.message, "Sync Complete") {
 			t.Fatalf("message %q does not say what happened", r.message)
+		}
+		// And it must never carry an identifier. The payload has job_id and
+		// no job name, so any attempt to name the job prints a 32-character
+		// hex string and fills the row with the least useful thing on it
+		// (D-128).
+		if contains(r.message, "photos-to-nas") || contains(r.message, "job-1") {
+			t.Fatalf("message %q carries a job identifier", r.message)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("cn4m received nothing")
@@ -147,8 +151,93 @@ func TestCN4MMessageIsAlwaysOneShortLine(t *testing.T) {
 	if len(msg) > 200 {
 		t.Fatalf("the message is %d characters; cn4m shows one row", len(msg))
 	}
-	if !contains(msg, "backup") {
-		t.Fatalf("message %q does not name the job", msg)
+	if !contains(msg, "Sync Failed") {
+		t.Fatalf("message %q does not lead with what happened", msg)
+	}
+	if contains(msg, "backup") {
+		t.Fatalf("message %q carries a job identifier (D-128)", msg)
+	}
+}
+
+// The format the suite view is actually read for: how far along, and how fast.
+func TestCN4MProgressReportsPercentAndSpeed(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload Payload
+		want    string
+	}{
+		{
+			name:    "percent and speed",
+			payload: Payload{"bytes_done": 650, "bytes_total": 1000, "throughput_bps": 910000000.0},
+			want:    "Sync in Progress: 65%, 910 MB/s",
+		},
+		{
+			name:    "bytes win over files, being the better measure of remaining work",
+			payload: Payload{"bytes_done": 100, "bytes_total": 1000, "files_done": 9, "files_total": 10},
+			want:    "Sync in Progress: 10%",
+		},
+		{
+			name:    "files are used when no byte total is known yet",
+			payload: Payload{"files_done": 9, "files_total": 10},
+			want:    "Sync in Progress: 90%",
+		},
+		{
+			name:    "speed alone while the scan has not produced a total",
+			payload: Payload{"throughput_bps": 2500000.0},
+			want:    "Sync in Progress: 2 MB/s",
+		},
+		{
+			// Totals are revised while the scan runs, so done can briefly
+			// exceed the total known so far. "104%" reads as a bug.
+			name:    "percent is clamped",
+			payload: Payload{"bytes_done": 1040, "bytes_total": 1000},
+			want:    "Sync in Progress: 100%",
+		},
+		{
+			name:    "neither known: no invented zero",
+			payload: Payload{},
+			want:    "Sync in Progress",
+		},
+		{
+			name:    "a stalled transfer reports no speed rather than 0 B/s",
+			payload: Payload{"bytes_done": 500, "bytes_total": 1000, "throughput_bps": 0.0},
+			want:    "Sync in Progress: 50%",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cn4mMessage(EventProgress, tt.payload); got != tt.want {
+				t.Fatalf("message = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// Every message a person can see, in one place, so a change to the wording is
+// a deliberate edit to this list rather than a surprise in the suite view.
+func TestCN4MMessagesCarryNoIdentifiers(t *testing.T) {
+	const id = "9fc012f2ac2524cc9bf41333e51cfc6b"
+	events := []struct {
+		event   string
+		payload Payload
+	}{
+		{EventRunStarted, Payload{"job_id": id}},
+		{EventProgress, Payload{"job_id": id, "bytes_done": 1, "bytes_total": 2}},
+		{EventPrompt, Payload{"job_id": id}},
+		{EventRunCompleted, Payload{"job_id": id, "status": "success", "files_done": 3}},
+		{EventRunCompleted, Payload{"job_id": id, "status": "partial", "files_done": 3, "errors_count": 1}},
+		{EventRunCompleted, Payload{"job_id": id, "status": "cancelled", "files_done": 3}},
+		{EventRunFailed, Payload{"job_id": id, "last_error": "the host is down"}},
+	}
+	for _, e := range events {
+		msg := cn4mMessage(e.event, e.payload)
+		if contains(msg, id) {
+			t.Errorf("%s: message %q contains the job id", e.event, msg)
+		}
+		if !contains(msg, "Sync") {
+			t.Errorf("%s: message %q does not read as a sync status", e.event, msg)
+		}
 	}
 }
 

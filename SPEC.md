@@ -186,7 +186,15 @@ A global rule that cannot be loaded degrades **every** job's chain, disabling de
 3. **JSON file + key** — a JSON file (same reachability rules) plus a user-specified key that selects the pattern list inside it. The key is a dot-path supporting array traversal, e.g.:
    - file `{"backup": {"exclude": ["*.tmp", "cache/"]}}` with key `backup.exclude`
    - file `[{"name":"media","skip":["Thumbs.db"]}]` with key `0.skip`
-   The value at the key MUST be an array of strings (or a single string); anything else is a validation error surfaced at save time and re-validated at run time (the file may have changed). Malformed/missing file or key at run time → treated per the rule's `on_error` setting: `fail_run` (default for excludes — silently syncing files the user meant to exclude is the dangerous direction) or `ignore_rule`.
+   The value at the key MUST be an array of strings (or a single string); anything else is a validation error surfaced at save time and re-validated at run time (the file may have changed).
+
+   **A `*` segment** matches every value of an object or every element of an array, so a catalogue keyed by something the user cannot predict is addressable: file `{"assets": {"<hash>": {"name": "a.mov"}, …}}` with key `assets.*.name` collects every asset's name. Object fan-out is emitted in sorted key order, so the resulting pattern list — and therefore the run log — is identical between two runs over the same document.
+
+   **The key field may hold several keys, one per line.** Blank lines are ignored, results are unioned in the order written, and duplicates are dropped. This is what lets one rule draw on several sections of the same catalogue (`tracked_repo_assets.*.name` and `untracked_repo_assets.*.name`) without configuring the same file twice. Adding one rule per key remains equivalent, because includes are OR'd; the single rule exists so the file path, `on_error` and the run-log counter are configured once.
+
+   **Strictness differs between the two forms, deliberately.** A key with no `*` is an *assertion* that a path exists: a missing key, a non-numeric array index or a scalar where a container was expected is an error, because the alternative is a typo silently selecting nothing. A key containing `*` is a *query*: children lacking the rest of the path are skipped, non-string values are skipped, and matching nothing at all is permitted — a catalogue whose sections vary, or whose section is empty, is a normal input rather than a broken one. A wildcard makes the whole of that key lenient; the two readings are not mixed within one key. A rule that resolves to no patterns is already reported as a run event (warn, or error for a global rule), so "nothing matched" stays visible without being fatal.
+
+   *Limitation:* a JSON object with a key literally named `*` cannot be selected, because `*` is the wildcard. No escape is provided; if such a document ever appears, add one rather than changing the wildcard. Malformed/missing file or key at run time → treated per the rule's `on_error` setting: `fail_run` (default for excludes — silently syncing files the user meant to exclude is the dangerous direction) or `ignore_rule`.
 
 **Rule semantics:**
 
