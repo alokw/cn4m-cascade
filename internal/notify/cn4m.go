@@ -247,9 +247,13 @@ func truncate(s string, max int) string {
 // bodyFor renders a payload in the format a hook expects, and returns the
 // content type to send it with.
 func bodyFor(hook store.Webhook, event string, payload Payload) ([]byte, string, error) {
-	if hook.Format == store.FormatCN4M {
+	switch hook.Format {
+	case store.FormatCN4M:
 		return []byte(cn4mForm(event, payload).Encode()),
 			"application/x-www-form-urlencoded", nil
+	case store.FormatDiscord:
+		body, err := discordBody(event, payload)
+		return body, "application/json", err
 	}
 	body, err := jsonBody(payload)
 	return body, "application/json", err

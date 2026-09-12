@@ -219,7 +219,7 @@ func (l *LocalStorage) check(root string) error {
 			// run insists the very same path is missing.
 			return fmt.Errorf("%s: %s %w", l.target.Describe(), root, ErrPathNotExist)
 		}
-		return fmt.Errorf("%s does not exist — check that the host directory is bind-mounted into the container", l.target.Describe())
+		return fmt.Errorf("%s does not exist — %s", l.target.Describe(), missingRootHint)
 	}
 	if err != nil {
 		return fmt.Errorf("%s: %s is not readable: %w", l.target.Describe(), root, err)

@@ -45,6 +45,11 @@ func StatusPayload(run *store.Run, snap *RunSnapshot, nameFor func(string) strin
 		out["bytes_done"] = snap.BytesDone
 		out["bytes_total"] = snap.BytesTotal
 		out["throughput_bps"] = snap.ThroughputBPS
+		// The size of the source tree, which is a different question from how
+		// much is being transferred. Reported in both states so a caller does
+		// not have to wait for a run to finish to learn how big the job is.
+		out["scanned_files"] = snap.ScannedFiles
+		out["scanned_bytes"] = snap.ScannedBytes
 		out["eta_sec"] = snap.ETASeconds
 
 		files := make([]map[string]any, 0, len(snap.InFlight))
@@ -55,11 +60,26 @@ func StatusPayload(run *store.Run, snap *RunSnapshot, nameFor func(string) strin
 		}
 		out["current_files"] = files
 	} else {
-		// A finished run's counters come from the flushed row.
-		out["files_done"] = run.FilesScanned
-		out["files_total"] = run.FilesScanned
-		out["bytes_done"] = run.BytesTotal
-		out["bytes_total"] = run.BytesTotal
+		// A finished run's counters come from the flushed per-destination rows,
+		// summed — not from the run row's scan totals.
+		//
+		// **files_total and bytes_total mean the transfer, in both states.**
+		// They used to switch meaning the moment a run ended: the transfer
+		// while running, the size of the source tree afterwards, so a job that
+		// copied 5 MB out of a 1 GB tree reported 1 GB once it finished. The
+		// tree is still reported, as scanned_files/scanned_bytes, because it
+		// answers a genuine question — just not this one.
+		var filesTotal, filesDone, bytesTotal, bytesDone int64
+		for _, d := range run.Destinations {
+			filesTotal += d.FilesTotal
+			filesDone += d.FilesDone
+			bytesTotal += d.BytesTotal
+			bytesDone += d.BytesDone
+		}
+		out["files_done"] = filesDone
+		out["files_total"] = filesTotal
+		out["bytes_done"] = bytesDone
+		out["bytes_total"] = bytesTotal
 		out["current_files"] = []map[string]any{}
 		// Present but meaningless rather than absent. §11 requires the
 		// documented shape "both during a run and after it", and a poller that
@@ -67,6 +87,8 @@ func StatusPayload(run *store.Run, snap *RunSnapshot, nameFor func(string) strin
 		// supposed to prevent. -1 is the project's existing "not computable"
 		// value (engine.ETAUnknown), not zero, which would read as "finishing
 		// right now".
+		out["scanned_files"] = run.FilesScanned
+		out["scanned_bytes"] = run.BytesTotal
 		out["throughput_bps"] = 0
 		out["eta_sec"] = -1
 	}

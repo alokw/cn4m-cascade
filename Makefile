@@ -201,6 +201,20 @@ test: test-unit test-integration ## All tests (excludes test-scale)
 build: web-build ## Compile the server binary with the SPA embedded
 	$(DEV) go build -o /tmp/cn4m-cascade ./cmd/cn4m-cascade
 
+.PHONY: windows-exe
+windows-exe: web-build ## Cross-compile the native Windows .exe into ./dist
+	@# The native deployment of SPEC.md §11 Phase 6b. Cross-compiled in the dev
+	@# container because that is where the Go toolchain and the SPA build live —
+	@# CGO is off and SQLite is pure Go, so nothing needs a Windows host to build.
+	@mkdir -p dist
+	$(DEV) env GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \n		go build -trimpath -ldflags="-s -w" -o /src/dist/cn4m-cascade.exe ./cmd/cn4m-cascade
+	@# A template beside the binary, because the process looks for .env next to
+	@# itself and an operator should not have to find out what goes in it.
+	@cp .env.example dist/.env.example
+	@ls -lh dist/cn4m-cascade.exe
+	@echo "Windows build. No Docker, no mount.cifs."
+	@echo "Next: copy dist/.env.example to dist/.env and set ENCRYPTION_KEY. See README."
+
 .PHONY: demo
 demo: build ## Walk the Phase 1 exit criteria with curl and print every response
 	$(DEV) bash /src/test/exit-criteria.sh

@@ -48,6 +48,17 @@ type RunSnapshot struct {
 	PendingDestinations   int   `json:"pending_destinations"`
 	EstimatedPendingBytes int64 `json:"estimated_pending_bytes"`
 
+	// ScannedFiles and ScannedBytes are how much the source scan found in
+	// scope — the size of the tree, not the size of the transfer.
+	//
+	// They exist so an operator can anticipate the shape of a job while it is
+	// still running; until now the scan size was only visible once the run had
+	// finished. They are deliberately **not** the progress denominator: a tree
+	// that is already in sync is large and has nothing to copy, and confusing
+	// the two is what made a 700 MB transfer report 3.5 TB (D-130).
+	ScannedFiles int64 `json:"scanned_files"`
+	ScannedBytes int64 `json:"scanned_bytes"`
+
 	// ConfirmDeadline is when a previewed run gives up waiting and cancels
 	// itself. Zero unless the run is awaiting confirmation.
 	ConfirmDeadline time.Time `json:"confirm_deadline,omitempty"`
@@ -215,6 +226,11 @@ type progress struct {
 	confirmDeadline time.Time
 	// plans is what each destination intends to do, once diffed.
 	plans map[string]DestPlan
+
+	// scannedFiles and scannedBytes are what the shared source scan found.
+	// Reported for context only; see RunSnapshot.ScannedBytes.
+	scannedFiles int64
+	scannedBytes int64
 }
 
 // phaseRank orders phases by how far through the pipeline they are, so the
@@ -340,6 +356,16 @@ func (p *progress) setScanProgress(files, dirs int64) {
 }
 
 // sample folds elapsed bytes into every destination's rolling throughput.
+// setSourceScan records the size of the source tree once the scan has finished.
+//
+// Informational. It must never reach FilesTotal or BytesTotal: those describe
+// the transfer, and this describes the tree the transfer was chosen from.
+func (p *progress) setSourceScan(files, bytes int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.scannedFiles, p.scannedBytes = files, bytes
+}
+
 func (p *progress) sample(now time.Time) {
 	p.mu.Lock()
 	trackers := make([]*engine.Tracker, 0, len(p.trackers))
@@ -386,6 +412,7 @@ func (p *progress) snapshot(now time.Time) RunSnapshot {
 		plans[k] = v
 	}
 	phase := p.phase
+	scannedFiles, scannedBytes := p.scannedFiles, p.scannedBytes
 	started := p.started
 	confirmDeadline := p.confirmDeadline
 	p.mu.Unlock()
@@ -394,6 +421,8 @@ func (p *progress) snapshot(now time.Time) RunSnapshot {
 		Phase:           phase,
 		ElapsedSec:      now.Sub(started).Seconds(),
 		ETASeconds:      engine.ETAUnknown,
+		ScannedFiles:    scannedFiles,
+		ScannedBytes:    scannedBytes,
 		ConfirmDeadline: confirmDeadline,
 	}
 
@@ -437,15 +466,29 @@ func (p *progress) snapshot(now time.Time) RunSnapshot {
 		out.Phase = busiestPhase(phase, out.Destinations)
 	}
 
-	// SPEC.md §6.1.1 wants the total to account for destinations that have
-	// not started. Their real size is unknown until they are planned, so
-	// they are estimated from the mean of the ones that are.
+	// SPEC.md §6.1.1 wants the total to account for destinations that have not
+	// started. They are **estimated from the mean of the ones that have**, and
+	// folded into the totals rather than reported separately, so a fan-out run
+	// stops counting upwards as each destination is planned.
+	//
+	// The estimate is of *work*, never of scope. An earlier version used the
+	// source scan — files × destinations, fixed the moment the scan ended — and
+	// it was wrong in a way that looked right: a 500 GB tree already in sync
+	// reported 3.5 TB to copy when the actual work was 700 MB, because every
+	// file in scope counted whether or not it needed copying. A progress bar
+	// and an ETA describe what is going to be transferred, so the denominator
+	// has to be the transfer.
 	if out.PendingDestinations > 0 && plannedCount > 0 {
-		out.EstimatedPendingBytes = (out.BytesTotal / int64(plannedCount)) * int64(out.PendingDestinations)
+		pending := int64(out.PendingDestinations)
+		out.EstimatedPendingBytes = (out.BytesTotal / int64(plannedCount)) * pending
+		out.FilesTotal += (out.FilesTotal / int64(plannedCount)) * pending
+		out.BytesTotal += out.EstimatedPendingBytes
 	}
 
 	if out.ThroughputBPS > 0 {
-		remaining := out.BytesTotal + out.EstimatedPendingBytes - out.BytesDone
+		// EstimatedPendingBytes is already inside BytesTotal; adding it again
+		// here would double count every destination not yet planned.
+		remaining := out.BytesTotal - out.BytesDone
 		if remaining < 0 {
 			remaining = 0
 		}

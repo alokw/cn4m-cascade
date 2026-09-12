@@ -60,6 +60,9 @@ services:
       # the code's bare-metal default would post status to itself. Set to
       # "off" if this install is not part of a cn4m suite.
       CN4M_CASCADE_STATUS_URL: ${CN4M_CASCADE_STATUS_URL:-http://host.docker.internal:2640/suite/status}
+      # Discord notifications, seeded on a fresh database only. Unset means
+      # none. The URL is a secret: keep it in .env, which is gitignored.
+      CN4M_CASCADE_DISCORD_WEBHOOK: ${CN4M_CASCADE_DISCORD_WEBHOOK:-}
 
     volumes:
       # The SQLite database and the encrypted credentials live here. Back this

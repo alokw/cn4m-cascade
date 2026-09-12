@@ -30,8 +30,8 @@ const CN4MReportingOff = "off"
 // Config is the fully resolved runtime configuration.
 type Config struct {
 	ListenAddr string // LISTEN_ADDR, default ":2649"
-	DataDir    string // DATA_DIR, default "/data" — holds the SQLite database
-	MountRoot  string // MOUNT_ROOT, default "/mnt/smb"
+	DataDir    string // DATA_DIR, holds the SQLite database; platform default
+	MountRoot  string // MOUNT_ROOT, where CIFS mounts go; unused on Windows
 
 	// CN4MStatusURL is where this reports its status in the cn4m suite
 	// (SPEC.md §8.2). Defaults to cn4m on the same machine, which is the
@@ -39,9 +39,20 @@ type Config struct {
 	// "off" to report nowhere.
 	CN4MStatusURL string
 
+	// DiscordWebhookURL seeds a Discord notification on a fresh database.
+	// Empty means none, which is the default: a chat notification nobody asked
+	// for is worse than no notification.
+	DiscordWebhookURL string
+
 	// EncryptionKey is the raw secret from ENCRYPTION_KEY. It is never the
 	// key used directly; secrets.NewBox derives from it.
 	EncryptionKey string
+
+	// ConfigPath is the config file that was layered in, or "" when
+	// configuration came entirely from the environment. Reported at startup so
+	// an operator can see *which* file the process actually read — the usual
+	// confusion with a discovered config file is editing a different copy.
+	ConfigPath string
 
 	// MountUID/MountGID become uid=/gid= in the CIFS mount options, so that
 	// files on the share are owned by the account the engine runs as.
@@ -63,20 +74,33 @@ func (c *Config) DBPath() string { return filepath.Join(c.DataDir, "cn4m-cascade
 // footgun: the derived key is only as strong as the input entropy.
 const minKeyLen = 16
 
-// Load reads configuration from the environment.
+// Load reads configuration from the environment, after layering in a config
+// file if one is present.
+//
+// The file is a convenience for deployments with no orchestrator to interpolate
+// one: `docker compose` reads `.env` on the operator's behalf, and a native
+// install has nothing doing that (SPEC.md §10). Environment variables still win
+// over the file, so a one-off override needs no edit.
 func Load() (*Config, error) {
+	configPath, err := applyEnvFile()
+	if err != nil {
+		return nil, err
+	}
+
 	c := &Config{
-		ListenAddr:     envStr("LISTEN_ADDR", DefaultListenAddr),
-		DataDir:        envStr("DATA_DIR", "/data"),
-		MountRoot:      envStr("MOUNT_ROOT", "/mnt/smb"),
-		CN4MStatusURL:  envStr("CN4M_CASCADE_STATUS_URL", DefaultCN4MStatusURL),
-		EncryptionKey:  os.Getenv("ENCRYPTION_KEY"),
-		MountUID:       os.Getuid(),
-		MountGID:       os.Getgid(),
-		MountTimeout:   30 * time.Second,
-		StatFSTimeout:  5 * time.Second,
-		UnmountTimeout: 15 * time.Second,
-		IdleGrace:      60 * time.Second,
+		ConfigPath:        configPath,
+		ListenAddr:        envStr("LISTEN_ADDR", DefaultListenAddr),
+		DataDir:           envStr("DATA_DIR", defaultDataDir()),
+		MountRoot:         envStr("MOUNT_ROOT", defaultMountRoot()),
+		CN4MStatusURL:     envStr("CN4M_CASCADE_STATUS_URL", DefaultCN4MStatusURL),
+		DiscordWebhookURL: envStr("CN4M_CASCADE_DISCORD_WEBHOOK", ""),
+		EncryptionKey:     os.Getenv("ENCRYPTION_KEY"),
+		MountUID:          os.Getuid(),
+		MountGID:          os.Getgid(),
+		MountTimeout:      30 * time.Second,
+		StatFSTimeout:     5 * time.Second,
+		UnmountTimeout:    15 * time.Second,
+		IdleGrace:         60 * time.Second,
 	}
 
 	if c.EncryptionKey == "" {
@@ -86,7 +110,6 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("ENCRYPTION_KEY is too short (%d characters): use at least %d", len(c.EncryptionKey), minKeyLen)
 	}
 
-	var err error
 	if c.MountUID, err = envInt("MOUNT_UID", c.MountUID); err != nil {
 		return nil, err
 	}

@@ -448,6 +448,11 @@ func (r *Runner) execute(ctx context.Context, h *handle, job *store.Job, run *st
 		return
 	}
 
+	// The size of the tree, for context while the run is in flight. Not the
+	// progress denominator — that is the work, which each destination
+	// decides when it is planned (SPEC.md §6.1.1).
+	h.progress.setSourceScan(srcScan.Files, srcScan.Bytes)
+
 	events.Add(engine.Event{Level: store.LevelInfo, Message: fmt.Sprintf(
 		"source scan complete: %d files / %d dirs / %d bytes%s",
 		srcScan.Files, srcScan.Dirs, srcScan.Bytes, prunedSuffix(srcScan))})
@@ -607,6 +612,11 @@ type destOutcome struct {
 	// job asked — deletions withheld, or a filter rule dropped. It reads as
 	// success on its own row, so the run has to surface it.
 	degraded bool
+	// lockedFiles counts files another process had open, so the run tally can
+	// say so. A run reported "incomplete" with "0 failed, 0 skipped" beside it
+	// tells an operator something is wrong and nothing about what, and a locked
+	// file is precisely the thing that must not be quietly forgotten.
+	lockedFiles int
 }
 
 // plannedDest is one destination that has been resolved, scanned and diffed.
@@ -1043,6 +1053,7 @@ func (r *Runner) executeOneDestination(ctx context.Context, h *handle, job *stor
 	}
 
 	outcome.status, outcome.summary, outcome.degraded = status, summary, degraded
+	outcome.lockedFiles = countLocked(result.Failures)
 	return outcome
 }
 
@@ -1184,6 +1195,21 @@ func classifyDestination(result *engine.ExecResult, plan *engine.Plan) (status s
 		// intended to remove, and the user needs to know why.
 		return store.DestSuccess, plan.BlockedReason, true
 
+	// Every failure was a file somebody else had open. The destination is
+	// not fully in sync, so this is **not** a clean success — it is
+	// degraded, which makes the run `partial`. But it is not a failure
+	// either, and calling it one has a real cost: media servers hold
+	// their project files open for as long as the project is loaded, so
+	// a locked file can stay locked for days. Reporting `failed` every
+	// run for a condition nobody can clear teaches people to ignore the
+	// status, and then a genuine failure goes unnoticed too.
+	//
+	// The failures stay in result.Failures deliberately: ExecResult.Failed
+	// gates the deletion guard, and a destination missing a file it was
+	// meant to receive must not have deletions run against it.
+	case len(result.Failures) > 0 && allLocked(result.Failures):
+		return store.DestSuccess, summariseLocked(result.Failures), true
+
 	case len(result.Failures) > 0:
 		return store.DestFailed, summarise(result.Failures), false
 
@@ -1201,7 +1227,7 @@ func classifyDestination(result *engine.ExecResult, plan *engine.Plan) (status s
 // destination is `partial`. A run where *nothing* succeeded is reported as
 // failed instead — calling that partial would overstate it.
 func classifyRun(outcomes []destOutcome, policy store.UnavailablePolicy) (store.RunStatus, string) {
-	var succeeded, failed, skipped, cancelled, degraded int
+	var succeeded, failed, skipped, cancelled, degraded, locked int
 	var problems []string
 	aborted := false
 
@@ -1209,6 +1235,7 @@ func classifyRun(outcomes []destOutcome, policy store.UnavailablePolicy) (store.
 		if o.unavailable && policy == store.PolicyAbort {
 			aborted = true
 		}
+		locked += o.lockedFiles
 		if o.degraded {
 			degraded++
 			problems = append(problems, fmt.Sprintf("%s: %s", o.targetID, o.summary))
@@ -1228,6 +1255,11 @@ func classifyRun(outcomes []destOutcome, policy store.UnavailablePolicy) (store.
 	}
 
 	summary := fmt.Sprintf("%d succeeded, %d failed, %d skipped", succeeded, failed, skipped)
+	if locked > 0 {
+		// Inside the tally rather than after it, so the short forms that keep
+		// only the tally — the Discord line, the cn4m status — still carry it.
+		summary += fmt.Sprintf(", %d file(s) locked", locked)
+	}
 	if len(problems) > 0 {
 		summary += " — " + strings.Join(problems, "; ")
 	}
@@ -1381,4 +1413,49 @@ func joinSubpaths(targetSubpath, jobSubpath string) string {
 	default:
 		return targetSubpath + "/" + jobSubpath
 	}
+}
+
+// allLocked reports whether every failure was a destination file held open by
+// another process.
+//
+// All of them, not some: one genuine error among them means the destination
+// really did fail, and the locked files are then the lesser half of a worse
+// problem.
+func allLocked(failures []engine.Failure) bool {
+	for _, f := range failures {
+		if !errors.Is(f.Err, engine.ErrDestinationLocked) {
+			return false
+		}
+	}
+	return len(failures) > 0
+}
+
+// summariseLocked describes a destination whose only problem was locked files.
+//
+// It says what will happen next, because the answer — nothing, until whoever
+// holds the file releases it — is not obvious from the fact alone.
+func summariseLocked(failures []engine.Failure) string {
+	names := make([]string, 0, len(failures))
+	for _, f := range failures {
+		names = append(names, f.RelPath)
+	}
+	const named = 3
+	shown, suffix := names, ""
+	if len(shown) > named {
+		shown, suffix = shown[:named], fmt.Sprintf(" and %d more", len(names)-named)
+	}
+	return fmt.Sprintf("%d file(s) were not copied because another process had them open (%s%s); "+
+		"everything else is in sync, and the next run will pick them up",
+		len(failures), strings.Join(shown, ", "), suffix)
+}
+
+// countLocked counts failures that were a destination file held open elsewhere.
+func countLocked(failures []engine.Failure) int {
+	n := 0
+	for _, f := range failures {
+		if errors.Is(f.Err, engine.ErrDestinationLocked) {
+			n++
+		}
+	}
+	return n
 }

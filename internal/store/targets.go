@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -117,8 +118,12 @@ func (t *Target) Validate() error {
 		if strings.TrimSpace(t.LocalPath) == "" {
 			return errors.New("local_path is required for a local target")
 		}
-		if !path.IsAbs(t.LocalPath) {
-			return fmt.Errorf("local_path %q must be an absolute path inside the container", t.LocalPath)
+		// filepath.IsAbs, not path.IsAbs: the latter only understands "/..."
+		// and would reject every Windows path a native install is given
+		// (SPEC.md §11, Phase 6b). The message follows suit, because
+		// "inside the container" is wrong advice when there is no container.
+		if !filepath.IsAbs(t.LocalPath) {
+			return fmt.Errorf("local_path %q must be an absolute path", t.LocalPath)
 		}
 		if t.Host != "" || t.Share != "" || t.Username != "" {
 			return errors.New("host, share and username are only valid for an SMB target")

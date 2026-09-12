@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -151,7 +152,45 @@ func (e *Executor) Execute(ctx context.Context, srcRoot, dstRoot string, plan *P
 	}
 	e.removeDirs(execCtx, dstRoot, rmdirs, result)
 
+	e.summariseLockedFiles(result)
+
 	return result, ctx.Err()
+}
+
+// summariseLockedFiles reports files skipped because another process held
+// them open, once, at the end (SPEC.md §6.2).
+//
+// Each one is already logged individually where it happened. This exists
+// because that is not enough on its own: a run of ten thousand files buries
+// three locked ones, and the operator needs to know at a glance that the
+// destination is not fully in sync and why. The count is derived from the
+// failures already recorded rather than tracked separately, so it cannot drift
+// from what the run actually reported.
+func (e *Executor) summariseLockedFiles(result *ExecResult) {
+	locked := make([]string, 0, 4)
+	for _, f := range result.Failures {
+		if errors.Is(f.Err, ErrDestinationLocked) {
+			locked = append(locked, f.RelPath)
+		}
+	}
+	if len(locked) == 0 {
+		return
+	}
+
+	// Named, not just counted, up to a limit: "3 files were locked" without
+	// saying which ones leaves the operator grepping. Past a handful the list
+	// stops being readable and the individual entries above are the record.
+	const named = 5
+	shown := locked
+	suffix := ""
+	if len(shown) > named {
+		shown = shown[:named]
+		suffix = fmt.Sprintf(" (and %d more, listed individually above)", len(locked)-named)
+	}
+	e.emit(Event{Level: store.LevelWarn, Message: fmt.Sprintf(
+		"%d file(s) were not copied because another process had the destination open: %s%s; "+
+			"they are not retried, and the next run will pick them up",
+		len(locked), strings.Join(shown, ", "), suffix)})
 }
 
 func (e *Executor) makeDirs(ctx context.Context, dstRoot string, actions []Action, result *ExecResult) error {

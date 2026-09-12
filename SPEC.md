@@ -59,8 +59,14 @@ This is a design/architecture spec intended to be handed to an AI coding assista
 **Key decisions (already made — do not revisit unless blocked):**
 
 1. **Backend language: Go.** Goroutines map perfectly onto concurrent tree scanning and parallel copy workers; single static binary keeps the image small.
-2. **SMB access via kernel CIFS mounts, not a userspace SMB library.** The backend mounts shares on demand at `/mnt/smb/<target-id>` using `mount.cifs`, then treats them as ordinary filesystem paths. This gets kernel-level performance (readahead, large rsize/wsize, SMB3 multichannel) and lets the entire sync engine be protocol-agnostic.
-3. **`network_mode: host`** to eliminate NAT overhead and any SMB networking weirdness.
+2. **SMB access via the platform's kernel SMB client, not a userspace SMB library.** The engine is handed ordinary filesystem paths and never learns the protocol behind them (§4). Two implementations of that, both satisfying `mountmgr.Mounter`:
+   - **Linux / container:** mount shares on demand at `/mnt/smb/<target-id>` with `mount.cifs`, then treat them as ordinary paths. Kernel-level readahead, large `rsize`/`wsize`, SMB3 multichannel.
+   - **Windows / native (added 2026-09-10):** there is nothing to mount. Windows opens `\\host\share\path` directly, so the connector authenticates the session with `WNetAddConnection2` and hands back the UNC root as the path. Credentials go in memory and never reach disk, which is strictly better than the Linux temp-file rule rather than a concession to it.
+
+   `mount.cifs` is Linux-only, and a container on Docker Desktop measured **~5× slower** on sustained network transfer than the same host natively (PERFORMANCE.md). A platform-native SMB client is therefore a supported architecture, not a workaround.
+3. **`network_mode: host`** to eliminate NAT overhead and any SMB networking weirdness — **on Linux, where it means what it says.** On Docker Desktop (Windows and macOS) containers run in a VM behind an internal gateway that `--network host` does not escape, so this decision cannot be honoured there. That is the measured reason the native Windows deployment exists.
+
+   **Recommended deployment per platform:** Docker with `network_mode: host` on Linux; the **native binary** on Windows; Docker Desktop for development everywhere.
 4. **Container capabilities:** `SYS_ADMIN` and `DAC_READ_SEARCH` (required for mount.cifs). Document clearly in the README that this is a privileged-ish container and why.
 5. **SQLite** (via `mattn/go-sqlite3` or `modernc.org/sqlite`) for all persistence: targets, job definitions and run history. (The two-way state database is deferred — §14.)
 6. **Frontend: React + Vite SPA**, embedded into the Go binary with `embed.FS` so the container serves everything from one process. WebSocket for live progress.
@@ -97,7 +103,7 @@ Responsibilities:
   - `soft` + `echo_interval` are critical: they make I/O return errors instead of hanging forever when the server disappears.
   - Try `multichannel` when the user enables it per-target; fall back gracefully if the server rejects it.
   - Fall back through `vers=3.1.1 → 3.0 → 2.1` on mount failure, recording which version worked.
-- **Credentials:** stored in SQLite, encrypted at rest with a key derived from an `ENCRYPTION_KEY` env var (fail startup if unset). Pass credentials to mount.cifs via a temp credentials file with 0600 perms (never on the command line — visible in `ps`), deleted immediately after mount.
+- **Credentials:** stored in SQLite, encrypted at rest with a key derived from an `ENCRYPTION_KEY` env var (fail startup if unset). A **native deployment may supply it, and every other setting, from a `.env` file beside the executable** — the compose deployment has an orchestrator to interpolate one and a native install has nothing doing that. Environment variables take precedence over the file, matching `docker compose`; the file is discovered beside the executable only, never relative to the working directory, because a Windows service's working directory is `system32`. Pass credentials to mount.cifs via a temp credentials file with 0600 perms (never on the command line — visible in `ps`), deleted immediately after mount.
 - **Refcounting:** multiple concurrent jobs may use the same target; unmount only when refcount hits zero, with a small idle grace period (e.g., 60s) to avoid mount churn on back-to-back jobs.
 - **Stale mount detection:** before reporting a mount as ready, run a `statfs` with a timeout (do the syscall in a goroutine, select on ctx). If it doesn't respond in ~5s, force `umount -l` (lazy) and remount.
 - **Startup hygiene:** on boot, lazily unmount anything under `/mnt/smb/*` left over from an unclean shutdown.
@@ -139,15 +145,17 @@ Maintained by a central per-run progress tracker, updated by copy workers and pu
 
 - **Per file in flight:** bytes done / total, current MB/s, ETA for that file.
 - **Per destination:** files done / total, bytes done / total, rolling throughput (EWMA over ~15s so ETA doesn't whiplash on mixed file sizes), ETA for that destination.
-- **Total run:** aggregate of all destinations (including not-yet-started ones, estimated using the current rolling throughput), overall ETA, elapsed time.
+- **Total run:** aggregate of all destinations, **including not-yet-started ones**, overall ETA, elapsed time. Destinations that have not been planned are **estimated from the mean of the ones that have**, and that estimate is folded into the reported totals rather than published beside them, so a fan-out run does not count upwards as each destination is planned. **The total is of work, never of scope:** it must describe what is going to be transferred, so a source tree that is already in sync contributes nothing to it. (An earlier implementation used the source scan — files × destinations, fixed when the scan ended — which was stable and wrong by three orders of magnitude on a synced tree; see PROGRESS.md D-130.) `estimated_pending_bytes` reports the estimate separately for callers that want it, and is already included in `bytes_total`, so an ETA must not add it again. A destination that never ran contributes neither work nor a pending share.
 - ETAs are computed from **byte** progress, not file counts (file counts mislead badly with mixed sizes); display both anyway.
 - During the scan phase (before totals are known), report files/dirs discovered per second and mark ETA as "estimating…".
+- **The size of the source tree is reported separately, as `scanned_files` and `scanned_bytes`**, in both the live and the finished shape. It answers a different question from the progress total — how big the job is, rather than how much is moving — and an operator needs it *during* a run to anticipate, not only afterwards. It must never be used as the progress denominator: a tree already in sync is large and has nothing to copy.
 
 ### 6.2 Comparison rules
 
 - Default: **size + mtime** (with a configurable tolerance, default 2 seconds, because SMB/FAT mtime granularity is coarse; also handle the classic DST/whole-hour offset with an optional "ignore ±1 hour" toggle).
 - Optional per-job: **content compare** (streaming hash of both sides). Warn in the UI that this reads every byte over the network.
 - Preserve mtimes on copied files (`os.Chtimes` after copy) — this is essential or every subsequent run re-copies everything.
+- **A destination file another process holds open is skipped, never retried.** Windows fails the final rename with a sharing violation where Linux would replace the file happily; the owning application decides when it releases, so retrying only spends a run's time waiting. The file is reported as an **error** for accounting — it still blocks mirror deletions, because a destination missing a file it was meant to receive must not have removals run against it — but a destination whose **only** problem was locked files is classified `success` and *degraded*, which makes the run `partial`. It is not a failure: a media server holds its project files open for as long as the project is loaded, so a locked file can stay locked for days, and reporting `failed` every run for a condition nobody can clear teaches people to ignore the status until a real failure goes unnoticed too. One genuine error among the locks makes the destination `failed` as usual. The run tally names the count — `3 succeeded, 0 failed, 0 skipped, 3 file(s) locked` — **inside** the tally rather than after it, so the abbreviated forms that keep only the tally still carry it: "incomplete" beside "0 failed, 0 skipped" reports that something is wrong and nothing about what. The file is — named individually in the run log, and **summarised at completion** so an operator sees "3 files were locked by another process" without reading the whole log. The temp file is always removed.
 
 ### 6.3 Copy mechanics (performance-critical)
 
@@ -297,6 +305,16 @@ The token may be sent either as the `?token=` query parameter shown above or as 
 
 Optionally, per job (or globally), the user configures webhook URLs that the backend POSTs to on events: `run_started`, `progress` (throttled to `min_interval_sec`, default 30s), `target_unavailable_prompt`, `run_completed`, `run_failed`. Payload = the same status JSON as the polling endpoint plus an `event` field; sign with HMAC-SHA256 of the body using the webhook's `secret` in an `X-Signature` header. Delivery: 3 attempts with backoff, failures logged to run_events (level=warn), never block or fail the sync itself. This lets the tool notify Home Assistant / n8n / a custom dashboard without polling.
 
+**Wire formats.** A callback declares how its body is shaped, because not every receiver speaks the generic one:
+
+- **`json`** (default) — the §8.1 status payload plus `event`, HMAC-SHA256 signed. For n8n, Home Assistant, anything custom.
+- **`cn4m`** — form-encoded `app`/`message`/`level`, which is what cn4m's `/suite/status` accepts. Unsigned, because that endpoint does not check one.
+- **`discord`** — a JSON `{"content": …}` body carrying one line with an emoji for the outcome, for a Discord webhook URL.
+
+`cn4m` and `discord` are **best-effort**: a delivery failure is not written to `run_events` and never fails a sync, because a suite dashboard or a chat service being unreachable is somebody else's outage rather than a problem with the backup. `json` keeps the warn-level logging, since a custom integration that silently stops arriving is a fault worth seeing.
+
+A `discord` callback should subscribe to `run_completed` and `run_failed` only: `progress` posts a line every `min_interval_sec` for the length of every run, which is noise in a channel people read. `CN4M_CASCADE_DISCORD_WEBHOOK` seeds one on a **fresh** database and never overwrites, exactly as `CN4M_CASCADE_STATUS_URL` does for cn4m — an environment variable sets what a new installation starts with, and after that the row belongs to whoever runs it. **The URL is a credential** and is never logged.
+
 ---
 
 ## 9. Frontend (React SPA)
@@ -425,6 +443,10 @@ Split in two: **5a is scheduling**, **5b is webhooks** (inbound tokens and outbo
 > **Phases 5 and 6 previously had no exit criteria**, while phases 1–4 all did. CLAUDE.md makes a phase complete only when its exit criteria pass in the harness, so the two largest phases were the two that could not be closed. The criteria above were written 2026-09-05, before any Phase 5 code, so they describe what the phase must prove rather than what it happened to do.
 
 **Phase 6 — Packaging and polish.** **The packaging of §10 first**, then log retention/pruning, bandwidth limiting, throughput graph, multichannel toggle, docs. (Preview mode moved to Phase 4 — see the note there. Portable configuration is §8's open item, tracked in PROGRESS.md.)
+
+**Phase 6b — Native Windows deployment.** A single `.exe` that runs without Docker, because Docker Desktop costs ~5× on sustained transfer (PERFORMANCE.md) and `mount.cifs` is Linux-only. Scope: a Windows `mountmgr.Mounter` using `WNetAddConnection2`/`WNetCancelConnection2` and `GetDiskFreeSpaceEx`; platform-appropriate configuration defaults (no `MOUNT_ROOT`, `%ProgramData%` for the database); locked-destination handling per §6.2; optional Windows Service subcommands (`-service install|uninstall|start|stop`) with the foreground process remaining the default; and the packaging and docs to install it. The engine, API, SPA, store, scheduler and filter chain are **unchanged** — §4's boundary is what makes that true, and a change to any of them is a sign the port is leaking.
+
+*Exit criteria: the `.exe` mounts a real SMB share by UNC path and completes a job to it with no `mount.cifs` present; credentials never touch disk and never appear in a log or a process argument; a destination file held open by another process is skipped, reported individually, summarised at completion, and leaves the run `partial` with no temp file behind; `-service install` produces a service that survives a reboot and logs where Windows can see it; a job definition created on the container build still runs on the native build against the same targets; and sustained throughput to a 10GbE destination measurably exceeds the containerised figure on the same host.*
 
 Ordered deliberately: **6a is packaging**, because until it exists there is no way to deploy this at all and everything else is polish on something only a developer can run — and because running the server currently means `exec`ing into the *test* container, which has collided with the suite badly enough to need a Docker daemon restart. **6b is log retention**, the only remaining item with a real failure mode: `run_events` is the largest table in the schema, it grows without bound, and the scheduler now produces runs unattended forever. **6c is bandwidth limiting** (§6.3), which touches the copy hot path and earns its own review. **6d is the throughput graph, the multichannel toggle and docs.**
 

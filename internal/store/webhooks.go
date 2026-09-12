@@ -45,10 +45,18 @@ const (
 	// fault of the sync, and a callback that put a warning on every run of a
 	// machine without cn4m would teach people to ignore run warnings.
 	FormatCN4M = "cn4m"
+	// FormatDiscord posts a one-line message to a Discord webhook.
+	//
+	// Best-effort like cn4m: a chat notification that cannot be delivered must
+	// never fail a sync or fill the run log with warnings about somebody
+	// else's outage.
+	FormatDiscord = "discord"
 )
 
 // BestEffort reports whether delivery failures should stay out of the run log.
-func (w *Webhook) BestEffort() bool { return w.Format == FormatCN4M }
+func (w *Webhook) BestEffort() bool {
+	return w.Format == FormatCN4M || w.Format == FormatDiscord
+}
 
 // KnownEvents is every event a webhook may subscribe to (SPEC.md §8.2).
 var KnownEvents = []string{
@@ -97,9 +105,9 @@ func (w *Webhook) Validate() error {
 		return fmt.Errorf("min_interval_sec must not be negative, got %d", w.MinIntervalSec)
 	}
 	switch w.Format {
-	case FormatJSON, FormatCN4M:
+	case FormatJSON, FormatCN4M, FormatDiscord:
 	default:
-		return fmt.Errorf("format must be %q or %q, got %q", FormatJSON, FormatCN4M, w.Format)
+		return fmt.Errorf("format must be %q, %q or %q, got %q", FormatJSON, FormatCN4M, FormatDiscord, w.Format)
 	}
 	return nil
 }
@@ -282,8 +290,50 @@ func (d *DB) EnsureCN4MWebhook(ctx context.Context, url string) (bool, error) {
 		// Global: every job's status belongs in the suite view, and a
 		// per-job opt-in would mean a job added later silently stops
 		// reporting.
+		JobID: "",
+		// `progress` is included because it is the line the suite view is
+		// actually read for: "Sync in Progress: 65%, 910 MB/s" (D-128). It was
+		// omitted while a progress message said "Syncing <32-hex-id> — 3/5
+		// files", which was noise worth suppressing; that is no longer what it
+		// says. Delivery is throttled per webhook by min_interval_sec, so
+		// subscribing does not mean one callback per second.
+		Events:  []string{"run_started", "progress", "run_completed", "run_failed"},
+		Enabled: true,
+	}
+	if err := d.CreateWebhook(ctx, hook); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// EnsureDiscordWebhook seeds a Discord notification on a fresh database, from
+// CN4M_CASCADE_DISCORD_WEBHOOK.
+//
+// The same contract as EnsureCN4MWebhook, for the same reasons: keyed on the
+// format so a row someone has re-pointed still counts as "there is one", global
+// rather than per-job so a job added later does not silently stop reporting,
+// and it **never overwrites**, so an environment variable cannot undo a change
+// made in the UI.
+//
+// It subscribes to **run_completed and run_failed only**. A chat channel is read
+// by people: `progress` would post a line every interval for the length of every
+// run, and `run_started` doubles the traffic to say something the completion
+// message already implies. The outcome is what somebody wants to see.
+func (d *DB) EnsureDiscordWebhook(ctx context.Context, url string) (bool, error) {
+	var existing int
+	if err := d.sql.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM webhooks WHERE format = ?`, FormatDiscord).Scan(&existing); err != nil {
+		return false, fmt.Errorf("checking for a Discord notification: %w", err)
+	}
+	if existing > 0 {
+		return false, nil
+	}
+
+	hook := &Webhook{
+		URL:     url,
+		Format:  FormatDiscord,
 		JobID:   "",
-		Events:  []string{"run_started", "run_completed", "run_failed"},
+		Events:  []string{"run_completed", "run_failed"},
 		Enabled: true,
 	}
 	if err := d.CreateWebhook(ctx, hook); err != nil {

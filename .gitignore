@@ -33,3 +33,7 @@ go.work.sum
 web/node_modules/
 web/dist/*
 !web/dist/.gitkeep
+
+# Cross-compiled release binaries (make windows-exe). Root-anchored so it
+# cannot also match web/dist, whose .gitkeep is deliberately tracked above.
+/dist/

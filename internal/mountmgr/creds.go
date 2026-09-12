@@ -3,10 +3,7 @@ package mountmgr
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
-
-	"github.com/alokw/cn4m-cascade/internal/store"
 )
 
 // writeCredentialsFile writes a mount.cifs credentials file with 0600
@@ -54,10 +51,4 @@ func writeCredentialsFile(dir, username, password, domain string) (path string, 
 		return "", func() {}, fmt.Errorf("closing the credentials file: %w", err)
 	}
 	return name, cleanup, nil
-}
-
-// mountpointFor is the path a target is mounted at. Target IDs are hex, so
-// this cannot escape the mount root.
-func mountpointFor(mountRoot string, t *store.Target) string {
-	return filepath.Join(mountRoot, t.ID)
 }

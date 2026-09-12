@@ -11,10 +11,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	// The IANA zone database, compiled into the binary.
@@ -52,10 +50,21 @@ func main() {
 		os.Exit(healthcheck())
 	}
 
+	// Service management, before any logging is set up: these are one-shot
+	// administrative commands whose output is for the operator standing at the
+	// prompt, not JSON for a log collector.
+	if cmd, ok := serviceCommand(); ok {
+		if err := runServiceCommand(cmd); err != nil {
+			fmt.Fprintf(os.Stderr, "cn4m-cascade: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
 	slog.SetDefault(log)
 
-	if err := run(log); err != nil {
+	if err := runService(log); err != nil {
 		log.Error("fatal", "error", err)
 		// The message is repeated on stderr: a container that dies at
 		// startup should say why without needing a log viewer.
@@ -93,10 +102,21 @@ func healthcheck() int {
 	return 0
 }
 
-func run(log *slog.Logger) error {
+// run starts everything and blocks until ctx is cancelled.
+//
+// The cancellation source is the caller's, not run's own, because there are two
+// of them: SIGINT/SIGTERM in the foreground, and the Windows service control
+// manager when running as a service (SPEC.md §11, Phase 6b). Owning the signal
+// handler in here would have meant a service that could not be stopped.
+func run(ctx context.Context, log *slog.Logger) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
+	}
+	// Which file, not merely that there was one: the usual confusion with a
+	// discovered config file is editing a different copy from the one being read.
+	if cfg.ConfigPath != "" {
+		log.Info("configuration file loaded", "path", cfg.ConfigPath)
 	}
 
 	box, err := secrets.NewBox(cfg.EncryptionKey)
@@ -107,12 +127,14 @@ func run(log *slog.Logger) error {
 	if err := os.MkdirAll(cfg.DataDir, 0o750); err != nil {
 		return fmt.Errorf("creating the data directory %s: %w", cfg.DataDir, err)
 	}
-	if err := os.MkdirAll(cfg.MountRoot, 0o755); err != nil {
-		return fmt.Errorf("creating the mount root %s: %w", cfg.MountRoot, err)
+	// An empty mount root means the platform mounts nothing — Windows hands
+	// the engine UNC paths directly, so there is no directory to make and
+	// "mkdir \"\"" is the only thing that could go wrong here.
+	if cfg.MountRoot != "" {
+		if err := os.MkdirAll(cfg.MountRoot, 0o755); err != nil {
+			return fmt.Errorf("creating the mount root %s: %w", cfg.MountRoot, err)
+		}
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	db, err := store.Open(ctx, cfg.DBPath())
 	if err != nil {
@@ -131,7 +153,7 @@ func run(log *slog.Logger) error {
 		UnmountTimeout: cfg.UnmountTimeout,
 		IdleGrace:      cfg.IdleGrace,
 		Params:         mountmgr.Params{UID: cfg.MountUID, GID: cfg.MountGID},
-	}, mountmgr.NewExecMounter(), db, decryptPassword(box), healthc, log)
+	}, mountmgr.NewSystemMounter(), db, decryptPassword(box), healthc, log)
 
 	// SPEC.md §5, startup hygiene: clear anything an unclean shutdown left
 	// behind before serving traffic.
@@ -166,6 +188,19 @@ func run(log *slog.Logger) error {
 		log.Warn("could not create the cn4m status callback", "error", err)
 	} else if created {
 		log.Info("created the cn4m status callback", "url", cfg.CN4MStatusURL)
+	}
+
+	// The Discord notification, same contract: created once on a fresh
+	// installation, never overwriting a row someone has since edited. Unset
+	// means none, which is the default.
+	if cfg.DiscordWebhookURL != "" {
+		if created, err := db.EnsureDiscordWebhook(ctx, cfg.DiscordWebhookURL); err != nil {
+			log.Warn("could not create the Discord notification", "error", err)
+		} else if created {
+			// The URL is a credential — anyone holding it can post to the
+			// channel — so it is never logged, only the fact of it.
+			log.Info("created the Discord notification")
+		}
 	}
 
 	notifier := notify.New(db, box.Decrypt, log)

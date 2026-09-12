@@ -35,6 +35,16 @@ var ErrShareUnreachable = errors.New("the share stopped responding")
 // (SPEC.md §12).
 var ErrSourceVanished = errors.New("the file no longer exists at the source")
 
+// ErrDestinationLocked reports that another process holds the destination file
+// open, so the copy could not be committed (SPEC.md §6.2).
+//
+// It is deliberately **not retried**. Only the owning application decides when
+// it releases a file, and it may hold it for the length of an edit; spending a
+// run's retry budget waiting achieves nothing except delaying every file behind
+// it. The run reports the file as an error — the destination genuinely is not in
+// sync — and the next run picks it up.
+var ErrDestinationLocked = errors.New("another process has the destination file open")
+
 // Copy buffer sizing. SPEC.md §6.3 calls for 1–4 MiB explicitly: the default
 // 32 KiB of io.Copy leaves a gigabit link idle between round trips.
 const (
@@ -280,6 +290,13 @@ func (c *Copier) copyOnceBlocking(ctx context.Context, src, dst string, modTime 
 	}
 
 	if err := boundedRename(ctx, c.OpTimeout, tmpPath, dst); err != nil {
+		// The copy itself worked; only the commit failed, and on Windows the
+		// usual cause is that somebody has the destination open. Naming that
+		// specifically is the difference between an operator knowing to close
+		// After Effects and reading "Access is denied".
+		if renameBlockedByLock(err, dst) {
+			return written, fmt.Errorf("%s: %w", dst, ErrDestinationLocked)
+		}
 		return written, err
 	}
 	committed = true
@@ -396,6 +413,10 @@ func retryable(err error) bool {
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return false
 	case errors.Is(err, ErrSourceVanished), errors.Is(err, fs.ErrNotExist):
+		return false
+	case errors.Is(err, ErrDestinationLocked):
+		// Not transient in any useful sense: the file is free when its owner
+		// says so, not after 15 seconds.
 		return false
 	case errors.Is(err, fs.ErrPermission):
 		return false

@@ -275,11 +275,14 @@ function CallbackList({
         >
           <option value="json">JSON, signed (n8n, Home Assistant, anything custom)</option>
           <option value="cn4m">cn4m status update</option>
+          <option value="discord">Discord message</option>
         </select>
         <span className="hint">
           {draft.format === 'cn4m'
             ? 'Form-encoded app/message/level, which is what cn4m’s /suite/status accepts — not JSON. No signature: that endpoint does not check one. Failures are silent, because a cn4m that is not running is a normal state rather than a problem with your sync.'
-            : 'A JSON body with the same fields the status endpoint returns, plus an event name.'}
+            : draft.format === 'discord'
+              ? 'A one-line chat message to a Discord webhook URL, with an emoji for the outcome. Subscribe it to run_completed and run_failed only — progress would post a line every interval, for the length of every run. Failures are silent, like cn4m: a chat notification that cannot be delivered is not a problem with your sync.'
+              : 'A JSON body with the same fields the status endpoint returns, plus an event name.'}
         </span>
       </label>
 

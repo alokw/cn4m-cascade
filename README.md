@@ -22,6 +22,25 @@ production packaging** — so this is deployable: `make image && make run`, then
 
 Tested at 100,000 files.
 
+> ### ⚠️ Where you deploy this decides its speed
+>
+> **A container on Docker Desktop moved 145 MB/s where the host moved 771 MB/s to the same NAS over
+> the same 10GbE link.** Containers there run inside a VM behind an internal gateway, and even
+> `--network host` does not escape it — so SPEC.md §3.3's `network_mode: host`, which exists "to
+> eliminate NAT overhead", cannot do its job on Docker Desktop for Windows or macOS.
+>
+> **For throughput-sensitive syncing, deploy on native Linux with `network_mode: host`**, or run
+> the binary directly on the host. Docker Desktop is fine for development and for small or
+> latency-tolerant jobs; it costs roughly 5× on sustained transfers.
+>
+> **On Windows there is now a native build** (SPEC.md §11, Phase 6b): a single `.exe`, no Docker, no
+> `mount.cifs` — it authenticates UNC paths through the Windows network redirector instead. Measured
+> at **~434 MB/s against 145 MB/s** for the same job in a container on the same host. Credentials
+> never touch disk on that path.
+>
+> Full measurements, the diagnosis, and how to run the native build are in
+> **[PERFORMANCE.md](PERFORMANCE.md)**.
+
 ## Sync modes
 
 | Mode | What it does |
@@ -143,9 +162,19 @@ docker compose -f docker-compose.yml up -d --build
 first visit creates one, and first-run setup then closes.
 
 **4. Add a target** and press **Save and test**. For a NAS, that is the host, share and credentials.
-For a folder on this machine, the path is **`/mnt/local`** — the container sees the host folder
-`docker-compose.yml` maps there (`%USERPROFILE%\cn4m` or `~/cn4m` by default), never the host path
-itself. See [Adding another local folder](#adding-another-local-folder) for a second one.
+
+> **Local folders in Docker are `/mnt/local`, and this is the one thing that trips people up.** A
+> container can only see what is mapped into it, so the path you type is the path *inside* the
+> container — never the path on your own machine. `/mnt/local` is the folder `docker-compose.yml`
+> maps there, `%USERPROFILE%\cn4m` or `~/cn4m` by default, and subfolders like
+> `/mnt/local/photos` work. `/Users/you/cn4m` means nothing to the container even though it exists on
+> your machine.
+>
+> **This applies to Docker only.** Run the binary natively and there is no container and no mapping:
+> a local target is just a real path, `M:\projects\repo` or `/srv/media`. See
+> [Quickstart (native Windows)](#quickstart-native-windows).
+>
+> To map a second folder, see [Adding another local folder](#adding-another-local-folder-docker).
 
 **Then:**
 
@@ -161,6 +190,98 @@ backup rule there is the part that bites.
 
 **Back up `./data` and your `ENCRYPTION_KEY` together.** The database holds encrypted credentials
 and the key decrypts them; either alone is useless and there is no recovery from losing the key.
+
+## Quickstart (native Windows)
+
+No Docker, no `mount.cifs` — one `.exe`. This is the **recommended way to run it on Windows**, because
+a container there costs roughly 5× on sustained transfer ([PERFORMANCE.md](PERFORMANCE.md)).
+
+**1. Build it** (or use a release binary):
+
+```bash
+make windows-exe          # cross-compiles into ./dist from the dev container
+```
+
+**2. Configure it.** The binary reads a **`.env` file sitting beside the executable** — the same
+format as the compose deployment, so there is only one configuration language to know:
+
+```powershell
+copy dist\.env.example dist\.env
+notepad dist\.env
+```
+
+Set `ENCRYPTION_KEY` to a long random value. Generate one with:
+
+```powershell
+$b = New-Object byte[] 32
+[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
+[Convert]::ToBase64String($b)
+```
+
+A minimal `dist\.env`:
+
+```ini
+ENCRYPTION_KEY=<paste the value>
+CN4M_CASCADE_STATUS_URL=off      # omit if this install reports to a cn4m suite
+```
+
+Everything else has a working default. **Environment variables override the file**, the same
+precedence `docker compose` gives its `.env`, so `$env:LOG_LEVEL="debug"; .\cn4m-cascade.exe` works
+for a one-off without editing anything.
+
+Notepad's defaults are fine — a UTF-8 byte-order mark and CRLF line endings are both handled.
+
+> ⚠️ **The key must stay the same forever.** It decrypts the stored target passwords. Change it and
+> every SMB target goes unhealthy until you re-enter its password; there is no recovery. **Back up
+> `.env` together with your database.**
+
+Prefer environment variables to a file? `setx ENCRYPTION_KEY "<value>"` works too — then open a new
+PowerShell, since `setx` does not affect the current session.
+
+**3. Run it:**
+
+```powershell
+.\dist\cn4m-cascade.exe
+```
+
+It logs which configuration file it read, so there is no doubt about which copy is in effect:
+
+```json
+{"level":"INFO","msg":"configuration file loaded","path":"...\dist\.env"}
+```
+
+**4. Open <http://localhost:2649>**, set an admin password, and add a target. For a NAS that is the
+host, share and credentials. For a folder on this machine it is an ordinary Windows path —
+`M:\projects\repo`, not `/mnt/local`; there is no container to map anything into.
+
+To have it start at boot instead, see **Running it as a service** in
+[PERFORMANCE.md](PERFORMANCE.md#running-it-as-a-service). The service reads the same `.env`.
+
+### Configuration
+
+Everything is an environment variable. Only the first is required.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `ENCRYPTION_KEY` | *(none — refuses to start)* | At least 16 characters. Never changes. Back it up. |
+| `CN4M_CASCADE_CONFIG` | *(none)* | An explicit config file path, instead of the `.env` beside the executable. A path that cannot be read is an error, not a warning. |
+| `DATA_DIR` | `%ProgramData%\cn4m-cascade` | Holds the SQLite database. Works without elevation, and a service and an interactive operator see the same one. |
+| `LISTEN_ADDR` | `:2649` | `127.0.0.1:2649` binds to loopback only. |
+| `CN4M_CASCADE_ADMIN_PASSWORD` | *(none)* | Sets the admin password on a fresh database instead of doing it in the browser. |
+| `CN4M_CASCADE_STATUS_URL` | cn4m on `localhost:2640` | `off` if this install is not part of a cn4m suite. |
+| `TZ` | the machine's zone | Cron schedules are read in this zone. |
+| `LOG_LEVEL` | `info` | `debug` for more. |
+
+`MOUNT_ROOT`, `MOUNT_UID` and `MOUNT_GID` are Linux-only and ignored: Windows mounts nothing, it
+authenticates UNC paths directly.
+
+Any of these may go in the `.env` file or the environment. The file is looked for **beside the
+executable only** — not the working directory, because a Windows service runs with its working
+directory in `system32` and a cwd-relative search would find nothing in the deployment that needs a
+config file most.
+
+**Back up `DATA_DIR` and `ENCRYPTION_KEY` together.** The database holds encrypted credentials and the
+key decrypts them; either alone is useless and there is no recovery from losing the key.
 
 ## Quickstart (development harness)
 
@@ -232,18 +353,21 @@ Windows-specific in the code; what follows is the environment.
   has touched. Fix a stale checkout with `git add --renormalize . && git checkout -- .` — commit or
   stash first, because that second command overwrites the worktree. Neither symptom points at line
   endings, and neither can happen on macOS or Linux.
-- **Paths in `.env` use forward slashes**: `CN4M_CASCADE_LOCAL_DIR=C:/Users/you/cn4m`. Docker Desktop
-  accepts them; backslashes are mangled by compose interpolation.
-- The default local folder is `%USERPROFILE%\cn4m`, created for you, and it appears inside the
-  container as `/mnt/local` — that is the path to type into the UI, on every platform. To sync a
-  folder somewhere else (another drive, a media volume), see **Adding another local folder** below.
+- **In Docker, paths in `.env` use forward slashes**: `CN4M_CASCADE_LOCAL_DIR=C:/Users/you/cn4m`.
+  Docker Desktop accepts them; backslashes are mangled by compose interpolation. The folder appears
+  inside the container as `/mnt/local`, which is what you type into the UI there — see **Adding
+  another local folder (Docker)** below. **None of this applies to the native build**, which takes
+  ordinary Windows paths like `M:\projects\repo`.
 - `make` is not standard on Windows. Use Git Bash or WSL, or run the underlying commands directly:
   `docker build -t cn4m-cascade:latest .` and `docker compose -f docker-compose.yml up -d`.
 - **A LAN NAS is reached through WSL2 NAT**, a layer Docker Desktop on a Mac does not have. A
   `mount error(113)` or a hang on an address that answers fine from PowerShell is a networking
   problem, not a CIFS one.
 
-## Adding another local folder
+## Adding another local folder (Docker)
+
+**Docker only.** A native install needs none of this: with no container there is nothing to map, and a
+local target is given a real path directly.
 
 The container sees exactly the host folders `docker-compose.yml` maps into it. `/mnt/local` is set up
 for you; anything else needs a bind mount, and the path you type into the UI is the path *inside* the
@@ -318,6 +442,51 @@ To check what is still running:
 ```bash
 docker compose -f docker-compose.test.yml ps
 ```
+
+## Notifications
+
+A job can push its status to outbound webhooks (SPEC.md §8.2), configured per job or globally in the
+**Webhooks & API** tab. Three wire formats:
+
+| Format | For | Signed | On failure |
+|---|---|---|---|
+| `json` | n8n, Home Assistant, anything custom | HMAC-SHA256 | logged at warn |
+| `cn4m` | the cn4m suite status view | no | silent |
+| `discord` | a Discord channel | no | silent |
+
+`cn4m` and `discord` are **best-effort on purpose**: a suite dashboard or a chat service being
+unreachable is somebody else's outage, not a fault in your backup, so a failed delivery never appears
+in the run log and never fails a sync. `json` keeps its warn-level logging, because a custom
+integration that quietly stops arriving *is* worth seeing.
+
+### Discord
+
+Create a webhook in Discord (**Server Settings → Integrations → Webhooks**) and either paste its URL
+into the Webhooks & API tab with format **Discord**, or set it in your `.env` to have it created
+automatically on a fresh database:
+
+```ini
+CN4M_CASCADE_DISCORD_WEBHOOK=https://discord.com/api/webhooks/<id>/<token>
+```
+
+You get one line per finished run:
+
+```
+🔄 ✅ Sync complete — 6 succeeded, 0 failed, 1 skipped
+🔄 ⚠️ Sync incomplete — 1 succeeded, 0 failed, 1 skipped
+🔄 ❌ Sync failed — 0 succeeded, 1 failed, 0 skipped
+```
+
+Deliberately just the tally. The destination id, the paths and the full error stay in the run log —
+a chat line is read at a glance, and the message is there to tell you to go and look.
+
+Subscribe it to **`run_completed` and `run_failed` only**. `progress` posts a line every
+`min_interval_sec` for the length of every run, which is noise in a channel people read.
+
+> **The webhook URL is a credential.** Anyone holding it can post to that channel. Keep it in `.env`,
+> which is gitignored; it is stored encrypted like any other webhook secret and is never written to a
+> log. The environment variable seeds a **fresh** database only and never overwrites, so editing the
+> row in the UI is permanent.
 
 ## Poking at the API by hand
 
@@ -461,10 +630,14 @@ Two things to know about the hold:
 The preview gate is the one thing that holds an entire run. An unreachable destination under
 `prompt` does not — see below.
 
-## Syncing a folder from your own machine
+## Syncing a folder from your own machine (Docker)
 
-The server runs in a container, so it can only read paths that exist *inside* it. One folder on your
-machine is shared in by default:
+**Docker only.** Running natively there is nothing to share: the server reads the machine's own
+filesystem, so a local target takes an ordinary path — `M:\projects\repo`, `/srv/media` — and none
+of the mapping below applies.
+
+In a container the server can only read paths that exist *inside* it. One folder on your machine is
+shared in by default:
 
 | Your machine | Inside the container |
 |---|---|

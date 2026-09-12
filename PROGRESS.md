@@ -1002,6 +1002,14 @@ D-1…D-13 were approved 2026-08-31 before implementation; D-14…D-17 came out 
 | D-127 | **A JSON filter key gains a `*` wildcard segment and accepts several keys, one per line** | Requested 2026-09-09. A catalogue keyed by content hashes (`{"tracked_repo_assets": {"<hash>": {"name": …}}}`) was unaddressable: the key had to be a literal dot-path onto something that was already a list of strings, so the only working key named one hash and returned one file. `*` fans out over an object's values or an array's elements, in **sorted key order** — Go randomises map iteration, and an unstable pattern order would make the run log and the rule's pattern count differ between two identical runs. Multiple keys are unioned and de-duplicated; this is convenience rather than capability, since includes are OR'd and one rule per key already worked, but it configures the file path, `on_error` and the run-log counter once instead of per key. **Strictness is split, which is the part to remember:** a key with no `*` stays an *assertion* and keeps every existing error, so a typo in `backup.exclude` still fails loudly; a key with `*` is a *query* and skips children that lack the path, skips non-string values, and may match nothing. The user chose the lenient reading knowingly after the silent-empty-include risk was raised; it is mitigated already, because the runner reports a rule that resolves to no patterns as a run event (warn, or error for a global rule). A wildcard makes the whole of *that key* lenient — mixing the two readings inside one key would be a rule nobody could hold in their head. *Limitation:* an object key literally named `*` is no longer selectable, documented in SPEC.md §6.5 rather than given an escape |
 | D-128 | **cn4m status lines carry no job identifier; progress reports percentage and speed** | Requested 2026-09-09: the suite view read `Started 9fc012f2ac2524cc9bf41333e51cfc6b`. The cause was not a formatting choice but a **missing field** — `cn4mMessage` prints `payload["job"]` and falls back to `job_id`, and nothing ever set `job`, because the §8.1 status payload carries `job_id` and no job *name*. Rather than add a field to a SPEC-defined shape that outside software consumes, the identifier was dropped from the message entirely: cn4m renders one row per app, and a 32-character hex string was the least useful thing that row could hold. Progress is now `Sync in Progress: 65%, 910 MB/s`. Percentage prefers **bytes over files** (a run whose remaining files are the large ones is not as far along as a file count suggests) and is **clamped to 0–100**, because totals are revised while the scan is still running and `104%` reads as a bug in the sync. Both parts are **omitted rather than guessed**: an early event with no total would otherwise print `0%` for a sync that is working, and a momentary stall would print `0 B/s`. **Consequence to accept:** two jobs running at once are indistinguishable in the suite view. That is the shape cn4m already had — one row per app, not per job — and the previous hex string did not really help; adding the job *name* to the payload is the fix if it ever matters |
 | D-129 | **The cn4m catalogue filter is offered as a one-click fill, not pre-filled into every rule** | Requested 2026-09-09, where the ask was "pre-fill, or at least examples". Both are provided: the file and key hints name the cn4m values, and a **Fill these in** button sets `/mnt/local/assets.json` plus the two wildcard keys in one click. Not pre-filled into every new rule, because a rule added for something else would arrive carrying a path to an unrelated file — and a wrong value already sitting in the box is easier to miss than an empty one. `RuleFileField` gained a `placeholder` prop so a JSON rule can suggest a catalogue path while a list-file rule still suggests an excludes list |
+| D-130 | **The fan-out run total is the *work*, with unplanned destinations estimated from the mean of the planned ones** | Reported 2026-09-10: one file to seven destinations counted `3/5`, then `6/7`, then `7/7`, because the aggregate summed only *planned* destinations and they are planned one at a time. §6.1.1 already required the total to cover not-yet-started destinations and the code applied that only to the ETA. **The first fix was wrong and shipped:** it took the total from the source scan — files × destinations, fixed when the scan ended — which is stable, and describes *scope* rather than *work*. Reported back 2026-09-11 as "multiple terabytes for a few 100mb files", and reproduced exactly: a 500 GB tree already in sync reported **3.5 TB** against **700 MB** of real copying, a 5,000× overstatement. The denominator of a progress bar is what will be transferred. It is now the sum of planned work plus `mean(planned) × pending`, folded into `bytes_total` — stable from the first plan, and accurate. `estimated_pending_bytes` stays exposed but is **inside** `bytes_total`, so the ETA no longer adds it twice. Verified live: a mostly-synced tree with one 300 MB file to 3 destinations reports **900 MB**, where the previous code would have said 3,600 MB |
+| D-137 | **A destination whose only failures are locked files is `success`+degraded — the run is `partial`, and the tally says how many were locked** | Reported 2026-09-11 from a real fan-out: seven d3 media servers, the same clip failing on all seven, every run `failed`. **The detection was correct** — checked directly against the share: the destination file exists, differs from the source, and an exclusive open is refused. Media servers hold project media open for as long as the project is loaded, so that file can stay locked for days. The *policy* was the error. `failed` on a condition nobody can clear puts a red ❌ in the channel on every run, which is how a status gets ignored and a genuine failure with it. Now degraded ⇒ `partial` ⇒ ⚠️, and the user's requirement — "don't want to forget about anything that might be locked" — is met by flagging it **every run** rather than by escalating the severity. **The tally carries the count**, `3 succeeded, 0 failed, 0 skipped, 3 file(s) locked`, placed *inside* the tally rather than after the em dash so the short forms that keep only the tally — Discord, cn4m — still carry it; "incomplete" beside "0 failed, 0 skipped" said something was wrong and nothing about what. Locked files stay in `result.Failures` because `ExecResult.Failed` gates the mirror deletion guard, and a destination missing a file must never have removals run against it; `TestLockedFilesStillBlockDeletions` pins that half. **Worth remembering:** the user's original instruction was "skip locked files", and overriding it on reasoning about status was the mistake — they later offered to take the blame for "bad information" they had not given |
+| D-134 | **`files_total`/`bytes_total` mean the transfer in every state; the source tree is `scanned_*`** | The last piece of D-130/D-133. A finished run took its totals from the run row's scan columns, so the number **switched meaning** the moment a run ended — the transfer while running, the size of the source tree afterwards, and a job that copied 5 MB out of a 1 GB tree reported 1 GB once it finished. The finished payload now sums the per-destination rows, which already hold the real work. The tree is still reported, as `scanned_files`/`scanned_bytes`, in both states. Chosen over the alternative — making both report the scan — because a progress bar and an ETA are about what is moving, and the user asked for "an accurate-ish representation of how many files and how much time" |
+| D-135 | **Discord is a webhook *format*, not a second notification system** | Requested 2026-09-11. It reuses the existing delivery, retries, circuit breaker, throttling, event subscriptions and UI, and cost one `bodyFor` branch plus a message renderer — a bespoke notifier would have duplicated every one of those and drifted from them. **Best-effort like cn4m**: a chat service being unreachable is somebody else's outage, not a fault in the backup, so a failed delivery never writes a `run_event` and never fails a sync. Seeded from `CN4M_CASCADE_DISCORD_WEBHOOK` on a **fresh** database only, never overwriting, exactly as `CN4M_CASCADE_STATUS_URL` does — and the URL **is a credential**, so it is never logged, only the fact that a row was created. Subscribed to `run_completed` and `run_failed` alone: `progress` would post a line every interval for the length of every run, which is noise in a channel people read |
+| D-136 | **A chat line carries the tally and nothing after it** | The first Discord failure message was 319 characters: the tally, then a 32-character destination id, then the same path twice, then a mid-word truncation. The runner joins its tally to the detail with an em dash, so everything before that separator is the scannable half and the rest belongs in the run log. **The bug worth remembering is which branch:** a failed run emits `run_failed`, not `run_completed`, and the first fix only trimmed the completion path — the live test still showed the wall of text. Now 55 characters. `TestDiscordDropsIdentifiersAndPathsFromFailures` asserts both events, no hex id, no path, and a length cap, because this is the third time (D-128, §7i) an identifier has crept into a line meant for a person |
+| D-133 | **The source scan size is reported alongside the progress total, never as it** | Requested 2026-09-11 — "we want the full scan size so we can anticipate accordingly" — after D-130's second fix made the totals describe work. Both numbers are wanted and they answer different questions: `bytes_total` is what will move, `scanned_bytes` is how big the tree is. Until now the scan size appeared only once a run had *finished*, which is the wrong time to anticipate anything, so `scanned_files`/`scanned_bytes` are now in the live snapshot and in the status payload in both states. Kept strictly out of the denominator, and `TestScanSizeIsReportedButIsNotTheDenominator` asserts both halves in one test so the distinction cannot erode quietly — letting the second become the first is precisely what D-130 got wrong |
+| D-132 | **A Windows target with no password uses the session the machine already has, instead of forcing its own** | Reported 2026-09-11: a Guest target failed with `ERROR_SESSION_CREDENTIAL_CONFLICT` — "multiple connections to a server by the same user, using more than one user name, are not allowed" — on a share the operator could open in Explorer perfectly well. That *is* the cause: **Windows permits one session per server per logon session**, and Explorer already had one. `mount.cifs` has no equivalent limit (and `nosharesock` gives every mount its own), so the whole failure mode is new to the native build. Note `IsGuest()` tests for an *empty* username, and the target's username was the literal string `Guest`, so it took the credentialed path. The connector now checks whether the UNC root is already reachable **when no password is configured** and, if so, uses the existing session rather than calling `WNetAddConnection2` at all. A target **with** a password never takes that path: those credentials were chosen deliberately, so they are used or the mount fails loudly — silently borrowing another session would read and write as the wrong identity. A conflict that does occur now names the remedy (`net use <share> /delete`), because nothing about the target is wrong and it is not guessable |
+| D-131 | **The seeded cn4m callback subscribes to `progress`** | The user reported the suite line never showing the new percentage. It was not a stale build — the running binary had it — but the seeded webhook's `events_json` was `[run_started, run_completed, run_failed]`, so progress was filtered out before delivery. That default was written when a progress message read `Syncing <32-hex-id> — 3/5 files`, which was fair to suppress; it now reads `Sync in Progress: 65%, 910 MB/s` (D-128), which is the line the suite view exists for. Only new databases are seeded, so **existing installs must tick it themselves**, and should also lower `min_interval_sec` from its 30s default — progress is throttled per webhook per run, and a sync shorter than the interval emits none |
 | D-119 | **A blackholed destination's iptables rule is removed by a process forked before the wedge, not by retrying afterwards** | The removal needs a fork; fork is blocked by CIFS threads in uninterruptible sleep; those threads are stuck because the rule is installed. That is a deadlock, and two fixes failed on it before the shape was understood — a 90s retry loop (which cannot succeed, and whose cost then pushed the whole suite past `go test -timeout`, losing every result rather than one test's). The escape is now forked at *install* time into a process with no CIFS threads, gated on a marker file so it is a fallback rather than a second remover. Recorded because the general lesson is not about iptables: **when a cleanup depends on the resource it is cleaning up, retrying is not a strategy** — the escape has to be prepared while the resource still works |
 | D-116 | **App-specific environment variables are prefixed `CN4M_CASCADE_`, not `CN4M_`** | Requested 2026-09-09: cn4m is a *different program*, so `CN4M_ADMIN_PASSWORD` reads like configuration for it rather than for this. `ENCRYPTION_KEY`, `DATA_DIR`, `LISTEN_ADDR`, `MOUNT_ROOT` and `TZ` stay unprefixed — they are generic, and they are what SPEC.md §10 already documented. Done now because packaging is the last cheap moment: once a container is deployed, "assume all installations are fresh" stops being true |
 | D-117 | **The production image is alpine, decided by measurement rather than by the argument in the plan** | The plan chose `debian:bookworm-slim` for CIFS parity with the dev container. Debian measured 158 MB, with the slim base alone at 97.2 MB on arm64 — so §10's "well under 100 MB" was unreachable with it. The parity argument was also weak: the binary is static Go, so musl versus glibc cannot reach it, and CIFS behaviour is the kernel's. Rather than assert either way, `make verify-image` mounts, lists, writes and unmounts a real share **from the shipping image**; it passes. 25 MB. The zone database is embedded via `time/tzdata` instead of a system package, which is both smaller and immune to a base image without zoneinfo silently making every cron schedule UTC |
@@ -1895,6 +1903,217 @@ integration test asserts the guarantee (ends cleanly within 90s) and logs the ti
 asserting it. Only `echo_interval=1` reliably lands under 30s, at the cost of the kernel being
 quickest to declare a merely slow server dead; it stays available as a per-target
 `mount_opts_override` for anyone who wants it.
+
+## 7m. Native Windows: the port that was mostly already done (2026-09-10)
+
+Phase 6b (SPEC.md §11). Approved after PERFORMANCE.md showed Docker Desktop costing ~5x, with
+CLAUDE.md's §3 rule amended to allow a platform-native SMB client for a **non-container** deployment
+only — scoped so the substitute still implements `mountmgr.Mounter` and still hands the engine an
+ordinary path, keeping SPEC.md §4's boundary intact.
+
+**The port was 90% free, and the reason is a design decision made long before it.** `GOOS=windows go
+build ./...` already succeeded before a line was written: CGO off, pure-Go SQLite, the SPA in
+`embed.FS`, `filepath.Join` everywhere, canonical `/`-separated relpaths, and — the load-bearing one —
+`Mounter` as an interface with exactly **two** `exec.Command` call sites in the whole codebase, both
+inside `ExecMounter`. A 13 MB `.exe` served the SPA and ran the scheduler on the first try. The only
+complaint was `reading the kernel mount table: open /proc/self/mountinfo`.
+
+### What was actually built
+| Piece | Why |
+|---|---|
+| `connector_windows.go` | `WNetAddConnection2` / `WNetCancelConnection2` / `GetDiskFreeSpaceEx`. Windows mounts nothing, so `Dir` **is** the UNC root and `Mounts()` correctly returns empty |
+| `MountSpec.Username/Password/Domain` + `FileCredentialer` | Windows takes credentials in memory. The manager now writes the 0600 file **only** for a Mounter that says it needs one — so on Windows credentials never reach disk at all. `MountSpec.String()` redacts, defensively |
+| `mountpoint_{unix,windows}.go` | `mountpointFor` returns a mountpoint on Linux and the UNC root on Windows; `prepareMountpoint` is a no-op there |
+| `defaults_{unix,windows}.go` | `%ProgramData%\cn4m-cascade`; `MountRoot` empty, because nothing is mounted |
+| `locked_{unix,windows}.go` | The locked-destination rule of SPEC.md §6.2 |
+
+### Three bugs only running it could find
+1. **`mkdir ""` at startup.** `MountRoot` is empty on Windows and main.go created it unconditionally. Fatal on the first native run.
+2. **`path.IsAbs` rejected every Windows path.** Target validation refused `M:\extra26\test-src` as "not an absolute path inside the container" — twice wrong, since there is no container either. Now `filepath.IsAbs`.
+3. **The lock detection did not detect the lock.** This is the instructive one. Renaming over a file held with `FILE_SHARE_NONE` on an SMB share fails with plain **`ERROR_ACCESS_DENIED`**, not `ERROR_SHARING_VIOLATION` — the redirector reports the refusal, not its cause. The first implementation checked only the unambiguous codes and sailed straight past it. Treating every `ACCESS_DENIED` as a lock would have been worse than the bug: a read-only destination would then send an operator hunting for an application that is not there. So it is **disambiguated by probing** — open the destination for `DELETE` with full sharing; `ERROR_SHARING_VIOLATION` from that is the positive answer. Bounded, and a probe that cannot finish reports "not locked" so the original error survives.
+
+**All three were invisible to the build and to the unit tests.** `GOOS=windows go build`, `go vet` and the whole suite passed while every one of them was live. Cross-compiling proves a program links, not that it runs.
+
+### Verified on the real network, natively
+| Criterion (§11 Phase 6b) | Result |
+|---|---|
+| Mounts a real share, no mount.cifs | ✅ `\\10.10.20.42\local_projects`, SMB **3.1.1**, 4 TB capacity, listing in **23 ms** |
+| Completes a job to it | ✅ 1 GiB copied, `success`, mtime preserved |
+| Beats the containerised figure | ✅ **~434 MB/s** against **145 MB/s** in Docker on the same host — **3x** |
+| Locked destination skipped and reported | ✅ named individually, summarised at completion, not retried, no temp file left |
+| Credentials never on disk | ✅ no credentials file is written on Windows at all |
+
+### The service wrapper (built after the above, same session)
+
+`-service install|uninstall|start|stop`, with the foreground process still the default. Detected, not
+configured: `svc.IsWindowsService()` decides, so there is no flag anyone has to remember — and the
+failure that avoids is specific, a service that starts, decides it is interactive, and gets killed by
+the SCM for never reporting Running.
+
+Two decisions worth keeping:
+
+- **`run()` no longer owns its signal handler.** It takes a `ctx` now, because there are two
+  cancellation sources: SIGINT/SIGTERM in the foreground and the SCM when running as a service. The
+  service path translates Stop and Shutdown into cancelling that same context, so shutdown is the
+  *identical* graceful path the container's SIGTERM takes rather than a second implementation of it.
+- **The SCM is told to expect 45 seconds.** SPEC.md §10 budgets 30 for graceful shutdown because
+  lazily detaching a dead share is the slow case, and Windows kills a service that overruns its
+  wait hint — which would mean being killed in exactly the situation the budget exists for.
+
+**Install validates before it acts.** A service reads the *machine* environment, not the environment
+of the prompt that installed it, so `-service install` reads `ENCRYPTION_KEY` from the registry and
+refuses with the exact `setx /M` line if it is missing. Ordering matters here and was fixed after
+seeing it wrong: the subcommand name and that check now run **before** connecting to the service
+manager, because an operator who mistyped `install` was previously told "Access is denied" about a
+manager they were never going to reach.
+
+**Verified unelevated:** unknown subcommand, missing machine key (with the remedy printed), and the
+foreground process still answering `/healthz` with the service code in place. **Not verified:** the
+install / start / stop / uninstall round trip against a live SCM, which needs an elevated prompt. The
+commands are in PERFORMANCE.md for the operator to run.
+
+### A config file, because there was no orchestrator to interpolate one
+
+Asked for after testing the binary: the container gets its settings from `docker compose`
+interpolating `.env`, and a native install had **nothing** doing that — the binary read only
+environment variables, so every setting was a `setx` away and nothing survived a shell closing.
+
+The binary now reads a **`.env` beside the executable**, same format as the compose file so there is
+one configuration language rather than two. Four decisions:
+
+- **The environment wins over the file**, matching compose. The reverse would make an exported
+  variable silently ineffective, which is the worst kind of configuration bug to debug.
+- **Beside the executable, never the working directory.** A Windows service runs with its cwd in
+  `system32`, so a cwd-relative search would find nothing in the deployment that needs a config file
+  most — and would otherwise behave differently depending on where someone was standing.
+- **A BOM and CRLF are both stripped.** Notepad writes both by default. Without the first, the leading
+  key becomes U+FEFF + `ENCRYPTION_KEY` and the program reports it unset over a file that plainly sets
+  it; without the second, a carriage return joins the key material and nothing decrypts. Verified by
+  writing the file exactly as Notepad would and starting the binary against it.
+- **The path it loaded is logged.** The usual confusion with a discovered config file is editing a
+  different copy from the one being read.
+
+**It also corrected the service check written an hour earlier.** `-service install` demanded a
+*machine-level* `ENCRYPTION_KEY`, which was right when the environment was the only source and wrong
+the moment a `.env` beside the binary could serve the service equally well. It now accepts either and
+names both if neither is present — a check that fails on a working deployment is worse than no check.
+
+`make windows-exe` cross-compiles the binary into `./dist` (root-anchored in `.gitignore`, so it
+cannot collide with `web/dist` whose `.gitkeep` is tracked).
+
+---
+
+## 7l. Docker Desktop's network layer is the ceiling — and the first two diagnoses were wrong (2026-09-10)
+
+Benchmarked at the user's request with a 1 GiB file, source `//10.10.20.10/extra26` (an SMB share on
+the *same* Windows machine), destination `//10.10.20.42/local_projects` over 10GbE. Full write-up in
+**PERFORMANCE.md**; this is the reasoning trail, because two hypotheses died on the way.
+
+| Path | NAT | mirrored |
+|---|---|---|
+| Container → NAS, write | 125-128 MB/s | 145-149 MB/s |
+| Container ← NAS, read | 43 MB/s | 49 MB/s |
+| Container ← this machine over SMB | 42 MB/s | 38 MB/s |
+| Container ← bind mount (9p) | 290-312 MB/s | — |
+| **Host → NAS, no container** | **771 MB/s** | — |
+
+**Wrong hypothesis #1: "SMB from the local machine will beat the bind mount."** Predicted from the
+mechanism — it skips the 9p layer — and wrong by 7×, because it crosses a network boundary the bind
+mount does not.
+
+**Wrong hypothesis #2: "the container is on a 1 Gb path; WSL2 NAT is the ceiling."** The evidence
+looked strong: parallel writes produced *exactly* 128 MiB/s at 1, 2, 4 and 7 streams, and
+128 MiB/s × 8 = 1.07 Gbit/s. A flat aggregate is a saturated link, and the arithmetic landed on a
+suspiciously round number. **The number was a coincidence.** Switching WSL2 to
+`networkingMode=mirrored` gained about **14%**, not the 6× the theory predicted — and the aggregate
+stayed flat across stream counts, which was the actual finding all along.
+
+**What it really is.** Mirrored mode does work: the VM holds `eth1: 10.10.20.10/24 mtu 8986`, the
+host's own 10GbE interface with jumbo frames. But a container run with `--network host` — which
+should put it on that stack — still reports `eth0: 192.168.65.3/24 mtu 1500` and routes to the NAS
+`via 192.168.65.1`. **Every container packet crosses Docker Desktop's internal gateway on a 1500-byte
+MTU**, one layer above the interface that would carry it at line rate. That gateway is shared, which
+is exactly why adding streams adds nothing.
+
+Escaping it means running the engine where the network is native — Docker inside a WSL2 distribution
+rather than Docker Desktop, or on the host outside a container. Neither is a code change.
+
+**Mirrored networking was applied, measured, and then reverted at the user's request** (2026-09-10)
+for compatibility and ease of deployment: 14% did not justify changing the networking semantics of a
+host running ten other containers. Nothing broke while it was enabled — cascade healthy,
+`host.docker.internal:2640` reachable so the cn4m callback worked, suite ports answering — and the
+same was re-verified after reverting, so this was a preference rather than a repair. **4 of 11
+containers came back on their own** after each `wsl --shutdown`; the 7 with restart policy `no` had to
+be started by hand, both times.
+
+**The conclusion that outlived the experiment: do not deploy this on Docker Desktop when throughput
+matters.** SPEC.md §3.3 decision 3 already specifies `network_mode: host` "to eliminate NAT
+overhead", and Docker Desktop is precisely where that remedy cannot apply — containers sit in a VM
+behind an internal gateway that `--network host` does not escape. Native Linux with host networking
+has no such layer. PERFORMANCE.md and the README now carry this at the top; the distinction matters,
+because "avoid Docker" would be wrong advice for the Linux deployment SPEC actually describes.
+
+**The method note worth keeping.** The settings sweep the user asked for — workers, parallel
+destinations, multichannel — was valuable precisely because every setting did *nothing*. A sweep that
+moves nothing is not a wasted experiment; it is the control that proves the constraint lies elsewhere.
+Two rounds of confident, mechanically-plausible reasoning were beaten by one flat table.
+
+---
+
+## 7k. Where the throughput actually goes (2026-09-10)
+
+**Measured, not reasoned.** The report was 100-200 MB/s through cascade against 900-1000 MB/s on the
+same 10GbE link. Reading a 3 GB file inside the running production container:
+
+| Read path | Throughput |
+|---|---|
+| `/mnt/local` — the host bind mount (`M:/specs26` via Docker Desktop) | **220 MB/s** cold, **303 MB/s** warm |
+| the container's own filesystem | 1.7 GB/s write, 10.8 GB/s cached read |
+
+**The Docker Desktop bind mount is the ceiling**, and it is roughly where the reported figure already
+sits. `M:` is a local drive — checked, no hidden network hop — so this is the Windows-to-WSL2
+filesystem translation and nothing else. No amount of worker, dialect or `rsize` tuning goes past it
+while the source is read that way. The comparison figure never touched Docker at all, which is why
+the gap looked like a sync problem.
+
+The job's own settings then multiply it. Read from the live database rather than assumed:
+`workers=1`, `parallel_destinations=0`, seven destinations, `multichannel=0` on all seven targets.
+Sequential destinations mean **the same source file is read seven times** through that 220 MB/s pipe:
+for the 6.7 GB file in that tree, about three and a half minutes of source reads alone.
+
+`rsize`/`wsize` are already 4 MiB and the copy buffer is already 4 MiB (SPEC.md §6.3), so the
+remaining levers are configuration, in order of size: move the source off the bind mount, turn on
+`parallel_destinations`, raise `workers`, enable `multichannel`. **`DefaultWorkers` was left at 1** —
+that is a deliberate choice from 2026-09-06 ("the gentlest thing to do to a source share") and
+changing a default on the strength of one deployment's numbers is the user's call, not a fix.
+
+### What the three settings actually do to a 1-file fan-out
+
+Asked 2026-09-10 for the 100 GB-to-seven-destinations case, and the answers are not symmetrical:
+
+- **`workers` does nothing.** The executor feeds its queue one action per *file*, and one file is one
+  action, so a single worker copies it while the rest idle. Workers is a many-files lever only.
+- **`parallel_destinations` is the only large one.** It turns N sequential copies into N concurrent
+  ones, moving the ceiling from per-stream speed to whichever binds first: the shared source read, or
+  the link. Note the page-cache question underneath it — N destinations read the *same* file at
+  roughly the same time, so how much of that is one physical read depends on whether they stay in
+  lockstep, and that is worth measuring rather than predicting.
+- **`multichannel` defaults to two channels, not one and not many.** Assumed to be a no-op (kernel
+  default `max_channels=1`) and **the probe disproved it**: mounting with `multichannel` on this WSL2
+  kernel reports `multichannel,max_channels=2` in the applied options. More needs `max_channels=N` in
+  the target's override, plus server support. Worth checking what the kernel applied rather than what
+  the option string requested.
+
+**The architectural note:** for one file to N destinations the source is read **N times**, once per
+destination copier, with only the page cache deduplicating them. A tee-style read-once-write-many
+pipeline is the correct fix for large-file fan-out and would make the source read a fixed cost rather
+than an N× one. Not built — it touches SPEC.md §6.3 and is a feature, not a tweak.
+
+**Reading the database beat asking.** Three questions — why is it slow, why does the count climb, why
+is cn4m quiet — all resolved against `cn4m-cascade.db` and a `dd` in the running container, and two of
+the three answers were not what the symptom suggested.
+
+---
 
 ## 7j. A green notification for a red test run (2026-09-09)
 

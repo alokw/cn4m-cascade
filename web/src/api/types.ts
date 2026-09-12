@@ -379,6 +379,11 @@ export interface RunSnapshot {
   elapsed_sec: number
   pending_destinations: number
   estimated_pending_bytes: number
+  /** Size of the source tree in scope — how big the job is, not how much is
+   *  being transferred. `bytes_total` is the transfer; a tree already in sync
+   *  is large and has nothing to copy. */
+  scanned_files: number
+  scanned_bytes: number
   /** Meaningful only while the run is awaiting_confirmation. Always present —
    *  guard with isZeroTime. */
   confirm_deadline: string
@@ -640,7 +645,7 @@ export type WebhookEvent = (typeof WEBHOOK_EVENTS)[number]
 
 /** internal/api/webhooks.go — webhookResponse. Never carries the secret. */
 /** internal/store/webhooks.go — the wire shape a callback is sent in. */
-export type WebhookFormat = 'json' | 'cn4m'
+export type WebhookFormat = 'json' | 'cn4m' | 'discord'
 
 export interface Webhook {
   id: string

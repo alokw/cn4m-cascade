@@ -14,7 +14,7 @@ import type { FilterFileCheck } from '../api/types'
 export function RuleFileField({
   value,
   onChange,
-  placeholder = '/mnt/local/excludes.txt or target://<target-id>/excludes.txt',
+  placeholder = 'a path the server can read, or target://<target-id>/excludes.txt',
 }: {
   value: string
   onChange: (v: string) => void
@@ -54,8 +54,10 @@ export function RuleFileField({
       File path
       <input value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />
       <span className="hint">
-        A path inside the container, or <code>target://&lt;target-id&gt;/path</code> to read it off a
-        share. Re-read at the start of every run, not saved with the job.
+        A path <strong>as the server sees it</strong> &mdash; an ordinary path when running
+        natively, a path inside the container under Docker &mdash; or{' '}
+        <code>target://&lt;target-id&gt;/path</code> to read it off a share. Re-read at the start of
+        every run, not saved with the job.
       </span>
       {check && !check.checked && check.message && <span className="hint">{check.message}</span>}
       {check?.checked && !check.exists && (

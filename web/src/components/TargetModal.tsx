@@ -261,15 +261,21 @@ export function TargetModal({ target, duplicate = false, onClose, onSaved, onRef
             Folder path
             <input
               value={form.local_path}
-              placeholder="/mnt/local"
+              placeholder="an absolute path the server can read"
               onChange={(e) => set('local_path', e.target.value)}
             />
             <span className="hint">
-              Use <code>/mnt/local</code> — that is your <code>~/cn4m</code> folder
-              (<code>%USERPROFILE%\cn4m</code> on Windows), shared with the server. Subfolders work
-              too, e.g. <code>/mnt/local/photos</code>. This is a path <strong>inside the
-              container</strong>; set <code>CN4M_LOCAL_DIR</code> in <code>.env</code> to share a
-              different folder.
+              An absolute path <strong>as the server sees it</strong>, which is not always the path
+              you see.
+              <br />
+              Running <strong>natively</strong>, it is an ordinary path on that machine &mdash;{' '}
+              <code>M:\projects\repo</code> or <code>/srv/media</code>.
+              <br />
+              Running in <strong>Docker</strong>, it is a path inside the container:{' '}
+              <code>/mnt/local</code> is the folder bind-mounted there (your <code>~/cn4m</code>, or{' '}
+              <code>%USERPROFILE%\cn4m</code> on Windows), and subfolders such as{' '}
+              <code>/mnt/local/photos</code> work too. Set <code>CN4M_CASCADE_LOCAL_DIR</code> in{' '}
+              <code>.env</code> to share a different folder.
             </span>
           </label>
         )}

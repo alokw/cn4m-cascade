@@ -171,7 +171,8 @@ export function FilterRuleRow({
                 id. One key per line; the results are combined.
               </span>
               <span className="hint">
-                For a cn4m catalogue: <code>{CN4M_FILE_PATH}</code> with{' '}
+                For a cn4m catalogue in Docker: <code>{CN4M_FILE_PATH}</code> (natively, the
+                real path to the file) with{' '}
                 <code>tracked_repo_assets.*.name</code> and{' '}
                 <code>untracked_repo_assets.*.name</code>.{' '}
                 <button

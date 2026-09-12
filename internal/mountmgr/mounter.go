@@ -25,6 +25,51 @@ type MountSpec struct {
 	Dir       string // /mnt/smb/<target-id>
 	Options   string // resolved option string; never contains a password
 	CredsFile string // path to a 0600 credentials file, or "" for guest
+
+	// Username, Password and Domain are the credentials in memory, for a
+	// Mounter that takes them as arguments rather than from a file. Empty for
+	// a guest mount.
+	//
+	// mount.cifs cannot use these: an option value would land in the process
+	// table, which is the whole reason CredsFile exists. Windows can — and
+	// should, because WNetAddConnection2 accepts them in-process and nothing
+	// is written to disk at all.
+	Username string
+	Password string
+	Domain   string
+}
+
+// String redacts the password.
+//
+// Defensive rather than needed: nothing logs a MountSpec today. But a struct
+// carrying a plaintext password is one careless "%+v" away from putting it in
+// a log file forever, and CLAUDE.md forbids that outright.
+func (s MountSpec) String() string {
+	password := ""
+	if s.Password != "" {
+		password = "<redacted>"
+	}
+	return fmt.Sprintf("MountSpec{Source:%s Dir:%s Options:%s CredsFile:%s Username:%s Domain:%s Password:%s}",
+		s.Source, s.Dir, s.Options, s.CredsFile, s.Username, s.Domain, password)
+}
+
+// FileCredentialer is implemented by a Mounter that needs its credentials on
+// disk. mount.cifs does; the Windows connector does not.
+//
+// A Mounter that does not implement it is given a file, because that is what
+// every Mounter needed before this existed and defaulting the other way would
+// silently stop passing credentials to one that still expects them.
+type FileCredentialer interface {
+	NeedsCredentialsFile() bool
+}
+
+// wantsCredentialsFile reports whether a credentials file must be written for
+// this Mounter.
+func wantsCredentialsFile(m Mounter) bool {
+	if fc, ok := m.(FileCredentialer); ok {
+		return fc.NeedsCredentialsFile()
+	}
+	return true
 }
 
 // MountInfo is one line of the kernel mount table.

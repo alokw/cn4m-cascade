@@ -3,8 +3,10 @@ package runner
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/alokw/cn4m-cascade/internal/engine"
+	"github.com/alokw/cn4m-cascade/internal/store"
 )
 
 // actionsOf is what a confirm screen renders, so its failure mode is a user
@@ -133,5 +135,164 @@ func TestDestPlanCountsMatchTheActionLists(t *testing.T) {
 	}
 	if dp.Replaces != len(da.Replaces) {
 		t.Fatalf("DestPlan.Replaces = %d but the list holds %d", dp.Replaces, len(da.Replaces))
+	}
+}
+
+// A fan-out run must not count upwards as each destination is planned.
+//
+// Reported 2026-09-10: copying one file to seven destinations counted "3/5",
+// then "6/7", then "7/7". The total summed only *planned* destinations, and with
+// parallel_destinations off they are planned one at a time, so the denominator
+// climbed as the run went — reading as the job growing while it worked.
+// SPEC.md §6.1.1 asks the run total to include destinations that have not
+// started, estimated from the ones that have.
+func TestFanOutTotalCoversDestinationsNotYetPlanned(t *testing.T) {
+	now := time.Now()
+	dests := []string{"d1", "d2", "d3", "d4", "d5", "d6", "d7"}
+	p := newProgress(now, dests)
+
+	// One destination planned: 1 file, 1000 bytes of real work.
+	tr := p.tracker("d1")
+	tr.SetTotals(1, 1000)
+	p.markPlanned("d1")
+	p.setStatus("d1", store.DestRunning)
+	for _, id := range dests[1:] {
+		p.setStatus(id, store.DestPending)
+	}
+
+	snap := p.snapshot(now)
+	if snap.FilesTotal != 7 {
+		t.Fatalf("files_total = %d, want 7: one planned destination of 1 file plus six pending like it",
+			snap.FilesTotal)
+	}
+	if snap.BytesTotal != 7000 {
+		t.Fatalf("bytes_total = %d, want 7000", snap.BytesTotal)
+	}
+
+	// Planning the rest must not move the total, only fill in what was estimated.
+	for _, id := range dests[1:] {
+		tr := p.tracker(id)
+		tr.SetTotals(1, 1000)
+		p.markPlanned(id)
+		p.setStatus(id, store.DestRunning)
+	}
+	if got := p.snapshot(now).FilesTotal; got != 7 {
+		t.Fatalf("files_total = %d after planning them all, want a steady 7", got)
+	}
+}
+
+// The regression that made this file worth rewriting.
+//
+// An earlier fix set the total from the *source scan* — files × destinations,
+// fixed when the scan ended. It was stable and wildly wrong: a tree already in
+// sync reported its entire size as the transfer. Reported 2026-09-11 as
+// "multiple terabytes for a few 100mb files".
+//
+// The denominator must be the **work**, never the scope.
+func TestTotalsReportWorkNotScope(t *testing.T) {
+	now := time.Now()
+	dests := []string{"d1", "d2", "d3", "d4", "d5", "d6", "d7"}
+	p := newProgress(now, dests)
+
+	const mib = 1 << 20
+	// Every destination is planned, and each has one 100 MiB file to copy —
+	// out of a source tree that is hundreds of gigabytes and otherwise in sync.
+	for _, id := range dests {
+		tr := p.tracker(id)
+		tr.SetTotals(1, 100*mib)
+		p.markPlanned(id)
+		p.setStatus(id, store.DestRunning)
+	}
+
+	snap := p.snapshot(now)
+	wantBytes := int64(7 * 100 * mib)
+	if snap.BytesTotal != wantBytes {
+		t.Fatalf("bytes_total = %d (%.1f GB), want %d (%.0f MB) — the total must be what is copied, not what was scanned",
+			snap.BytesTotal, float64(snap.BytesTotal)/(1<<30), wantBytes, float64(wantBytes)/mib)
+	}
+	if snap.FilesTotal != 7 {
+		t.Fatalf("files_total = %d, want 7", snap.FilesTotal)
+	}
+}
+
+// A destination that never ran leaves nothing behind in the estimate: it was
+// never planned, so it contributes no work and no pending share once it has
+// reached a terminal state.
+func TestSkippedDestinationDoesNotInflateTheTotal(t *testing.T) {
+	now := time.Now()
+	p := newProgress(now, []string{"d1", "d2"})
+
+	tr := p.tracker("d1")
+	tr.SetTotals(2, 200)
+	p.markPlanned("d1")
+	p.setStatus("d1", store.DestRunning)
+	// d2 is unreachable and the job skips it: not pending any more.
+	p.setStatus("d2", store.DestSkippedUnavailable)
+
+	snap := p.snapshot(now)
+	if snap.FilesTotal != 2 {
+		t.Fatalf("files_total = %d, want 2 — a skipped destination adds no work", snap.FilesTotal)
+	}
+	if snap.BytesTotal != 200 {
+		t.Fatalf("bytes_total = %d, want 200", snap.BytesTotal)
+	}
+}
+
+// The ETA must not count pending destinations twice: the estimate is already
+// folded into BytesTotal.
+func TestETADoesNotDoubleCountPendingDestinations(t *testing.T) {
+	now := time.Now()
+	p := newProgress(now, []string{"d1", "d2"})
+
+	tr := p.tracker("d1")
+	tr.SetTotals(1, 1000)
+	p.markPlanned("d1")
+	p.setStatus("d1", store.DestRunning)
+	p.setStatus("d2", store.DestPending)
+
+	snap := p.snapshot(now)
+	if snap.BytesTotal != 2000 {
+		t.Fatalf("bytes_total = %d, want 2000 (one planned + one estimated)", snap.BytesTotal)
+	}
+	if snap.EstimatedPendingBytes != 1000 {
+		t.Fatalf("estimated_pending_bytes = %d, want 1000", snap.EstimatedPendingBytes)
+	}
+	// BytesTotal already includes the estimate, so remaining is 2000, not 3000.
+	if snap.ThroughputBPS > 0 {
+		t.Fatalf("unexpected throughput in a synthetic snapshot: %v", snap.ThroughputBPS)
+	}
+}
+
+// The scan size is reported for context, and must never become the progress
+// denominator. Keeping both in one test makes the distinction hard to erode:
+// D-130 was exactly the mistake of letting the second become the first.
+func TestScanSizeIsReportedButIsNotTheDenominator(t *testing.T) {
+	now := time.Now()
+	p := newProgress(now, []string{"d1", "d2"})
+
+	const mib = 1 << 20
+	// A large tree that is almost entirely in sync: 500 files, 5 GB scanned,
+	// but only one 10 MiB file actually needs copying to each destination.
+	p.setSourceScan(500, 5000*mib)
+	for _, id := range []string{"d1", "d2"} {
+		tr := p.tracker(id)
+		tr.SetTotals(1, 10*mib)
+		p.markPlanned(id)
+		p.setStatus(id, store.DestRunning)
+	}
+
+	snap := p.snapshot(now)
+
+	if snap.ScannedBytes != 5000*mib || snap.ScannedFiles != 500 {
+		t.Fatalf("scanned = %d files / %d bytes, want 500 / %d", snap.ScannedFiles, snap.ScannedBytes, 5000*mib)
+	}
+	// The transfer is 2 x 10 MiB. If the scan ever leaks into this, it reads
+	// as 10 GB and the progress bar becomes meaningless.
+	if snap.BytesTotal != 2*10*mib {
+		t.Fatalf("bytes_total = %d (%.1f GB), want %d (20 MiB) — the scan size must not be the denominator",
+			snap.BytesTotal, float64(snap.BytesTotal)/(1<<30), 2*10*mib)
+	}
+	if snap.FilesTotal != 2 {
+		t.Fatalf("files_total = %d, want 2", snap.FilesTotal)
 	}
 }

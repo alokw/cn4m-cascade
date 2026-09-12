@@ -187,7 +187,7 @@ func (m *Manager) ensureMounted(ctx context.Context, t *store.Target, e *entry, 
 // mount walks the SMB dialect ladder, stopping at the first success and
 // recording which rung worked (SPEC.md §5).
 func (m *Manager) mount(ctx context.Context, t *store.Target, dir string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := prepareMountpoint(dir); err != nil {
 		return fmt.Errorf("creating the mountpoint for %s: %w", t.Describe(), err)
 	}
 
@@ -290,14 +290,21 @@ func (m *Manager) mountOnce(ctx context.Context, t *store.Target, dir, dialect, 
 	}
 
 	if !t.IsGuest() {
-		credsFile, cleanup, err := writeCredentialsFile(m.cfg.CredsDir, t.Username, password, t.Domain)
-		if err != nil {
-			return err
+		spec.Username, spec.Password, spec.Domain = t.Username, password, t.Domain
+
+		// Only a Mounter that reads credentials from disk gets a file. On
+		// Windows nothing is written at all, because WNetAddConnection2
+		// takes them in-process (SPEC.md §3).
+		if wantsCredentialsFile(m.mounter) {
+			credsFile, cleanup, err := writeCredentialsFile(m.cfg.CredsDir, t.Username, password, t.Domain)
+			if err != nil {
+				return err
+			}
+			// SPEC.md §5: the file is deleted immediately after the mount,
+			// whether it succeeded or not.
+			defer cleanup()
+			spec.CredsFile = credsFile
 		}
-		// SPEC.md §5: the file is deleted immediately after the mount,
-		// whether it succeeded or not.
-		defer cleanup()
-		spec.CredsFile = credsFile
 	}
 
 	return m.mounter.Mount(ctx, spec)
