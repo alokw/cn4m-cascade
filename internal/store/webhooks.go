@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"slices"
@@ -297,8 +298,14 @@ func (d *DB) EnsureCN4MWebhook(ctx context.Context, url string) (bool, error) {
 		// files", which was noise worth suppressing; that is no longer what it
 		// says. Delivery is throttled per webhook by min_interval_sec, so
 		// subscribing does not mean one callback per second.
-		Events:  []string{"run_started", "progress", "run_completed", "run_failed"},
-		Enabled: true,
+		Events: []string{"run_started", "progress", "run_completed", "run_failed"},
+		// Five seconds, not the generic 30. This row exists to drive a live
+		// status bar, and the default throttle is measured against the length
+		// of a run: a sync that finishes in twenty seconds sends one progress
+		// update and then nothing, so the bar shows a number once and freezes.
+		// A suite dashboard is the one subscriber where progress is the point.
+		MinIntervalSec: 5,
+		Enabled:        true,
 	}
 	if err := d.CreateWebhook(ctx, hook); err != nil {
 		return false, err
@@ -340,4 +347,24 @@ func (d *DB) EnsureDiscordWebhook(ctx context.Context, url string) (bool, error)
 		return false, err
 	}
 	return true, nil
+}
+
+// CN4MWebhookURL returns the URL of the stored cn4m callback, if there is one.
+//
+// Exists so startup can compare what is configured against what is stored.
+// EnsureCN4MWebhook never overwrites — an environment variable must not undo a
+// deliberate change made in the UI — but that rule has a sharp edge: a database
+// copied from another deployment carries that deployment's URL, and changing
+// the variable afterwards does nothing at all. Silently.
+func (d *DB) CN4MWebhookURL(ctx context.Context) (string, bool, error) {
+	var url string
+	err := d.sql.QueryRowContext(ctx,
+		`SELECT url FROM webhooks WHERE format = ? LIMIT 1`, FormatCN4M).Scan(&url)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("reading the cn4m callback: %w", err)
+	}
+	return url, true, nil
 }

@@ -151,6 +151,13 @@ export function WebhooksTab({
 }
 
 /** The outbound half: where this job reports to when things happen. */
+// What each wire format is called on a row, so the badge says something.
+const FORMAT_LABELS: Record<string, string> = {
+  json: 'JSON',
+  cn4m: 'cn4m',
+  discord: 'Discord',
+}
+
 function CallbackList({
   hooks,
   jobID,
@@ -191,6 +198,50 @@ function CallbackList({
     }
   }
 
+  // Editing an existing callback. The API has always supported it
+  // (PATCH /api/webhooks/{id}) and the UI never called it, so a stored callback
+  // could be read and deleted but not corrected — and typing into the *add*
+  // form looked like editing right up until you navigated away and the
+  // component state went with you.
+  const [editingID, setEditingID] = useState<string | null>(null)
+  const [edit, setEdit] = useState<WebhookPayload | null>(null)
+
+  function startEdit(hook: Webhook) {
+    setError(null)
+    setEditingID(hook.id)
+    setEdit({
+      url: hook.url,
+      events: [...hook.events],
+      enabled: hook.enabled,
+      format: hook.format,
+      min_interval_sec: hook.min_interval_sec,
+      // Never prefilled: the API only stores the secret encrypted, so there is
+      // nothing to show. Left blank, the stored one is kept.
+      secret: '',
+      job_id: hook.job_id,
+    })
+  }
+
+  function cancelEdit() {
+    setEditingID(null)
+    setEdit(null)
+  }
+
+  async function saveEdit() {
+    if (!editingID || !edit) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api.webhooks.update(editingID, edit)
+      cancelEdit()
+      onChanged()
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Could not save the callback.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function remove(hook: Webhook) {
     if (!window.confirm(`Stop sending callbacks to ${hook.url}?`)) return
     try {
@@ -200,14 +251,6 @@ function CallbackList({
       setError(err instanceof ApiError ? err.message : 'Could not remove the callback.')
     }
   }
-
-  const toggleEvent = (event: string) =>
-    setDraft((d) => ({
-      ...d,
-      events: d.events.includes(event)
-        ? d.events.filter((e) => e !== event)
-        : [...d.events, event],
-    }))
 
   return (
     <div className="card">
@@ -224,63 +267,123 @@ function CallbackList({
       )}
 
       <ul className="target-list">
-        {mine.map((h) => (
+        {[...mine, ...global].map((h) => (
           <li key={h.id} className="card">
             <div className="target-head">
               <code>{h.url}</code>
+              {!h.job_id && <span className="badge">every job</span>}
               {!h.enabled && <span className="badge">paused</span>}
-              {h.format === 'cn4m' && <span className="badge">cn4m</span>}
+              <span className="badge">{FORMAT_LABELS[h.format] ?? h.format}</span>
               {h.has_secret && <span className="badge">signed</span>}
             </div>
-            <p className="muted">
-              {h.events.length === 0 ? 'Every event' : h.events.map((e) => EVENT_LABELS[e] ?? e).join(', ')}
-            </p>
-            <div className="actions">
-              <button className="link danger" onClick={() => void remove(h)}>
-                Remove
-              </button>
-            </div>
-          </li>
-        ))}
-        {global.map((h) => (
-          <li key={h.id} className="card">
-            <div className="target-head">
-              <code>{h.url}</code>
-              <span className="badge">every job</span>
-              {h.format === 'cn4m' && <span className="badge">cn4m</span>}
-            </div>
-            <p className="hint">
-              {h.format === 'cn4m'
-                ? 'Reports this job to cn4m, the parent system. Configured for every job; if cn4m is not running, nothing happens and nothing is logged against your runs.'
-                : 'Configured globally, so it applies to this job too.'}
-            </p>
+
+            {editingID === h.id && edit ? (
+              <>
+                <CallbackFields value={edit} onChange={setEdit} urlLabel="Callback URL" />
+                <div className="actions">
+                  <button disabled={busy || !edit.url.trim()} onClick={() => void saveEdit()}>
+                    Save
+                  </button>
+                  <button className="link" disabled={busy} onClick={cancelEdit}>
+                    Cancel
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                {/* The settings themselves, not just the URL. Without these a
+                    stored callback was unreadable: you could not tell which
+                    events it was subscribed to or how often progress was
+                    throttled, which is exactly how a cn4m callback sat silently
+                    un-subscribed from `progress` without anyone noticing. */}
+                <p className="muted">
+                  {h.events.length === 0
+                    ? 'Every event'
+                    : h.events.map((e) => EVENT_LABELS[e] ?? e).join(', ')}
+                  {' · progress at most every '}
+                  {h.min_interval_sec}s
+                </p>
+                {!h.job_id && (
+                  <p className="hint">
+                    {h.format === 'cn4m'
+                      ? 'Reports every job to cn4m, the parent system. If cn4m is not running, nothing happens and nothing is logged against your runs — so a wrong URL here is silent.'
+                      : 'Configured globally, so it applies to every job.'}
+                  </p>
+                )}
+                <div className="actions">
+                  <button className="link" onClick={() => startEdit(h)}>
+                    Edit
+                  </button>
+                  <button className="link danger" onClick={() => void remove(h)}>
+                    Remove
+                  </button>
+                </div>
+              </>
+            )}
           </li>
         ))}
       </ul>
 
+      <CallbackFields value={draft} onChange={setDraft} urlLabel="Add a callback URL" />
+
+      <div className="actions">
+        <button disabled={busy || !draft.url.trim()} onClick={() => void add()}>
+          Add callback
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * The fields of one callback, shared by the add form and the edit form.
+ *
+ * Shared rather than duplicated because they drifted once already: the add form
+ * grew a Discord option and a format hint that the (then non-existent) edit form
+ * would not have had. One copy is the only way that stays true.
+ */
+function CallbackFields({
+  value,
+  onChange,
+  urlLabel,
+}: {
+  value: WebhookPayload
+  onChange: (next: WebhookPayload) => void
+  urlLabel: string
+}) {
+  const toggleEvent = (event: string) =>
+    onChange({
+      ...value,
+      events: value.events.includes(event)
+        ? value.events.filter((e) => e !== event)
+        : [...value.events, event],
+    })
+
+  return (
+    <>
       <label>
-        Add a callback URL
+        {urlLabel}
         <input
-          value={draft.url}
+          value={value.url}
           placeholder="https://n8n.example.lan/webhook/cn4m"
-          onChange={(e) => setDraft({ ...draft, url: e.target.value })}
+          onChange={(e) => onChange({ ...value, url: e.target.value })}
         />
       </label>
 
       <label>
         Send it as
         <select
-          value={draft.format}
-          onChange={(e) => setDraft({ ...draft, format: e.target.value as WebhookFormat })}
+          value={value.format}
+          onChange={(e) => onChange({ ...value, format: e.target.value as WebhookFormat })}
         >
           <option value="json">JSON, signed (n8n, Home Assistant, anything custom)</option>
           <option value="cn4m">cn4m status update</option>
           <option value="discord">Discord message</option>
         </select>
         <span className="hint">
-          {draft.format === 'cn4m'
+          {value.format === 'cn4m'
             ? 'Form-encoded app/message/level, which is what cn4m’s /suite/status accepts — not JSON. No signature: that endpoint does not check one. Failures are silent, because a cn4m that is not running is a normal state rather than a problem with your sync.'
-            : draft.format === 'discord'
+            : value.format === 'discord'
               ? 'A one-line chat message to a Discord webhook URL, with an emoji for the outcome. Subscribe it to run_completed and run_failed only — progress would post a line every interval, for the length of every run. Failures are silent, like cn4m: a chat notification that cannot be delivered is not a problem with your sync.'
               : 'A JSON body with the same fields the status endpoint returns, plus an event name.'}
         </span>
@@ -292,7 +395,7 @@ function CallbackList({
           <label key={event} className="checkbox">
             <input
               type="checkbox"
-              checked={draft.events.includes(event)}
+              checked={value.events.includes(event)}
               onChange={() => toggleEvent(event)}
             />
             {EVENT_LABELS[event]}
@@ -302,38 +405,46 @@ function CallbackList({
       </fieldset>
 
       <div className="row">
-        {draft.format === 'json' && (
-        <label>
-          Signing secret <span className="hint">optional</span>
-          <input
-            type="password"
-            value={draft.secret ?? ''}
-            placeholder="leave blank for unsigned"
-            onChange={(e) => setDraft({ ...draft, secret: e.target.value })}
-          />
-          <span className="hint">
-            Sent as an <code>X-Signature</code> header — HMAC-SHA256 of the body — so the receiver
-            can tell a real callback from anything else that can reach its URL.
-          </span>
-        </label>
+        {value.format === 'json' && (
+          <label>
+            Signing secret <span className="hint">optional</span>
+            <input
+              type="password"
+              value={value.secret ?? ''}
+              placeholder="leave blank to keep the current one"
+              onChange={(e) => onChange({ ...value, secret: e.target.value })}
+            />
+            <span className="hint">
+              Sent as an <code>X-Signature</code> header — HMAC-SHA256 of the body — so the receiver
+              can tell a real callback from anything else that can reach its URL. Leaving this blank
+              when editing keeps the secret already stored.
+            </span>
+          </label>
         )}
         <label>
           Progress no more often than
           <input
             type="number"
             min={1}
-            value={draft.min_interval_sec}
-            onChange={(e) => setDraft({ ...draft, min_interval_sec: Number(e.target.value) })}
+            value={value.min_interval_sec}
+            onChange={(e) => onChange({ ...value, min_interval_sec: Number(e.target.value) })}
           />
-          <span className="hint">seconds</span>
+          <span className="hint">
+            seconds. A run shorter than this sends one progress update and no more, so a fast job with
+            a 30-second interval looks silent.
+          </span>
         </label>
       </div>
 
-      <div className="actions">
-        <button disabled={busy || !draft.url.trim()} onClick={() => void add()}>
-          Add callback
-        </button>
-      </div>
-    </div>
+      <label className="checkbox">
+        <input
+          type="checkbox"
+          checked={value.enabled !== false}
+          onChange={(e) => onChange({ ...value, enabled: e.target.checked })}
+        />
+        Enabled
+      </label>
+    </>
   )
 }
+

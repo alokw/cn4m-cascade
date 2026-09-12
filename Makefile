@@ -207,7 +207,8 @@ windows-exe: web-build ## Cross-compile the native Windows .exe into ./dist
 	@# container because that is where the Go toolchain and the SPA build live —
 	@# CGO is off and SQLite is pure Go, so nothing needs a Windows host to build.
 	@mkdir -p dist
-	$(DEV) env GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \n		go build -trimpath -ldflags="-s -w" -o /src/dist/cn4m-cascade.exe ./cmd/cn4m-cascade
+	$(DEV) env GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+		go build -trimpath -ldflags="-s -w" -o /src/dist/cn4m-cascade.exe ./cmd/cn4m-cascade
 	@# A template beside the binary, because the process looks for .env next to
 	@# itself and an operator should not have to find out what goes in it.
 	@cp .env.example dist/.env.example

@@ -8,15 +8,46 @@ learns about SMB.
 **[SPEC.md](SPEC.md) is the source of truth** for design and scope. [CLAUDE.md](CLAUDE.md) holds the
 working rules; [PROGRESS.md](PROGRESS.md) tracks what is built and what is next.
 
+## Running the Windows build in 60 seconds
+
+**What you need installed: nothing.** No Docker, no Go, no `mount.cifs`, no runtime. The
+distributable is one self-contained `.exe` — the web UI is compiled into it, and SMB shares are
+reached through the Windows network redirector. This is also the **fastest** way to run it on
+Windows, by roughly 5× ([PERFORMANCE.md](PERFORMANCE.md)).
+
+From the `dist` folder:
+
+```powershell
+copy .env.example .env                          # 1. one setting is required
+notepad .env                                    #    set ENCRYPTION_KEY to any 16+ random chars
+.\cn4m-cascade.exe                              # 2. run it
+```
+
+Then open **<http://localhost:2649>**, set an admin password, and add a target — a NAS by host,
+share and credentials, or a local folder as an ordinary Windows path such as `M:\projects\repo`.
+
+Two things worth knowing before you start:
+
+- **`ENCRYPTION_KEY` can never change.** It decrypts the stored SMB passwords, so back `.env` up
+  alongside the database (`%ProgramData%\cn4m-cascade`). There is no recovery from losing it.
+- **Set `CN4M_CASCADE_STATUS_URL=off`** unless this install reports to a cn4m suite — otherwise it
+  posts status to `http://localhost:2640/suite/status` by default.
+
+That is the whole thing. [Quickstart (native Windows)](#quickstart-native-windows) has the same
+steps with the key-generation one-liner, every other setting, and how to install it as a service so
+it starts at boot; building the `.exe` yourself is `make windows-exe`.
+
 ## Status
 
-Built in phases (SPEC.md §11). **Phases 1 to 5 are complete, and Phase 6 has begun with the
-production packaging** — so this is deployable: `make image && make run`, then open
+Built in phases (SPEC.md §11). **Phases 1 to 5 are complete, and Phase 6 has the production
+packaging and the native Windows build** — so this is deployable two ways: `make image && make run`
+for a container, or `make windows-exe` for a single `.exe` with no Docker at all. Then open
 <http://localhost:2649>.
 
 | | |
 |---|---|
-| ✅ Works today | The full web UI — dashboard, jobs, targets, run detail, logs, settings. Mirror and update modes, fan-out to many destinations, include/exclude filters with global exclusions, on-demand kernel CIFS mounts with refcounting and an idle grace period, SMB dialect and multichannel fallback, encrypted credentials, preview-before-run, cron scheduling, webhook triggers and signed outbound callbacks, cn4m suite reporting, and a production Docker image |
+| ✅ Works today | The full web UI — dashboard, jobs, targets, run detail, logs, settings. Mirror and update modes, fan-out to many destinations, include/exclude filters with global exclusions (including a `*` wildcard for JSON catalogues), on-demand SMB access with refcounting and an idle grace period, dialect and multichannel fallback, encrypted credentials, preview-before-run, cron scheduling, webhook triggers, and outbound callbacks in three formats — signed JSON, cn4m suite reporting and **Discord messages** |
+| 📦 Two deployments | A **production Docker image** (~24 MB), and a **native Windows `.exe`** that needs no Docker and no `mount.cifs` — roughly 5× faster on sustained transfer ([PERFORMANCE.md](PERFORMANCE.md)), with optional Windows Service install and a `.env` beside the binary |
 | ⛔ Not built yet | Bandwidth limiting, throughput graph, log retention, portable configuration export |
 | 🚫 Not planned | **Two-way sync** — deferred indefinitely, SPEC.md §14.1 |
 
@@ -123,10 +154,20 @@ bind-mounted local path.
 
 ## Requirements
 
+**To build it, or to work on it:**
+
 - **Docker** (Docker Desktop is fine). The daemon must be responsive — see [Troubleshooting](#troubleshooting).
 - **Nothing else.** You do not need Go, `cifs-utils`, or a Samba install on your machine. Every
   build, lint and test runs inside the dev container, because `mount.cifs` is Linux-only and the
   host is often macOS. Every `make` target is a thin `docker compose` wrapper.
+
+**To run it:**
+
+- **In a container:** Docker, and on Linux the `SYS_ADMIN` and `DAC_READ_SEARCH` capabilities that
+  `mount.cifs` needs — see [Why the container is privileged](#why-the-container-is-privileged).
+- **Natively on Windows:** nothing at all. One `.exe`, no Docker, no `mount.cifs`, no runtime to
+  install — it uses the Windows network redirector directly. This is the **recommended** way to run
+  it on Windows; see [Quickstart (native Windows)](#quickstart-native-windows).
 
 ## Quickstart (Docker)
 
@@ -268,7 +309,8 @@ Everything is an environment variable. Only the first is required.
 | `DATA_DIR` | `%ProgramData%\cn4m-cascade` | Holds the SQLite database. Works without elevation, and a service and an interactive operator see the same one. |
 | `LISTEN_ADDR` | `:2649` | `127.0.0.1:2649` binds to loopback only. |
 | `CN4M_CASCADE_ADMIN_PASSWORD` | *(none)* | Sets the admin password on a fresh database instead of doing it in the browser. |
-| `CN4M_CASCADE_STATUS_URL` | cn4m on `localhost:2640` | `off` if this install is not part of a cn4m suite. |
+| `CN4M_CASCADE_STATUS_URL` | `http://localhost:2640/suite/status` | Where cn4m suite status goes. `off` if this install is not part of a cn4m suite. |
+| `CN4M_CASCADE_DISCORD_WEBHOOK` | *(none)* | A Discord webhook URL. Seeds a fresh database only — see [Editing a callback](#editing-a-callback). |
 | `TZ` | the machine's zone | Cron schedules are read in this zone. |
 | `LOG_LEVEL` | `info` | `debug` for more. |
 
@@ -424,6 +466,18 @@ Run `make help` for this list at any time.
 | `make tidy` | `go mod tidy` |
 | `make dev-shell` | Interactive shell in the dev container |
 
+**Deploying:**
+
+| Command | What it does |
+|---|---|
+| `make image` | Build the production Docker image (SPEC.md §10) |
+| `make run` | Run it on <http://localhost:2649> |
+| `make logs` | Follow the production server's logs |
+| `make down` | Stop the production stack |
+| `make verify-image` | Prove the shipping image can mount a real CIFS share |
+| `make windows-exe` | Cross-compile the native Windows `.exe` into `./dist` |
+| `make dev-run` | Run from source in the dev container, on `:12649` |
+
 ### Tearing down
 
 ```bash
@@ -454,10 +508,30 @@ A job can push its status to outbound webhooks (SPEC.md §8.2), configured per j
 | `cn4m` | the cn4m suite status view | no | silent |
 | `discord` | a Discord channel | no | silent |
 
+A fresh database seeds a `cn4m` row pointing at `http://localhost:2640/suite/status`, the suite's own
+status endpoint, reporting `progress` at most every 5 seconds. Set `CN4M_CASCADE_STATUS_URL=off`
+before first start if this install is not part of a cn4m suite, or `host.docker.internal` in place of
+`localhost` if cn4m runs on the host and cascade runs in a container.
+
 `cn4m` and `discord` are **best-effort on purpose**: a suite dashboard or a chat service being
 unreachable is somebody else's outage, not a fault in your backup, so a failed delivery never appears
 in the run log and never fails a sync. `json` keeps its warn-level logging, because a custom
 integration that quietly stops arriving *is* worth seeing.
+
+### Editing a callback
+
+Each row in the **Webhooks & API** tab shows its events and its progress interval, and has an
+**Edit** button — including the global ones seeded from the environment. That matters because the
+environment variables (`CN4M_CASCADE_STATUS_URL`, `CN4M_CASCADE_DISCORD_WEBHOOK`) seed a **fresh**
+database and never overwrite afterwards: once a row exists, the tab is the only place it changes.
+
+The commonest way to be caught by that is moving a database between deployments — a container `.env`
+points at `host.docker.internal`, which resolves to nothing useful on a native install, and delivery
+is best-effort so nothing complains. The server now warns at startup when the stored URL differs from
+the configured one.
+
+Leaving the signing secret blank when editing keeps the one already stored; it is never displayed,
+because only the encrypted form is kept.
 
 ### Discord
 
@@ -522,6 +596,9 @@ POST           /api/jobs/{id}/run           → 202, runs in the background
 
 GET            /api/runs                    GET              /api/runs/{id}
 GET            /api/runs/{id}/events        POST             /api/runs/{id}/cancel
+
+POST|GET       /api/webhooks                PATCH|DELETE     /api/webhooks/{id}
+POST           /api/hooks/jobs/{id}/run     → tokenized trigger, 202
 
 GET            /healthz
 ```
@@ -697,6 +774,11 @@ wait is always bounded, because a run may be started by a schedule with nobody w
 | `STATFS_TIMEOUT` | `5s` | Stale-mount watchdog |
 | `UNMOUNT_TIMEOUT` | `15s` | |
 | `MOUNT_IDLE_GRACE` | `60s` | How long an unreferenced mount survives, so back-to-back jobs reuse it |
+| `CN4M_CASCADE_CONFIG` | *(none)* | An explicit config file path instead of the `.env` beside the binary. A path that cannot be read is an error |
+| `CN4M_CASCADE_ADMIN_PASSWORD` | *(none)* | Sets the admin password on a **fresh** database instead of doing it in the browser |
+| `CN4M_CASCADE_STATUS_URL` | `http://localhost:2640/suite/status` | Where cn4m suite status goes. In a container this needs `host.docker.internal`, not `localhost` — see [Notifications](#notifications). `off` to disable |
+| `CN4M_CASCADE_DISCORD_WEBHOOK` | *(none)* | A Discord webhook URL. Seeds a **fresh** database only |
+| `TZ` | the machine's zone | Cron schedules are read in this zone |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
 ## Why the container is privileged
@@ -755,6 +837,29 @@ Nothing in this project can work around that; use a Linux host.
 | `mount error(113): could not connect` | the host is unreachable — routing or firewall, not CIFS |
 | `wrong fs type, bad option, bad superblock` | the kernel has no CIFS support; nothing here can work around it |
 | `Operation not permitted` | the capabilities did not apply; check `SYS_ADMIN` survived your shell quoting |
+
+**A Windows target fails with "multiple connections to a server ... by the same user, using more
+than one user name, are not allowed".** Windows permits exactly **one session per server per logon
+session**, and something already has one — very often just an Explorer window. A target with no
+password reuses whatever session exists, so this only appears on a target that *has* credentials.
+Either give it the same credentials as the existing connection, or clear that connection:
+`net use \\server\share /delete` (or `net use * /delete` for all of them). Nothing is wrong with
+the target. This cannot happen under Linux, where each mount gets its own session.
+
+**A run reports files "not copied because another process had the destination file open".** Real, and
+usually expected: a media server holds its project files open for as long as the project is loaded.
+Those files are skipped rather than retried — only the owning application decides when it lets go —
+and the run is `partial` rather than `failed`, with the count in the summary (`…, 3 file(s) locked`).
+The next run picks them up. Everything else still copies.
+
+**cn4m shows nothing, and no error appears anywhere.** cn4m and Discord callbacks are *best-effort*:
+a delivery that fails is never logged and never fails a sync, so a wrong URL is completely silent.
+Check the callback's URL in the **Webhooks & API** tab — the environment variable only seeds a
+**fresh** database and never overwrites, so a database copied from another deployment keeps that
+deployment's URL. The commonest case is a container's `host.docker.internal` in a native install,
+which still *resolves* (Docker Desktop leaves the name mapped) but points nowhere useful. The server
+warns about exactly this mismatch at startup. If the status bar updates once and then freezes, raise
+the callback's progress interval limit: a run shorter than the interval sends one update and no more.
 
 **Integration tests fail with `mount error(115): Operation now in progress`.** Almost always a dirty
 harness rather than a real failure. A test process killed before its cleanup ran leaves behind an

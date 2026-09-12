@@ -188,6 +188,16 @@ func run(ctx context.Context, log *slog.Logger) error {
 		log.Warn("could not create the cn4m status callback", "error", err)
 	} else if created {
 		log.Info("created the cn4m status callback", "url", cfg.CN4MStatusURL)
+	} else if stored, ok, err := db.CN4MWebhookURL(ctx); err == nil && ok && stored != cfg.CN4MStatusURL {
+		// The callback is only ever seeded, never updated, so a database
+		// carried over from another deployment keeps that deployment's URL
+		// and the variable here does nothing. Deliveries are best-effort,
+		// so nothing fails and nothing is logged: the suite view simply
+		// stays empty. Saying so once at startup is what turns that into
+		// something an operator can act on.
+		log.Warn("the stored cn4m callback does not match CN4M_CASCADE_STATUS_URL; "+
+			"the stored one is used, and it is only editable in the Webhooks & API tab",
+			"stored", stored, "configured", cfg.CN4MStatusURL)
 	}
 
 	// The Discord notification, same contract: created once on a fresh
