@@ -509,7 +509,10 @@ A job can push its status to outbound webhooks (SPEC.md §8.2), configured per j
 | `discord` | a Discord channel | no | silent |
 
 A fresh database seeds a `cn4m` row pointing at `http://localhost:2640/suite/status`, the suite's own
-status endpoint, reporting `progress` at most every 5 seconds. Set `CN4M_CASCADE_STATUS_URL=off`
+status endpoint, reporting `progress` at most every 5 seconds. Progress goes out at cn4m's
+`progress` level, which is a per-app slot rather than a feed entry — each update replaces the last
+on the rail and none of them reach the tray or the log; the outcome that follows (`ok`, `warning` or
+`error`) clears it and is what gets logged. Set `CN4M_CASCADE_STATUS_URL=off`
 before first start if this install is not part of a cn4m suite, or `host.docker.internal` in place of
 `localhost` if cn4m runs on the host and cascade runs in a container.
 
@@ -827,6 +830,12 @@ it never answers, restart Docker Desktop.
 
 **`make verify-cifs` fails with an unknown filesystem type.** The VM kernel lacks the `cifs` module.
 Nothing in this project can work around that; use a Linux host.
+
+**`make windows-exe` says "dist/cn4m-cascade.exe is in use".** A running `cn4m-cascade.exe` locks
+its own image, so the file cannot be replaced until it stops — close the console it is running in,
+or `cn4m-cascade.exe -service stop` if it is installed as a service, then re-run. The target
+deliberately fails here: written straight onto the locked file through the bind mount, `go build`
+once reported success having changed nothing, which is worse than an error.
 
 **A target will not mount.** The message names the layer that failed:
 

@@ -76,11 +76,11 @@ func TestDeliveredBodyCarriesAVerifiableSignature(t *testing.T) {
 	defer srv.Close()
 
 	n := testNotifier(t)
-	n.queue <- job{
+	n.enqueue(job{
 		hook:  store.Webhook{ID: "w1", URL: srv.URL, SecretEncrypted: secret, Enabled: true},
 		event: EventRunCompleted, runID: "run-1",
 		payload: Payload{"event": EventRunCompleted, "run_id": "run-1", "status": "success"},
-	}
+	})
 
 	select {
 	case r := <-got:
@@ -116,26 +116,26 @@ func TestAHangingReceiverNeverBlocksTheCaller(t *testing.T) {
 
 	n := testNotifier(t)
 
-	// Fill every worker with a hanging delivery, then time the next enqueue.
-	for i := range 8 {
-		n.queue <- job{
+	// Park the hook's lane on a hanging delivery and fill its queue behind it,
+	// then time the next enqueue. Every lane holds queueDepth, so this has to
+	// push past that to reach the "full" path.
+	for i := range queueDepth + 8 {
+		n.enqueue(job{
 			hook:  store.Webhook{ID: "hang", URL: srv.URL, Enabled: true},
 			event: EventProgress, runID: "run-hang", payload: Payload{"i": i},
-		}
+		})
 	}
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for i := range 100 {
-			select {
-			case n.queue <- job{
+			// Full is the designed outcome: enqueue reports it and returns,
+			// never blocks.
+			_ = n.enqueue(job{
 				hook:  store.Webhook{ID: "hang", URL: srv.URL, Enabled: true},
 				event: EventProgress, runID: "run-hang", payload: Payload{"j": i},
-			}:
-			default:
-				// Full is the designed outcome: dropped, never blocked.
-			}
+			})
 		}
 	}()
 
@@ -192,5 +192,85 @@ func TestSubscriptionMatching(t *testing.T) {
 				t.Fatalf("Subscribes(%q) = %v, want %v", tc.event, got, tc.want)
 			}
 		})
+	}
+}
+
+// A webhook's events are delivered in the order they were queued.
+//
+// This became a requirement with cn4m's `progress` level: a progress post is a
+// per-app slot that the app's next non-progress post clears, so if a progress
+// request lands *after* the run's outcome it re-fills the slot and "97%" sits
+// on the rail for two minutes after the sync finished. A shared worker pool
+// reorders freely under any receiver latency; per-hook lanes must not.
+//
+// The receiver's latency is jittered so that a pool would be caught reliably
+// rather than occasionally.
+func TestDeliveriesForOneHookArriveInOrder(t *testing.T) {
+	const events = 40
+	arrived := make(chan int, events)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decoding body: %v", err)
+		}
+		seq, _ := body["seq"].(float64)
+		// Odd-numbered posts dawdle; under a pool the even one queued after
+		// them overtakes.
+		if int(seq)%2 == 1 {
+			time.Sleep(15 * time.Millisecond)
+		}
+		arrived <- int(seq)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	n := testNotifier(t)
+	hook := store.Webhook{ID: "ordered", URL: srv.URL, Enabled: true, Format: store.FormatJSON}
+	for i := range events {
+		if !n.enqueue(job{hook: hook, event: EventProgress, runID: "run-1", payload: Payload{"seq": i}}) {
+			t.Fatalf("enqueue %d reported full", i)
+		}
+	}
+
+	for want := range events {
+		select {
+		case got := <-arrived:
+			if got != want {
+				t.Fatalf("delivery %d arrived where %d was expected; a later event overtook an earlier one", got, want)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("only %d of %d deliveries arrived", want, events)
+		}
+	}
+}
+
+// Lanes are per hook, so one receiver that hangs must not hold up another
+// hook's deliveries — the isolation a shared pool gave for free.
+func TestAHangingHookDoesNotDelayAnotherHook(t *testing.T) {
+	release := make(chan struct{})
+	hanging := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer hanging.Close()
+	// Deferred after Close so it runs first: Close waits for the parked
+	// handler, which only returns once release is closed.
+	defer close(release)
+
+	got := make(chan struct{}, 1)
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer healthy.Close()
+
+	n := testNotifier(t)
+	n.enqueue(job{hook: store.Webhook{ID: "hang", URL: hanging.URL, Enabled: true}, event: EventProgress, runID: "r"})
+	n.enqueue(job{hook: store.Webhook{ID: "ok", URL: healthy.URL, Enabled: true}, event: EventProgress, runID: "r"})
+
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a healthy hook waited behind a hanging one; lanes are not isolated")
 	}
 }

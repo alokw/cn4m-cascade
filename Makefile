@@ -208,7 +208,17 @@ windows-exe: web-build ## Cross-compile the native Windows .exe into ./dist
 	@# CGO is off and SQLite is pure Go, so nothing needs a Windows host to build.
 	@mkdir -p dist
 	$(DEV) env GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
-		go build -trimpath -ldflags="-s -w" -o /src/dist/cn4m-cascade.exe ./cmd/cn4m-cascade
+		go build -trimpath -ldflags="-s -w" -o /tmp/cn4m-cascade.exe ./cmd/cn4m-cascade
+	@# Built to a scratch path and copied, NOT built straight onto dist/: a
+	@# running cn4m-cascade.exe locks its image, and through the bind mount
+	@# `go build -o` onto that file exits 0 having written nothing (observed
+	@# 2026-09-12 — a "successful" build that left the old binary in place). A
+	@# plain cp fails loudly on the same lock, which is the behaviour wanted.
+	@$(DEV) cp /tmp/cn4m-cascade.exe /src/dist/cn4m-cascade.exe || { \
+	  echo ""; \
+	  echo "Could not replace dist/cn4m-cascade.exe: it is in use."; \
+	  echo "Stop the running cn4m-cascade.exe (or: cn4m-cascade.exe -service stop) and re-run."; \
+	  exit 1; }
 	@# A template beside the binary, because the process looks for .env next to
 	@# itself and an operator should not have to find out what goes in it.
 	@cp .env.example dist/.env.example

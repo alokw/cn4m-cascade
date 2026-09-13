@@ -28,13 +28,28 @@ const AppName = "cascade"
 // standing between a typo here and a suite view that quietly misreports
 // whether backups are working.
 const (
-	levelIdle    = "idle"    // grey — nothing happening, the resting state
-	levelWorking = "working" // orange — in progress right now
-	levelOK      = "ok"      // green — finished, nothing to do
-	levelWarning = "warning" // yellow — finished, but not cleanly
-	levelBlocked = "blocked" // purple — waiting on a person, timeout running
-	levelError   = "error"   // red — finished badly, or could not run at all
+	levelIdle     = "idle"     // grey — nothing happening, the resting state
+	levelWorking  = "working"  // orange — in progress right now; a real event
+	levelProgress = "progress" // orange — a live counter, replaced not appended
+	levelOK       = "ok"       // green — finished, nothing to do
+	levelWarning  = "warning"  // yellow — finished, but not cleanly
+	levelBlocked  = "blocked"  // purple — waiting on a person, timeout running
+	levelError    = "error"    // red — finished badly, or could not run at all
 )
+
+// `progress` (added to cn4m 2026-09-12) is the one level with different
+// semantics from the rest: it goes to a **per-app slot** rather than the feed.
+// Each post replaces the previous line, and it never reaches the tray or the
+// log — the same rule cn4m's own set_app_progress() follows. Before it existed,
+// a five-second progress cadence put a dozen "Sync in Progress: 16%" rows into
+// the feed per minute, every one of them a stale duplicate of the next.
+//
+// The slot is cleared by the app's next non-progress post, which is why the
+// outcome still goes out at its own level, and it is dropped after two minutes
+// of silence so a cascade that dies mid-sync does not leave "16%" up for good.
+// Our cadence is far inside that: the runner emits progress every flush tick,
+// on a timer rather than on file boundaries, so even a single 100 GB file keeps
+// the line alive.
 
 // cn4mLevel picks the level for one event.
 //
@@ -49,8 +64,13 @@ const (
 // *now*, whereas a partial run is history.
 func cn4mLevel(event string, payload Payload) string {
 	switch event {
-	case EventRunStarted, EventProgress:
+	case EventRunStarted:
+		// A real event, so it lands in the feed and the log; the progress
+		// lines that follow it only ever replace one another in the slot.
 		return levelWorking
+
+	case EventProgress:
+		return levelProgress
 
 	case EventPrompt:
 		return levelBlocked

@@ -36,10 +36,10 @@ const (
 	// maxAttempts and the backoff give a receiver that is restarting a fair
 	// chance without turning one event into an unbounded retry storm.
 	maxAttempts = 3
-	// queueDepth is how many pending deliveries are held before new ones are
-	// dropped. Dropping is deliberate: the alternative is an unbounded queue
-	// that turns a dead receiver into memory growth for the whole of a long
-	// run, and a notification is not worth that.
+	// queueDepth is how many pending deliveries **per webhook** are held
+	// before new ones are dropped. Dropping is deliberate: the alternative is
+	// an unbounded queue that turns a dead receiver into memory growth for the
+	// whole of a long run, and a notification is not worth that.
 	queueDepth = 256
 )
 
@@ -90,13 +90,31 @@ type Notifier struct {
 	client  *http.Client
 	decrypt SecretLookup
 
-	queue chan job
-	wg    sync.WaitGroup
-	once  sync.Once
-	stop  chan struct{}
+	wg   sync.WaitGroup
+	once sync.Once
+	stop chan struct{}
+	// ctx is the lifetime handed to Start; lanes created afterwards inherit it.
+	ctx context.Context
 
+	mu sync.Mutex
+	// lanes holds one delivery queue per webhook, each drained by its own
+	// goroutine, so a hook's events go out **in the order they were queued**.
+	//
+	// That ordering is load-bearing since cn4m's `progress` level (2026-09-12):
+	// a progress post is a per-app slot that the app's next non-progress post
+	// clears. With a shared pool, a progress request and the run's outcome can
+	// be in flight on two workers at once, and if the progress one lands
+	// second it re-fills the slot *after* the outcome cleared it — "97%" then
+	// sits on the rail for two minutes after the sync finished, and the
+	// finished sync itself never displaced it. Per-hook lanes make that
+	// impossible; different hooks still deliver in parallel, and a slow
+	// receiver only ever holds up its own lane.
+	//
+	// Created on first use rather than at Start, because hooks come and go at
+	// runtime and are few — one goroutine each is nothing.
+	lanes   map[string]chan job
+	stopped bool
 	// lastProgress throttles the progress event per (webhook, run).
-	mu           sync.Mutex
 	lastProgress map[string]time.Time
 	// down tracks best-effort endpoints that are not answering, so a receiver
 	// that is simply absent is left alone rather than retried on every event.
@@ -132,19 +150,19 @@ func New(db *store.DB, decrypt SecretLookup, log *slog.Logger) *Notifier {
 				return http.ErrUseLastResponse
 			},
 		},
-		queue:        make(chan job, queueDepth),
+		lanes:        map[string]chan job{},
 		stop:         make(chan struct{}),
 		lastProgress: map[string]time.Time{},
 		down:         map[string]*outage{},
 	}
 }
 
-// Start begins the delivery workers.
+// Start records the lifetime deliveries run under. The lanes themselves are
+// spawned as hooks first appear.
 func (n *Notifier) Start(ctx context.Context) {
-	for range 4 {
-		n.wg.Add(1)
-		go n.worker(ctx)
-	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.ctx = ctx
 }
 
 // Stop drains what is already queued, bounded by ctx.
@@ -154,7 +172,14 @@ func (n *Notifier) Start(ctx context.Context) {
 // ones most likely to be delivered rather than the ones most likely to be
 // lost. A caller that does not want to wait passes a short context.
 func (n *Notifier) Stop(ctx context.Context) error {
-	n.once.Do(func() { close(n.stop) })
+	n.once.Do(func() {
+		// Marked under the lock before the lanes are told, so no lane can be
+		// created (and a WaitGroup incremented) once Wait has begun.
+		n.mu.Lock()
+		n.stopped = true
+		n.mu.Unlock()
+		close(n.stop)
+	})
 
 	done := make(chan struct{})
 	go func() {
@@ -201,15 +226,41 @@ func (n *Notifier) Notify(ctx context.Context, jobID, runID, event string, paylo
 		}
 		body["event"] = event
 
-		select {
-		case n.queue <- job{hook: hook, event: event, runID: runID, payload: body}:
-		default:
+		if !n.enqueue(job{hook: hook, event: event, runID: runID, payload: body}) {
 			// Full means a receiver is not keeping up. Drop rather than block:
 			// blocking here would push a stranger's outage into the sync
 			// pipeline, which is the one thing this package must not do.
 			n.log.Warn("callback queue is full; dropped an event",
 				"url", hook.URL, "event", event, "run_id", runID)
 		}
+	}
+}
+
+// enqueue places a job on its webhook's lane, starting the lane if this is
+// the hook's first event. Reports false when the lane is full, or when the
+// notifier has been stopped — Notify's producers are meant to be gone by then,
+// and a late event is dropped rather than starting a goroutine nothing will
+// wait for.
+func (n *Notifier) enqueue(j job) bool {
+	n.mu.Lock()
+	if n.stopped {
+		n.mu.Unlock()
+		return false
+	}
+	lane, ok := n.lanes[j.hook.ID]
+	if !ok {
+		lane = make(chan job, queueDepth)
+		n.lanes[j.hook.ID] = lane
+		n.wg.Add(1)
+		go n.worker(n.ctx, lane)
+	}
+	n.mu.Unlock()
+
+	select {
+	case lane <- j:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -281,16 +332,17 @@ func (n *Notifier) Forget(runID string) {
 	}
 }
 
-func (n *Notifier) worker(ctx context.Context) {
+// worker drains one webhook's lane, one delivery at a time and in order.
+func (n *Notifier) worker(ctx context.Context, lane <-chan job) {
 	defer n.wg.Done()
 	for {
-		// The queue is checked on its own first. A plain three-way select
+		// The lane is checked on its own first. A plain three-way select
 		// picks at random among ready cases, so a worker would abandon a full
 		// backlog the instant `stop` closed — which is exactly when the most
 		// interesting events (run_completed for the runs being cancelled) are
 		// being queued.
 		select {
-		case j := <-n.queue:
+		case j := <-lane:
 			n.deliver(ctx, j)
 			continue
 		default:
@@ -304,13 +356,13 @@ func (n *Notifier) worker(ctx context.Context) {
 			// work is not accepted because Notify's producers are gone by now.
 			for {
 				select {
-				case j := <-n.queue:
+				case j := <-lane:
 					n.deliver(ctx, j)
 				default:
 					return
 				}
 			}
-		case j := <-n.queue:
+		case j := <-lane:
 			n.deliver(ctx, j)
 		}
 	}

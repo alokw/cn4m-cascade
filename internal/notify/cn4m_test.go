@@ -41,7 +41,7 @@ func TestCN4MCallbackArrivesAsFormFields(t *testing.T) {
 	defer cn4m.Close()
 
 	n := testNotifier(t)
-	n.queue <- job{
+	n.enqueue(job{
 		hook: store.Webhook{
 			ID: "cn4m", URL: cn4m.URL, Enabled: true, Format: store.FormatCN4M,
 		},
@@ -50,7 +50,7 @@ func TestCN4MCallbackArrivesAsFormFields(t *testing.T) {
 			"event": EventRunCompleted, "job": "photos-to-nas",
 			"status": "success", "files_done": 1204, "errors_count": 0,
 		},
-	}
+	})
 
 	select {
 	case r := <-got:
@@ -99,11 +99,11 @@ func TestJSONFormatStillPostsJSON(t *testing.T) {
 	defer srv.Close()
 
 	n := testNotifier(t)
-	n.queue <- job{
+	n.enqueue(job{
 		hook:    store.Webhook{ID: "j", URL: srv.URL, Enabled: true, Format: store.FormatJSON},
 		event:   EventRunStarted,
 		payload: Payload{"event": EventRunStarted, "job": "x"},
-	}
+	})
 
 	select {
 	case ct := <-got:
@@ -254,7 +254,7 @@ func TestCN4MLevelsCoverEveryOutcome(t *testing.T) {
 		want   string
 	}{
 		{"a run beginning", EventRunStarted, "running", levelWorking},
-		{"progress", EventProgress, "running", levelWorking},
+		{"progress", EventProgress, "running", levelProgress},
 		{"waiting on a person", EventPrompt, "running", levelBlocked},
 		{"a clean finish", EventRunCompleted, "success", levelOK},
 		{"a partial finish", EventRunCompleted, "partial", levelWarning},
@@ -276,7 +276,7 @@ func TestCN4MLevelsCoverEveryOutcome(t *testing.T) {
 // invisible until the suite view shows the wrong colour for a backup.
 func TestEveryEmittedLevelIsInCN4MsVocabulary(t *testing.T) {
 	accepted := map[string]bool{
-		levelIdle: true, levelWorking: true, levelOK: true,
+		levelIdle: true, levelWorking: true, levelProgress: true, levelOK: true,
 		levelWarning: true, levelBlocked: true, levelError: true,
 	}
 
@@ -350,5 +350,77 @@ func TestTheBreakerDoesNotApplyToJSONWebhooks(t *testing.T) {
 
 	if n.backedOff(hook) {
 		t.Fatal("a JSON webhook was backed off; its failures are visible and should keep being retried")
+	}
+}
+
+// cn4m gained a `progress` level (2026-09-12) that goes to a per-app slot —
+// each post replaces the last, none of them enter the feed, the tray or the
+// log — instead of the feed that `working` writes to. Before it, a
+// five-second progress cadence put a dozen near-identical "Sync in Progress"
+// rows into the feed per minute.
+//
+// Two halves to the contract, and this checks both on the wire:
+//
+//   - every progress post carries level=progress, so it lands in the slot;
+//   - the start and the outcome carry a *different* level, because the slot
+//     is cleared by the app's next non-progress post. An outcome sent as
+//     `progress` would leave "97%" on the rail until cn4m's two-minute
+//     timeout dropped it, and the finished sync would never reach the log.
+func TestCN4MProgressUsesTheSlotAndTheOutcomeClearsIt(t *testing.T) {
+	type post struct{ message, level string }
+	got := make(chan post, 8)
+
+	cn4m := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("cn4m could not parse the request: %v", err)
+		}
+		got <- post{message: r.PostFormValue("message"), level: r.PostFormValue("level")}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer cn4m.Close()
+
+	n := testNotifier(t)
+	hook := store.Webhook{ID: "cn4m", URL: cn4m.URL, Enabled: true, Format: store.FormatCN4M}
+
+	sequence := []struct {
+		event   string
+		payload Payload
+	}{
+		{EventRunStarted, Payload{"status": "running"}},
+		{EventProgress, Payload{"status": "running", "bytes_done": 16, "bytes_total": 100, "throughput_bps": 289e6}},
+		{EventProgress, Payload{"status": "running", "bytes_done": 60, "bytes_total": 100, "throughput_bps": 300e6}},
+		{EventRunCompleted, Payload{"status": "success", "files_done": 40}},
+	}
+	for _, step := range sequence {
+		n.enqueue(job{hook: hook, event: step.event, runID: "run-1", payload: step.payload})
+	}
+
+	var posts []post
+	for range sequence {
+		select {
+		case p := <-got:
+			posts = append(posts, p)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("cn4m received %d of %d posts", len(posts), len(sequence))
+		}
+	}
+
+	if posts[0].level == levelProgress {
+		t.Errorf("run start went to the progress slot (%q); it is a real event and belongs in the feed", posts[0].message)
+	}
+	for _, p := range posts[1:3] {
+		if p.level != levelProgress {
+			t.Errorf("progress post %q went out as %q, want %q — it would spam the feed", p.message, p.level, levelProgress)
+		}
+		if !contains(p.message, "%") || !contains(p.message, "MB/s") {
+			t.Errorf("progress line %q does not carry what is changing", p.message)
+		}
+	}
+	last := posts[len(posts)-1]
+	if last.level == levelProgress {
+		t.Errorf("the outcome %q went out as progress; nothing would clear the slot and it would never reach the log", last.message)
+	}
+	if last.level != levelOK {
+		t.Errorf("outcome level = %q, want %q", last.level, levelOK)
 	}
 }
